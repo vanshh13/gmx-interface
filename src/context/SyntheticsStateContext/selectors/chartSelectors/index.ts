@@ -1,0 +1,105 @@
+import { QueryFunction } from "@taskworld.com/rereselect";
+
+import { selectJitLiquidityMap } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import {
+  selectTradeboxAvailableTokensOptions,
+  selectTradeboxFromTokenAddress,
+  selectTradeboxMarketInfo,
+  selectTradeboxToTokenAddress,
+  selectTradeboxTradeFlags,
+} from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import { SyntheticsState } from "context/SyntheticsStateContext/SyntheticsStateContextProvider";
+import { createSelector } from "context/SyntheticsStateContext/utils";
+import { getBorrowingFactorPerPeriod, getFundingFactorPerPeriod } from "domain/synthetics/fees";
+import { getJitLiquidityInfo } from "domain/synthetics/jit/utils";
+import {
+  getAvailableUsdLiquidityForPosition,
+  getOpenInterestForBalance,
+  getOpenInterestInTokens,
+} from "domain/synthetics/markets";
+import { createTokenSortSequenceComparator } from "domain/tokens/utils";
+import { CHART_PERIODS } from "lib/legacy";
+import { bigMath } from "sdk/utils/bigmath";
+
+export { selectChartToken } from "../shared/marketSelectors";
+
+function getAvailableChartTokensInternal(q: QueryFunction<SyntheticsState>, forSwap: boolean) {
+  const fromTokenAddress = q(selectTradeboxFromTokenAddress);
+  const toTokenAddress = q(selectTradeboxToTokenAddress);
+
+  if (!fromTokenAddress || !toTokenAddress) {
+    return [];
+  }
+
+  const { swapTokens, indexTokens, sortedLongAndShortTokens, sortedIndexTokensWithPoolValue } = q(
+    selectTradeboxAvailableTokensOptions
+  );
+
+  const availableChartTokens = forSwap ? swapTokens : indexTokens;
+  const currentSortReferenceList = forSwap ? sortedLongAndShortTokens : sortedIndexTokensWithPoolValue;
+
+  return [...availableChartTokens].sort(createTokenSortSequenceComparator(currentSortReferenceList));
+}
+
+export const selectAvailableChartTokens = createSelector(function selectAvailableChartTokensImpl(q) {
+  const { isSwap } = q(selectTradeboxTradeFlags);
+  return getAvailableChartTokensInternal(q, isSwap);
+});
+
+export const selectAvailablePerpChartTokens = createSelector(function selectAvailablePerpChartTokensImpl(q) {
+  return getAvailableChartTokensInternal(q, false);
+});
+
+export const selectAvailableSwapChartTokens = createSelector(function selectAvailableSwapChartTokensImpl(q) {
+  return getAvailableChartTokensInternal(q, true);
+});
+
+export const selectChartHeaderInfo = createSelector((q) => {
+  const marketInfo = q(selectTradeboxMarketInfo);
+
+  if (!marketInfo) {
+    return;
+  }
+
+  const jitLiquidityMap = q(selectJitLiquidityMap);
+  const jitInfo = getJitLiquidityInfo(jitLiquidityMap, marketInfo.marketTokenAddress);
+
+  const borrowingRateLong = -getBorrowingFactorPerPeriod(marketInfo, true, BigInt(CHART_PERIODS["1h"]));
+  const borrowingRateShort = -getBorrowingFactorPerPeriod(marketInfo, false, BigInt(CHART_PERIODS["1h"]));
+  const fundingRateLong = getFundingFactorPerPeriod(marketInfo, true, BigInt(CHART_PERIODS["1h"]));
+  const fundingRateShort = getFundingFactorPerPeriod(marketInfo, false, BigInt(CHART_PERIODS["1h"]));
+
+  const netRateHourlyLong = (fundingRateLong ?? 0n) + (borrowingRateLong ?? 0n);
+  const netRateHourlyShort = (fundingRateShort ?? 0n) + (borrowingRateShort ?? 0n);
+
+  const longUsdInterest = getOpenInterestForBalance(marketInfo, true);
+  const shortUsdInterest = getOpenInterestForBalance(marketInfo, false);
+  const totalInterest = longUsdInterest + shortUsdInterest;
+
+  const longOpenInterestPercentage =
+    totalInterest !== 0n
+      ? Math.max(Math.min(Math.round(Number(bigMath.mulDiv(longUsdInterest, 10000n, totalInterest)) / 100), 100), 0.01)
+      : 0;
+
+  const shortOpenInterestPercentage =
+    totalInterest === 0n ? 0 : longOpenInterestPercentage !== undefined ? 100 - longOpenInterestPercentage : undefined;
+
+  return {
+    liquidityLong: getAvailableUsdLiquidityForPosition(marketInfo, true, jitInfo?.maxReservedUsdWithJitLong),
+    liquidityShort: getAvailableUsdLiquidityForPosition(marketInfo, false, jitInfo?.maxReservedUsdWithJitShort),
+    netRateHourlyLong,
+    netRateHourlyShort,
+    borrowingRateLong,
+    borrowingRateShort,
+    fundingRateLong,
+    fundingRateShort,
+    openInterestLong: longUsdInterest,
+    openInterestShort: shortUsdInterest,
+    openInterestLongInTokens: getOpenInterestInTokens(marketInfo, true),
+    openInterestShortInTokens: getOpenInterestInTokens(marketInfo, false),
+    decimals: marketInfo.indexToken.decimals,
+    indexTokenSymbol: marketInfo.indexToken.symbol,
+    longOpenInterestPercentage,
+    shortOpenInterestPercentage,
+  };
+});

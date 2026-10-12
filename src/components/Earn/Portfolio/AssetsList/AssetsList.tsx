@@ -1,0 +1,203 @@
+import { Trans } from "@lingui/macro";
+import cx from "classnames";
+import { useMemo } from "react";
+import { useMedia } from "react-use";
+
+import { ContractsChainId } from "config/chains";
+import { useConnectModal } from "context/ConnectModalContext/ConnectModalContext";
+import { getHasBalanceOutsideWallet } from "domain/multichain/getHasBalanceOutsideWallet";
+import { MultichainMarketTokensBalances } from "domain/multichain/types";
+import { getGlvOrMarketAddress, GlvOrMarketInfo } from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { useGlvUserEarnings } from "domain/synthetics/markets/useGlvUserEarnings";
+import { PerformanceData } from "domain/synthetics/markets/usePerformanceAnnualized";
+import { useUserEarnings } from "domain/synthetics/markets/useUserEarnings";
+import { useChainId } from "lib/chains";
+import { StakingProcessedData } from "lib/legacy";
+import { getByKey } from "lib/objects";
+import { useBreakpoints } from "lib/useBreakpoints";
+import useWallet from "lib/wallets/useWallet";
+
+import ConnectWalletButton from "components/ConnectWalletButton/ConnectWalletButton";
+
+import EarnIcon from "img/ic_earn.svg?react";
+
+import { AssetCardEarnings, GmGlvAssetCard } from "./GmGlvAssetCard";
+import { GmxAssetCard } from "./GmxAssetCard/GmxAssetCard";
+
+const ZERO_EARNINGS: AssetCardEarnings = { total: 0n, recent: 0n, expected365d: 0n };
+
+type AssetItem =
+  | { type: "gmx"; usdValue: bigint; hasEsGmx: boolean }
+  | { type: "gmGlv"; info: GlvOrMarketInfo; usdValue: bigint };
+
+function getSortedAssets({
+  hasGmx,
+  processedData,
+  hasEsGmx,
+  gmGlvAssets,
+  multichainMarketTokensBalances,
+}: {
+  hasGmx: boolean;
+  processedData: StakingProcessedData | undefined;
+  hasEsGmx: boolean;
+  gmGlvAssets: GlvOrMarketInfo[];
+  multichainMarketTokensBalances: MultichainMarketTokensBalances | undefined;
+}) {
+  const assets: AssetItem[] = [];
+
+  if ((hasGmx || hasEsGmx) && processedData) {
+    const gmxUsdValue = hasGmx ? (processedData.gmxBalanceUsd ?? 0n) + (processedData.gmxInStakedGmxUsd ?? 0n) : 0n;
+    const esGmxUsdValue = hasEsGmx
+      ? (processedData.esGmxBalanceUsd ?? 0n) + (processedData.esGmxInStakedGmxUsd ?? 0n)
+      : 0n;
+    assets.push({ type: "gmx", usdValue: gmxUsdValue + esGmxUsdValue, hasEsGmx });
+  }
+
+  for (const info of gmGlvAssets) {
+    const tokenAddress = getGlvOrMarketAddress(info);
+    const usdValue = multichainMarketTokensBalances?.[tokenAddress]?.totalBalanceUsd ?? 0n;
+    assets.push({ type: "gmGlv", info, usdValue });
+  }
+
+  return assets.sort((a, b) => {
+    if (a.type === "gmx" && b.type !== "gmx") return -1;
+    if (a.type !== "gmx" && b.type === "gmx") return 1;
+    if (b.usdValue > a.usdValue) return 1;
+    if (b.usdValue < a.usdValue) return -1;
+    return 0;
+  });
+}
+
+function AssetsList({
+  chainId,
+  processedData,
+  hasAnyAssets,
+  hasGmx,
+  hasEsGmx,
+  gmGlvAssets,
+
+  performanceTotal,
+  performance30d,
+  isPerformanceLoading,
+  multichainMarketTokensBalances,
+}: {
+  chainId: ContractsChainId;
+  processedData: StakingProcessedData | undefined;
+  hasAnyAssets: boolean;
+  hasGmx: boolean;
+  hasEsGmx: boolean;
+  gmGlvAssets: GlvOrMarketInfo[];
+  performanceTotal: PerformanceData | undefined;
+  performance30d: PerformanceData | undefined;
+  isPerformanceLoading: boolean;
+  multichainMarketTokensBalances: MultichainMarketTokensBalances | undefined;
+}) {
+  const hasGmxCard = hasGmx || hasEsGmx;
+  const cardsCount = (hasGmxCard ? 1 : 0) + gmGlvAssets.length;
+  const { isMobile } = useBreakpoints();
+
+  const isEnoughSpaceFor3Columns = useMedia(`(min-width: 1340px)`);
+  const isEnoughSpaceFor2Columns = !isMobile;
+
+  const shouldUseFlex = (cardsCount < 3 && isEnoughSpaceFor2Columns) || (cardsCount < 4 && isEnoughSpaceFor3Columns);
+
+  const { account } = useWallet();
+  const { openConnectModal } = useConnectModal();
+
+  const { srcChainId } = useChainId();
+  const {
+    userEarnings,
+    isLoading: isGmEarningsLoading,
+    isUnavailable: isGmEarningsUnavailable,
+  } = useUserEarnings(chainId, srcChainId);
+  const {
+    glvUserEarnings,
+    isLoading: isGlvEarningsLoading,
+    isUnavailable: isGlvEarningsUnavailable,
+  } = useGlvUserEarnings(chainId, srcChainId);
+
+  const sortedAssets = useMemo(() => {
+    return getSortedAssets({
+      hasGmx,
+      processedData,
+      hasEsGmx,
+      gmGlvAssets,
+      multichainMarketTokensBalances,
+    });
+  }, [hasGmx, hasEsGmx, processedData, gmGlvAssets, multichainMarketTokensBalances]);
+
+  return (
+    <section className={cx("flex flex-col rounded-8 bg-slate-900", { grow: !hasAnyAssets })}>
+      <h2 className="text-body-large p-20 pb-2 font-medium text-typography-primary">
+        <Trans>My assets</Trans>
+      </h2>
+
+      {hasAnyAssets && (
+        <div
+          className={cx(
+            "grid grid-cols-1 items-start gap-12 p-12",
+            shouldUseFlex
+              ? "md:flex md:flex-wrap md:items-start md:[&>div]:w-[359px]"
+              : "md:grid-flow-dense md:grid-cols-2 min-[1300px]:grid-cols-3 min-[1460px]:grid-cols-4"
+          )}
+        >
+          {sortedAssets.map((asset) => {
+            if (asset.type === "gmx" && processedData) {
+              return (
+                <div key="gmx" className="md:row-span-2 md:min-h-[420px] md:self-stretch">
+                  <GmxAssetCard processedData={processedData} hasEsGmx={asset.hasEsGmx} />
+                </div>
+              );
+            }
+            if (asset.type === "gmGlv") {
+              const info = asset.info;
+              const address = getGlvOrMarketAddress(info);
+              const isGlv = isGlvInfo(info);
+
+              const earnings = isGlv ? glvUserEarnings?.byGlvAddress[address] : userEarnings?.byMarketAddress[address];
+              const isEarningsLoading = isGlv ? isGlvEarningsLoading : isGmEarningsLoading;
+              const isEarningsUnavailable = isGlv ? isGlvEarningsUnavailable : isGmEarningsUnavailable;
+
+              return (
+                <GmGlvAssetCard
+                  key={address}
+                  marketInfo={info}
+                  chainId={chainId}
+                  totalPerformanceApy={getByKey(performanceTotal, address)}
+                  performanceApy30d={getByKey(performance30d, address)}
+                  isPerformanceLoading={isPerformanceLoading}
+                  multichainMarketTokenBalances={multichainMarketTokensBalances?.[address]}
+                  hasBalanceOutsideWallet={getHasBalanceOutsideWallet(
+                    multichainMarketTokensBalances?.[address],
+                    chainId
+                  )}
+                  earnings={earnings ?? (isEarningsLoading || isEarningsUnavailable ? undefined : ZERO_EARNINGS)}
+                  isEarningsLoading={isEarningsLoading}
+                  isEarningsAvailable={!isEarningsUnavailable}
+                />
+              );
+            }
+            return null;
+          })}
+        </div>
+      )}
+
+      {!hasAnyAssets && (
+        <div className="flex h-full flex-col items-center justify-center gap-12 p-20">
+          <EarnIcon className="size-20 text-blue-300" />
+          <span className="text-body-small text-center font-medium text-typography-secondary">
+            {account ? <Trans>No assets yet</Trans> : <Trans>Connect wallet to see your assets</Trans>}
+          </span>
+          {!account && openConnectModal && (
+            <ConnectWalletButton onClick={openConnectModal}>
+              <Trans>Connect wallet</Trans>
+            </ConnectWalletButton>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export default AssetsList;

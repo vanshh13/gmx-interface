@@ -1,0 +1,168 @@
+import { t } from "@lingui/macro";
+import identity from "lodash/identity";
+
+import { CONTRACTS_CHAIN_IDS, ContractsChainId } from "config/chains";
+import { BASIS_POINTS_DIVISOR_BIGINT, USD_DECIMALS } from "config/factors";
+import { getReferralCodeOwner } from "domain/referrals";
+import { isAddressZero, MAX_REFERRAL_CODE_LENGTH, REFERRAL_CODE_QUERY_PARAM } from "lib/legacy";
+import { expandDecimals, formatAmount, removeTrailingZeros } from "lib/numbers";
+import { getRootUrl } from "lib/url";
+import { bigMath } from "sdk/utils/bigmath";
+import { encodeReferralCode } from "sdk/utils/referrals";
+
+import { REFERRAL_CODE_REGEX } from "./referralCode";
+
+export const CREATE_REFERRAL_CODE_QUERY_PARAM = "createReferralCode";
+
+export type ReferralCodeTakenStatus = "all" | "current" | "other" | "none";
+
+export async function getReferralCodeTakenStatus(
+  account: string | undefined,
+  referralCode: string,
+  chainId: ContractsChainId
+): Promise<{ takenStatus: ReferralCodeTakenStatus; failedChains: ContractsChainId[] }> {
+  const referralCodeBytes32 = encodeReferralCode(referralCode);
+
+  const ownerMap: Partial<Record<ContractsChainId, string>> = {};
+  const failedChains: ContractsChainId[] = [];
+
+  await Promise.all(
+    CONTRACTS_CHAIN_IDS.map(async (otherChainId) => {
+      try {
+        const res = await getReferralCodeOwner(otherChainId, referralCodeBytes32);
+        ownerMap[otherChainId] = res;
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(`Failed to check referral code owner on chain ${otherChainId}:`, error);
+        failedChains.push(otherChainId);
+      }
+    })
+  );
+
+  const takenMap: Partial<Record<ContractsChainId, boolean>> = {};
+
+  for (const otherChainId of CONTRACTS_CHAIN_IDS) {
+    if (failedChains.includes(otherChainId)) {
+      continue;
+    }
+
+    const owner = ownerMap[otherChainId];
+    const takenOnOtherChain =
+      !isAddressZero(owner) && (owner !== account || (owner === account && chainId === otherChainId));
+
+    takenMap[otherChainId] = takenOnOtherChain;
+  }
+
+  const checkedChains = CONTRACTS_CHAIN_IDS.filter((id) => !failedChains.includes(id));
+  const allTaken = checkedChains.length > 0 && checkedChains.every((id) => takenMap[id]);
+  const someTaken = Object.values(takenMap).some(identity);
+
+  if (allTaken) {
+    return { takenStatus: "all", failedChains };
+  }
+  if (takenMap[chainId]) {
+    return { takenStatus: "current", failedChains };
+  }
+  if (!takenMap[chainId] && someTaken) {
+    return { takenStatus: "other", failedChains };
+  }
+
+  return { takenStatus: "none", failedChains };
+}
+
+export function getTierIdDisplay(tierId: number | bigint | string): number {
+  return Number(tierId) + 1;
+}
+
+const BALANCER_PROGRAM_TIERS = [6, 7];
+
+export function isBalancerProgramTier(tierId: number | undefined): boolean {
+  return tierId !== undefined && BALANCER_PROGRAM_TIERS.includes(tierId);
+}
+
+export function getSharePercentage(
+  customDiscountShare: bigint | undefined,
+  tierDiscountShare: bigint | undefined,
+  totalRebate: bigint | undefined,
+  isRebate?: boolean
+): string | number | undefined {
+  const discountShare =
+    customDiscountShare !== undefined && customDiscountShare > 0n ? customDiscountShare : tierDiscountShare;
+
+  if (discountShare === undefined || totalRebate === undefined) return;
+
+  const decimals = 4;
+
+  const share = bigMath.mulDiv(
+    totalRebate * (isRebate ? BASIS_POINTS_DIVISOR_BIGINT - discountShare : discountShare),
+    BigInt(Math.pow(10, decimals)),
+    BASIS_POINTS_DIVISOR_BIGINT
+  );
+
+  const percentage = share / 100n;
+  return removeTrailingZeros(formatAmount(percentage, decimals, 3, true));
+}
+
+export function getCodeError(value: string): string {
+  if (!value) return "";
+
+  const trimmedValue = value.trim();
+  if (trimmedValue.length > MAX_REFERRAL_CODE_LENGTH) {
+    return t`Max ${MAX_REFERRAL_CODE_LENGTH} characters`;
+  }
+
+  if (!REFERRAL_CODE_REGEX.test(trimmedValue)) {
+    return t`Only letters, numbers, and underscores allowed`;
+  }
+  return "";
+}
+
+export function getReferralCodeTradeUrl(referralCode: string): string {
+  return `${getRootUrl()}/trade/?${REFERRAL_CODE_QUERY_PARAM}=${referralCode}`;
+}
+
+export type ProtocolReferralCodeType = "organic" | "graduated";
+
+const PROTOCOL_REFERRAL_CODES: Record<string, ProtocolReferralCodeType> = {
+  EARNED_TRADER_DISCOUNT_5: "organic",
+  EARNED_TRADER_DISCOUNT_10: "organic",
+  DIRECT_GMX_DISCOUNT_5: "graduated",
+  DIRECT_GMX_DISCOUNT_10: "graduated",
+};
+
+export function getProtocolReferralCodeType(codeString: string | undefined): ProtocolReferralCodeType | undefined {
+  if (!codeString) {
+    return undefined;
+  }
+
+  return PROTOCOL_REFERRAL_CODES[codeString];
+}
+
+const SHARE_CARD_DISCOUNTS_THRESHOLD_USD = expandDecimals(100, USD_DECIMALS);
+
+export function shouldShowShareCardDiscounts(totalDiscountsUsd: bigint | undefined): boolean {
+  return totalDiscountsUsd !== undefined && totalDiscountsUsd >= SHARE_CARD_DISCOUNTS_THRESHOLD_USD;
+}
+
+export function shouldShowCreateReferralCodeTabLabel({
+  hasAddressInUrl,
+  hasAccount,
+  isReferralsDataLoading,
+  hasAnyAffiliateCode,
+}: {
+  hasAddressInUrl: boolean;
+  hasAccount: boolean;
+  isReferralsDataLoading: boolean;
+  hasAnyAffiliateCode: boolean;
+}): boolean {
+  // Another wallet's page is not yours to create a code on
+  if (hasAddressInUrl) {
+    return false;
+  }
+
+  if (!hasAccount) {
+    return true;
+  }
+
+  return !isReferralsDataLoading && !hasAnyAffiliateCode;
+}

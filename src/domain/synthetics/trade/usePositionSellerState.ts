@@ -1,0 +1,113 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { getKeepLeverageKey, getSyntheticsReceiveMoneyTokenKey } from "config/localStorage";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useLocalStorageSerializeKey } from "lib/localStorage";
+import { DEFAULT_TWAP_DURATION, DEFAULT_TWAP_NUMBER_OF_PARTS } from "sdk/configs/twap";
+import { TradeMode } from "sdk/utils/trade/types";
+import { TwapDuration } from "sdk/utils/twap/types";
+
+import { PositionInfo } from "../positions";
+
+export enum OrderOption {
+  Market = "Market",
+  Twap = "TWAP",
+}
+
+export const ORDER_OPTION_TO_TRADE_MODE: Record<OrderOption, TradeMode> = {
+  [OrderOption.Market]: TradeMode.Market,
+  [OrderOption.Twap]: TradeMode.Twap,
+};
+
+export type PositionSellerState = ReturnType<typeof usePositionSellerState>;
+
+export function usePositionSellerState(
+  chainId: number,
+  closingPosition: PositionInfo | undefined,
+  initialOrderOption: OrderOption | undefined
+) {
+  const { savedAllowedSlippage } = useSettings();
+  const [orderOption, setOrderOption] = useState<OrderOption>(initialOrderOption ?? OrderOption.Market);
+  const [triggerPriceInputValue, setTriggerPriceInputValue] = useState("");
+  const [keepLeverage, setKeepLeverage] = useLocalStorageSerializeKey(getKeepLeverageKey(chainId), true);
+  const [defaultTriggerAcceptablePriceImpactBps, setDefaultTriggerAcceptablePriceImpactBps] = useState<bigint>();
+  const [selectedTriggerAcceptablePriceImpactBps, setSelectedTriggerAcceptablePriceImpactBps] = useState<bigint>();
+  const [closeUsdInputValue, setCloseUsdInputValue] = useState("");
+  const [receiveTokenAddress, setReceiveTokenAddress] = useState<string>();
+  const [allowedSlippage, setAllowedSlippage] = useState(savedAllowedSlippage);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isReceiveTokenChanged, setIsReceiveTokenChanged] = useState(false);
+  const [isReceiveSeparated, setIsReceiveSeparated] = useState(false);
+  const [duration, setDuration] = useState<TwapDuration>(DEFAULT_TWAP_DURATION);
+  const [numberOfParts, setNumberOfParts] = useState<number>(DEFAULT_TWAP_NUMBER_OF_PARTS);
+
+  useEffect(() => {
+    if (initialOrderOption !== undefined) {
+      setOrderOption(initialOrderOption);
+    }
+  }, [initialOrderOption]);
+
+  const resetPositionSeller = useCallback(() => {
+    setOrderOption(OrderOption.Market);
+    setTriggerPriceInputValue("");
+    setDefaultTriggerAcceptablePriceImpactBps(undefined);
+    setSelectedTriggerAcceptablePriceImpactBps(undefined);
+    setCloseUsdInputValue("");
+    setReceiveTokenAddress("");
+    setAllowedSlippage(savedAllowedSlippage);
+    setIsSubmitting(false);
+    setIsReceiveTokenChanged(false);
+    setIsReceiveSeparated(false);
+  }, [savedAllowedSlippage, setReceiveTokenAddress]);
+
+  const closingPositionKey = useMemo(() => {
+    return getSyntheticsReceiveMoneyTokenKey(
+      chainId,
+      closingPosition?.market.name,
+      closingPosition?.isLong ? "long" : "short",
+      closingPosition?.collateralTokenAddress
+    );
+  }, [chainId, closingPosition]);
+
+  const [defaultReceiveToken, setDefaultReceiveToken] = useLocalStorageSerializeKey<string | undefined>(
+    closingPositionKey,
+    undefined
+  );
+
+  const handleSetOrderOption = useCallback((option: OrderOption) => {
+    setOrderOption(option);
+    setTriggerPriceInputValue("");
+  }, []);
+
+  return {
+    orderOption,
+    handleSetOrderOption,
+    triggerPriceInputValue,
+    setTriggerPriceInputValue,
+    keepLeverage,
+    setKeepLeverage,
+    defaultTriggerAcceptablePriceImpactBps,
+    setDefaultTriggerAcceptablePriceImpactBps,
+    selectedTriggerAcceptablePriceImpactBps,
+    setSelectedTriggerAcceptablePriceImpactBps,
+    closeUsdInputValue,
+    setCloseUsdInputValue,
+    receiveTokenAddress,
+    setReceiveTokenAddress,
+    allowedSlippage,
+    setAllowedSlippage,
+    isSubmitting,
+    setIsSubmitting,
+    resetPositionSeller,
+    isReceiveTokenChanged,
+    setIsReceiveTokenChanged,
+    isReceiveSeparated,
+    setIsReceiveSeparated,
+    defaultReceiveToken,
+    setDefaultReceiveToken,
+    duration,
+    setDuration,
+    numberOfParts,
+    setNumberOfParts,
+  };
+}

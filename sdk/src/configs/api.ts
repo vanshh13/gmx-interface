@@ -1,0 +1,59 @@
+import { ARBITRUM, ARBITRUM_SEPOLIA, AVALANCHE, AVALANCHE_FUJI, ContractsChainId, MEGAETH } from "./chains";
+
+export type ApiEnvironment = "production" | "test";
+
+const API_URLS: Record<ApiEnvironment, Record<ContractsChainId, string | undefined>> = {
+  production: {
+    [ARBITRUM]: "https://arbitrum.gmxapi.io",
+    [AVALANCHE]: "https://avalanche.gmxapi.io",
+    [AVALANCHE_FUJI]: undefined,
+    [ARBITRUM_SEPOLIA]: "https://arbitrum-sepolia-test.gmxapi.ai",
+    [MEGAETH]: "https://megaeth.gmxapi.io",
+  },
+  test: {
+    [ARBITRUM]: "https://arbitrum-test.gmxapi.ai",
+    [AVALANCHE]: undefined,
+    [AVALANCHE_FUJI]: undefined,
+    [ARBITRUM_SEPOLIA]: "https://arbitrum-sepolia-test.gmxapi.ai",
+    [MEGAETH]: undefined,
+  },
+};
+
+const API_FALLBACK_URLS: Record<ApiEnvironment, Record<ContractsChainId, string[]>> = {
+  production: {
+    [ARBITRUM]: [],
+    [AVALANCHE]: [],
+    [AVALANCHE_FUJI]: [],
+    [ARBITRUM_SEPOLIA]: [],
+    [MEGAETH]: [],
+  },
+  test: {
+    [ARBITRUM]: [],
+    [AVALANCHE]: [],
+    [AVALANCHE_FUJI]: [],
+    [ARBITRUM_SEPOLIA]: [],
+    [MEGAETH]: [],
+  },
+};
+
+export function getApiUrl(chainId: number, environment: ApiEnvironment = "production") {
+  return API_URLS[environment][chainId];
+}
+
+export function getApiFallbackUrls(chainId: number, environment: ApiEnvironment = "production"): string[] {
+  return API_FALLBACK_URLS[environment][chainId] ?? [];
+}
+
+export function isApiSupported(chainId: number, environment: ApiEnvironment = "production") {
+  return getApiUrl(chainId, environment) !== undefined;
+}
+
+// Stats are chain-agnostic, so one deployment per environment serves them for every network
+const STATS_API_URLS: Record<ApiEnvironment, string | undefined> = {
+  production: API_URLS.production[ARBITRUM],
+  test: API_URLS.test[ARBITRUM],
+};
+
+export function getStatsApiUrl(environment: ApiEnvironment = "production") {
+  return STATS_API_URLS[environment];
+}

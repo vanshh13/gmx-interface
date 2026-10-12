@@ -1,0 +1,1106 @@
+import { t, Trans } from "@lingui/macro";
+import { ReactNode, useCallback, useMemo } from "react";
+import { zeroAddress } from "viem";
+
+import { AVALANCHE, SettlementChainId } from "config/chains";
+import { JUMPER_BRIDGE_URL } from "config/links";
+import { MULTI_CHAIN_DEPOSIT_TRADE_TOKENS } from "config/multichain";
+import { useConnectModal } from "context/ConnectModalContext/ConnectModalContext";
+import {
+  useGmxAccountDepositViewTokenAddress,
+  useGmxAccountDepositViewTokenInputValue,
+  useGmxAccountModalOpen,
+} from "context/GmxAccountContext/hooks";
+import { usePendingTxns } from "context/PendingTxnsContext/PendingTxnsContext";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import {
+  usePositionsConstants,
+  useUiFeeFactor,
+  useUserReferralInfo,
+} from "context/SyntheticsStateContext/hooks/globalsHooks";
+import {
+  selectGmxAccountGasPaymentToken,
+  selectSettlementChainGasPaymentToken,
+} from "context/SyntheticsStateContext/selectors/expressSelectors";
+import {
+  selectChainId,
+  selectGasPaymentTokenAllowance,
+  selectMarketsInfoData,
+  selectProDiscountFactor,
+  selectSrcChainId,
+  selectTokensData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { selectSavedAcceptablePriceImpactBuffer } from "context/SyntheticsStateContext/selectors/settingsSelectors";
+import {
+  selectExternalSwapBlockReason,
+  selectExternalSwapDesirability,
+  selectExternalSwapQuote,
+  selectIsExternalSwapDisabledByExpressSchema,
+  selectIsOneClickActiveByUser,
+  selectIsWaitingForExternalSwapQuote,
+  selectTradeboxFindSwapPath,
+  selectTradeboxFromToken,
+  selectTradeboxSelectSwapToToken,
+  selectTradeboxFromTokenAmount,
+  selectTradeboxIsFromTokenGmxAccount,
+  selectTradeboxIsTPSLEnabled,
+  selectTradeboxIsWrapOrUnwrap,
+  selectTradeboxMaxAllowedLeverage,
+  selectTradeboxPayAmount,
+  selectTradeboxExistingPositionForPreview,
+  selectTradeboxState,
+  selectTradeboxToToken,
+  selectTradeboxToTokenAmount,
+  selectTradeboxTradeFlags,
+  selectTradeboxTradeMode,
+  selectTradeboxTriggerPrice,
+  selectTradeboxDecreasePositionAmounts,
+  selectTradeboxHasExistingPosition,
+} from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import { selectTradeboxTradeTypeError } from "context/SyntheticsStateContext/selectors/tradeboxSelectors/selectTradeboxTradeErrors";
+import { selectExternalSwapQuoteParams } from "context/SyntheticsStateContext/selectors/tradeSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useGmxAccountShowDepositButton } from "domain/multichain/useGmxAccountShowDepositButton";
+import { ExpressTxnParams } from "domain/synthetics/express";
+import { findNextGasPaymentToken } from "domain/synthetics/express/useSwitchGasPaymentTokenIfRequired";
+import { getExternalAggregatorSwapUrl } from "domain/synthetics/externalSwaps/utils";
+import { substractMaxLeverageSlippage } from "domain/synthetics/positions/utils";
+import { useSidecarEntries } from "domain/synthetics/sidecarOrders/useSidecarEntries";
+import { useSidecarOrders } from "domain/synthetics/sidecarOrders/useSidecarOrders";
+import {
+  findMaxLeverageIncrease,
+  type MaxLeverageIncreaseParams,
+} from "domain/synthetics/trade/utils/maxLeverageSearch";
+import {
+  getApprovalGasError,
+  getCommonError,
+  getExpressError,
+  getNativeGasError,
+  takeValidationResult,
+  ValidationBannerErrorName,
+  ValidationButtonTooltipName,
+  ValidationResult,
+} from "domain/synthetics/trade/utils/validation";
+import {
+  getApproveButtonText,
+  getGasPaymentTokenApprovalTooltip,
+  getIsGasPaymentTokenApproval,
+} from "domain/tokens/gasPaymentTokenApproval";
+import { useTokenApproval } from "domain/tokens/useTokenApproval";
+import { useMultipleWalletExtensionsChainError } from "lib/chains/getMultipleWalletExtensionsChainError";
+import { useLocalizedMap } from "lib/i18n";
+import { adjustForDecimals, formatAmountFree } from "lib/numbers";
+import { EMPTY_OBJECT, getByKey } from "lib/objects";
+import { sleep } from "lib/sleep";
+import { useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { sendUserAnalyticsConnectWalletClickEvent, userAnalytics } from "lib/userAnalytics";
+import type { TokenApproveClickEvent, TokenApproveResultEvent } from "lib/userAnalytics/types";
+import { useEthersSigner } from "lib/wallets/useEthersSigner";
+import { useIsWalletInitializing } from "lib/wallets/useIsWalletInitializing";
+import { getContract } from "sdk/configs/contracts";
+import { getToken, getTokenBySymbol, getWrappedToken } from "sdk/configs/tokens";
+import { ExecutionFee } from "sdk/utils/fees/types";
+import { BatchOrderTxnParams } from "sdk/utils/orderTransactions";
+import { TokenData } from "sdk/utils/tokens/types";
+import { getLimitOrderTypeByTradeMode, TradeMode, TradeType } from "sdk/utils/trade";
+import { mustNeverExist } from "sdk/utils/types";
+
+import { EmbeddedActionButton } from "components/Button/EmbeddedActionButton";
+import { ValidationBannerErrorContent } from "components/Errors/gasErrors";
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import { useMultichainTokens } from "components/GmxAccountModal/hooks";
+
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+import { tradeModeLabels, tradeTypeLabels } from "../tradeboxConstants";
+import { useTradeboxTransactions } from "./useTradeboxTransactions";
+
+interface TradeboxButtonStateOptions {
+  account?: string;
+  setToTokenInputValue: (value: string, shouldResetPriceImpactWarning: boolean) => void;
+  canSwitchGasPaymentToken: boolean;
+}
+
+type TradeboxButtonState = {
+  text: ReactNode;
+  tooltipContent: ReactNode | null;
+  bannerErrorContent: ReactNode | null;
+  disabled: boolean;
+  onSubmit: () => Promise<void>;
+  slippageInputId: string;
+  expressParams?: ExpressTxnParams;
+  isExpressLoading: boolean;
+  batchParams?: BatchOrderTxnParams;
+  totalExecutionFee?: ExecutionFee;
+};
+
+export function useTradeboxButtonState({
+  account,
+  setToTokenInputValue,
+  canSwitchGasPaymentToken,
+}: TradeboxButtonStateOptions): TradeboxButtonState {
+  const chainId = useSelector(selectChainId);
+  const srcChainId = useSelector(selectSrcChainId);
+  const signer = useEthersSigner();
+
+  const tradeFlags = useSelector(selectTradeboxTradeFlags);
+  const { isSwap, isIncrease } = tradeFlags;
+  const isWaitingForExternalSwapQuote = useSelector(selectIsWaitingForExternalSwapQuote);
+  const { stopLoss, takeProfit } = useSidecarOrders();
+  const sidecarEntries = useSidecarEntries();
+  const isTpSlEnabled = useSelector(selectTradeboxIsTPSLEnabled);
+  const hasOutdatedUi = useHasOutdatedUi();
+  const multipleWalletExtensionsChainError = useMultipleWalletExtensionsChainError();
+  const localizedTradeTypeLabels = useLocalizedMap(tradeTypeLabels);
+  const localizedTradeModeLabels = useLocalizedMap(tradeModeLabels);
+  const tradeMode = useSelector(selectTradeboxTradeMode);
+  const { stage, collateralToken, tradeType, setStage } = useSelector(selectTradeboxState);
+  const { isLeverageSliderEnabled, setGasPaymentTokenAddress } = useSettings();
+  const { shouldShowDepositButton } = useGmxAccountShowDepositButton();
+  const [, setGmxAccountDepositViewTokenAddress] = useGmxAccountDepositViewTokenAddress();
+  const [, setGmxAccountDepositViewTokenInputValue] = useGmxAccountDepositViewTokenInputValue();
+  const [, setGmxAccountModalOpen] = useGmxAccountModalOpen();
+
+  const fromToken = useSelector(selectTradeboxFromToken);
+  const toToken = useSelector(selectTradeboxToToken);
+  const settlementChainGasPaymentToken = useSelector(selectSettlementChainGasPaymentToken);
+  const gmxAccountGasPaymentToken = useSelector(selectGmxAccountGasPaymentToken);
+  const tokensData = useSelector(selectTokensData);
+  const isWrapOrUnwrap = useSelector(selectTradeboxIsWrapOrUnwrap);
+  const payAmount = useSelector(selectTradeboxPayAmount);
+  const isFromTokenGmxAccount = useSelector(selectTradeboxIsFromTokenGmxAccount);
+  const gasPaymentToken = isFromTokenGmxAccount ? gmxAccountGasPaymentToken : settlementChainGasPaymentToken;
+  const hasExistingPosition = useSelector(selectTradeboxHasExistingPosition);
+  const decreaseAmounts = useSelector(selectTradeboxDecreasePositionAmounts);
+  const { tokenChainDataArray } = useMultichainTokens();
+
+  const { setPendingTxns } = usePendingTxns();
+  const { openConnectModal } = useConnectModal();
+  const isWalletInitializing = useIsWalletInitializing();
+
+  const {
+    onSubmitWrapOrUnwrap,
+    onSubmitSwap,
+    onSubmitIncreaseOrder,
+    onSubmitDecreaseOrder,
+    slippageInputId,
+    expressParams,
+    batchParams,
+    isExpressLoading,
+    isMultichainSubmitDisabled,
+    totalExecutionFee,
+  } = useTradeboxTransactions({
+    setPendingTxns,
+    canSwitchGasPaymentToken,
+  });
+
+  const approvalTokens = useMemo(() => {
+    const list: { tokenAddress: string; amount: bigint | undefined }[] = [];
+
+    if (fromToken && payAmount !== undefined) {
+      list.push({ tokenAddress: fromToken.address, amount: payAmount });
+    }
+
+    if (expressParams?.gasPaymentParams) {
+      list.push({
+        tokenAddress: expressParams.gasPaymentParams.gasPaymentTokenAddress,
+        amount: expressParams.gasPaymentParams.gasPaymentTokenAmount,
+      });
+    }
+
+    return list;
+  }, [fromToken, payAmount, expressParams?.gasPaymentParams]);
+
+  const {
+    tokensToApprove,
+    isAllowanceLoaded: isAllowanceLoadedRaw,
+    isApproving,
+    handleApprove,
+  } = useTokenApproval({
+    chainId,
+    spenderAddress: getContract(chainId, "SyntheticsRouter"),
+    tokens: approvalTokens,
+    allowPermit: Boolean(expressParams),
+    skip: isFromTokenGmxAccount,
+  });
+
+  const isDataReady = Boolean(fromToken && payAmount !== undefined && gasPaymentToken);
+  const isAllowanceLoaded = isDataReady && isAllowanceLoadedRaw;
+
+  const pendingApprovalTokenAddress = isAllowanceLoaded && !isApproving ? tokensToApprove[0] : undefined;
+  const isPendingGasPaymentTokenApproval =
+    pendingApprovalTokenAddress !== undefined &&
+    getIsGasPaymentTokenApproval({
+      tokenAddress: pendingApprovalTokenAddress,
+      gasPaymentTokenAddress: expressParams?.gasPaymentParams?.gasPaymentTokenAddress,
+      payTokenAddress: fromToken?.address,
+    });
+
+  const tradeError = useSelector(selectTradeboxTradeTypeError);
+
+  const isMaxLeverageActionOffered =
+    tradeError.buttonTooltipName === ValidationButtonTooltipName.maxLeverage ||
+    tradeError.buttonTooltipName === ValidationButtonTooltipName.resultingPositionMaxLeverage;
+
+  const { hasAvailableMaxLeverage, detectAndSetAvailableMaxLeverage } = useDetectAndSetAvailableMaxLeverage({
+    setToTokenInputValue,
+    enabled: isMaxLeverageActionOffered,
+  });
+
+  const nativeGasError = useMemo((): ValidationResult => {
+    if (gasPaymentToken && expressParams?.gasPaymentParams?.gasPaymentTokenAmount !== undefined) {
+      return {};
+    }
+
+    if (payAmount === undefined || payAmount === 0n) {
+      return {};
+    }
+
+    return getNativeGasError({
+      chainId,
+      networkFee: totalExecutionFee?.feeTokenAmount,
+      nativeBalance: getByKey(tokensData, zeroAddress)?.walletBalance,
+    });
+  }, [
+    chainId,
+    expressParams?.gasPaymentParams?.gasPaymentTokenAmount,
+    gasPaymentToken,
+    payAmount,
+    tokensData,
+    totalExecutionFee?.feeTokenAmount,
+  ]);
+
+  const approvalGasError = useMemo((): ValidationResult => {
+    if (!expressParams) {
+      return {};
+    }
+
+    return getApprovalGasError({
+      tokenToApprove: pendingApprovalTokenAddress,
+      nativeToken: getByKey(tokensData, zeroAddress),
+      gasPrice: expressParams.gasPrice,
+    });
+  }, [expressParams, pendingApprovalTokenAddress, tokensData]);
+
+  const gasPaymentTokenAllowance = useSelector(selectGasPaymentTokenAllowance);
+  const externalSwapDesirability = useSelector(selectExternalSwapDesirability);
+  const swapToToken = useSelector(selectTradeboxSelectSwapToToken);
+
+  const alternativeGasToken = useMemo((): TokenData | undefined => {
+    if (
+      approvalGasError.bannerErrorName !== ValidationBannerErrorName.insufficientNativeTokenForApproval ||
+      !isPendingGasPaymentTokenApproval ||
+      !gasPaymentToken ||
+      expressParams?.gasPaymentParams === undefined
+    ) {
+      return undefined;
+    }
+
+    const externalSwapConflictToken = isSwap ? swapToToken : collateralToken;
+    const excludeTokenAddresses =
+      externalSwapDesirability === "required" &&
+      externalSwapConflictToken &&
+      externalSwapConflictToken.address !== getWrappedToken(chainId).address
+        ? [externalSwapConflictToken.address]
+        : undefined;
+
+    const address = findNextGasPaymentToken({
+      chainId,
+      tokensData,
+      gasPaymentToken,
+      gasPaymentTokenAmount: expressParams.gasPaymentParams.gasPaymentTokenAmount,
+      payAmounts: fromToken && payAmount !== undefined ? { [fromToken.address]: payAmount } : {},
+      isGmxAccount: false,
+      excludeTokenAddresses,
+      tokensAllowanceData: gasPaymentTokenAllowance?.tokensAllowanceData ?? EMPTY_OBJECT,
+    });
+
+    return getByKey(tokensData, address);
+  }, [
+    approvalGasError.bannerErrorName,
+    isPendingGasPaymentTokenApproval,
+    gasPaymentToken,
+    expressParams?.gasPaymentParams,
+    isSwap,
+    swapToToken,
+    collateralToken,
+    externalSwapDesirability,
+    chainId,
+    tokensData,
+    fromToken,
+    payAmount,
+    gasPaymentTokenAllowance?.tokensAllowanceData,
+  ]);
+
+  const handleSwitchGasToken = useCallback(() => {
+    if (alternativeGasToken) {
+      setGasPaymentTokenAddress(alternativeGasToken.address);
+    }
+  }, [alternativeGasToken, setGasPaymentTokenAddress]);
+
+  const isOneClickActiveByUser = useSelector(selectIsOneClickActiveByUser);
+  const isExternalSwapBlockedByGasConflict = useSelector(selectIsExternalSwapDisabledByExpressSchema);
+  const isSubmitBlockedByRequiredExternalSwap =
+    externalSwapDesirability === "required" && (isOneClickActiveByUser || isExternalSwapBlockedByGasConflict);
+
+  const externalSwapBlockedError = useMemo((): ValidationResult => {
+    if (isSubmitBlockedByRequiredExternalSwap) {
+      return { buttonErrorMessage: t`No swap route available` };
+    }
+    return {};
+  }, [isSubmitBlockedByRequiredExternalSwap]);
+
+  const { buttonErrorText, tooltipContent, bannerErrorContent } = useMemo((): {
+    buttonErrorText: string | undefined;
+    tooltipContent: ReactNode | null;
+    bannerErrorContent: ReactNode | null;
+  } => {
+    const commonError = getCommonError({
+      chainId,
+      isConnected: Boolean(account),
+      hasOutdatedUi,
+    });
+
+    const expressError = getExpressError({
+      expressParams,
+      tokensData,
+    });
+
+    const validationResult = takeValidationResult(
+      commonError,
+      multipleWalletExtensionsChainError,
+      tradeError,
+      externalSwapBlockedError,
+      expressError,
+      nativeGasError,
+      approvalGasError
+    );
+
+    const setMaxLeverageAction = hasAvailableMaxLeverage ? (
+      <>
+        <br />
+        <br />
+        <EmbeddedActionButton onClick={detectAndSetAvailableMaxLeverage}>
+          <Trans>Set max leverage</Trans>
+        </EmbeddedActionButton>
+      </>
+    ) : null;
+
+    let tooltipContent: ReactNode = null;
+    if (validationResult.buttonTooltipMessage) {
+      tooltipContent = validationResult.buttonTooltipMessage;
+    } else if (validationResult.buttonTooltipName) {
+      switch (validationResult.buttonTooltipName) {
+        case ValidationButtonTooltipName.maxLeverage: {
+          tooltipContent = (
+            <>
+              {isLeverageSliderEnabled ? (
+                <Trans>Decrease leverage to match the max allowed leverage.</Trans>
+              ) : (
+                <Trans>Decrease size to match the max allowed leverage.</Trans>
+              )}{" "}
+              <ExternalLink href="https://docs.gmx.io/docs/trading/order-types/#max-leverage">
+                <Trans>Read more</Trans>
+              </ExternalLink>
+              .{setMaxLeverageAction}
+            </>
+          );
+
+          break;
+        }
+        case ValidationButtonTooltipName.resultingPositionMaxLeverage: {
+          tooltipContent = (
+            <>
+              <Trans>
+                The resulting position would exceed the maximum allowed leverage. Increase margin or reduce size.
+              </Trans>
+              {setMaxLeverageAction}
+            </>
+          );
+          break;
+        }
+        case ValidationButtonTooltipName.liqPriceGtMarkPrice: {
+          tooltipContent = <Trans>Position would be liquidated immediately upon execution. Reduce the size.</Trans>;
+          break;
+        }
+        case ValidationButtonTooltipName.noSwapPath: {
+          tooltipContent = (
+            <NoSwapPathTooltipContent
+              collateralToken={collateralToken}
+              fromToken={fromToken}
+              chainId={chainId}
+              toToken={toToken}
+            />
+          );
+          break;
+        }
+
+        case ValidationButtonTooltipName.insufficientGmxPoolLiquidity: {
+          tooltipContent = <InsufficientGmxPoolLiquidityTooltipContent />;
+          break;
+        }
+
+        // PositionEditor-only states
+        case ValidationButtonTooltipName.minDeposit:
+        case ValidationButtonTooltipName.marginDepositAutoCancelLimit:
+        case ValidationButtonTooltipName.marginDepositInsufficient:
+          break;
+
+        default:
+          mustNeverExist(validationResult.buttonTooltipName);
+      }
+    }
+
+    const bannerErrorContent =
+      validationResult.bannerErrorName && !shouldShowDepositButton ? (
+        <ValidationBannerErrorContent
+          validationBannerErrorName={validationResult.bannerErrorName}
+          chainId={chainId}
+          srcChainId={srcChainId}
+          gasPaymentTokenAddress={expressParams?.gasPaymentParams.gasPaymentTokenAddress}
+          approvalTokenAddress={pendingApprovalTokenAddress}
+          alternativeGasTokenAddress={alternativeGasToken?.address}
+          onSwitchGasToken={handleSwitchGasToken}
+        />
+      ) : null;
+
+    return {
+      buttonErrorText: validationResult.buttonErrorMessage,
+      tooltipContent,
+      bannerErrorContent,
+    };
+  }, [
+    chainId,
+    srcChainId,
+    account,
+    hasOutdatedUi,
+    expressParams,
+    tokensData,
+    multipleWalletExtensionsChainError,
+    tradeError,
+    externalSwapBlockedError,
+    nativeGasError,
+    approvalGasError,
+    pendingApprovalTokenAddress,
+    alternativeGasToken,
+    handleSwitchGasToken,
+    collateralToken,
+    fromToken,
+    toToken,
+    isLeverageSliderEnabled,
+    detectAndSetAvailableMaxLeverage,
+    shouldShowDepositButton,
+    hasAvailableMaxLeverage,
+  ]);
+
+  const payTokenSourceChainMappedBalance = useMemo(() => {
+    if (srcChainId === undefined || fromToken === undefined) {
+      return undefined;
+    }
+
+    const sourceChainToken = tokenChainDataArray.find(
+      (token) => token.address === fromToken.address && token.sourceChainId === srcChainId
+    );
+
+    if (sourceChainToken?.sourceChainBalance === undefined) {
+      return undefined;
+    }
+
+    return adjustForDecimals(
+      sourceChainToken.sourceChainBalance,
+      sourceChainToken.sourceChainDecimals,
+      fromToken.decimals
+    );
+  }, [tokenChainDataArray, fromToken, srcChainId]);
+
+  const onSubmit = useCallback(async () => {
+    if (!account || !signer) {
+      sendUserAnalyticsConnectWalletClickEvent("ActionButton");
+      openConnectModal?.();
+      return;
+    }
+
+    if (!signer) {
+      return;
+    }
+
+    if (shouldShowDepositButton) {
+      if (fromToken) {
+        const isSupportedToDeposit = MULTI_CHAIN_DEPOSIT_TRADE_TOKENS[chainId as SettlementChainId].includes(
+          fromToken.address
+        );
+
+        if (isSupportedToDeposit) {
+          setGmxAccountDepositViewTokenAddress(fromToken.address);
+          if (payAmount !== undefined) {
+            let cappedAmount = payAmount;
+
+            if (payTokenSourceChainMappedBalance !== undefined && payAmount > payTokenSourceChainMappedBalance) {
+              cappedAmount = payTokenSourceChainMappedBalance;
+            }
+
+            setGmxAccountDepositViewTokenInputValue(formatAmountFree(cappedAmount, fromToken.decimals));
+          }
+        }
+      }
+
+      setGmxAccountModalOpen("deposit");
+
+      return;
+    }
+
+    if (!isFromTokenGmxAccount && isAllowanceLoaded && tokensToApprove.length) {
+      if (!chainId || isApproving || !tokensToApprove[0]) return;
+
+      userAnalytics.pushEvent<TokenApproveClickEvent>({
+        event: "TokenApproveAction",
+        data: { action: "ApproveClick" },
+      });
+      handleApprove({
+        onApproveFail: () =>
+          userAnalytics.pushEvent<TokenApproveResultEvent>({
+            event: "TokenApproveAction",
+            data: { action: "ApproveFail" },
+          }),
+      });
+
+      return;
+    }
+
+    setStage("processing");
+
+    let txnPromise: Promise<any>;
+
+    if (isWrapOrUnwrap) {
+      txnPromise = onSubmitWrapOrUnwrap();
+    } else if (isSwap) {
+      txnPromise = onSubmitSwap();
+    } else if (isIncrease) {
+      txnPromise = Promise.resolve(onSubmitIncreaseOrder());
+    } else {
+      txnPromise = onSubmitDecreaseOrder();
+    }
+
+    if (expressParams?.subaccount) {
+      /**
+       * Wait 2 seconds to prevent double click on button
+       * waiting for txnPromise may not be enough because it's sometimes resolves very fast
+       */
+      await sleep(2000);
+      setStage("trade");
+
+      return;
+    }
+
+    return txnPromise.finally(() => {
+      setStage("trade");
+    });
+  }, [
+    account,
+    chainId,
+    expressParams?.subaccount,
+    fromToken,
+    handleApprove,
+    isAllowanceLoaded,
+    isApproving,
+    isFromTokenGmxAccount,
+    isIncrease,
+    isSwap,
+    isWrapOrUnwrap,
+    onSubmitDecreaseOrder,
+    onSubmitIncreaseOrder,
+    onSubmitSwap,
+    onSubmitWrapOrUnwrap,
+    openConnectModal,
+    payAmount,
+    payTokenSourceChainMappedBalance,
+    setGmxAccountDepositViewTokenAddress,
+    setGmxAccountDepositViewTokenInputValue,
+    setGmxAccountModalOpen,
+    setStage,
+    shouldShowDepositButton,
+    signer,
+    tokensToApprove,
+  ]);
+
+  return useMemo((): TradeboxButtonState => {
+    const commonState = {
+      tooltipContent,
+      bannerErrorContent,
+      onSubmit,
+      slippageInputId,
+      expressParams,
+      batchParams,
+      totalExecutionFee,
+      isExpressLoading,
+    };
+
+    if (!account && isWalletInitializing) {
+      return {
+        ...commonState,
+        text: t`Connecting wallet...`,
+        disabled: true,
+      };
+    }
+
+    if (!account && buttonErrorText) {
+      return {
+        ...commonState,
+        text: buttonErrorText,
+        disabled: false,
+      };
+    }
+
+    const isAvalancheGmxAccountWarning = isFromTokenGmxAccount && chainId === AVALANCHE;
+
+    if (isAvalancheGmxAccountWarning) {
+      return {
+        ...commonState,
+        text: t`Not supported`,
+        disabled: true,
+      };
+    }
+
+    if (shouldShowDepositButton) {
+      return {
+        ...commonState,
+        text: t`Deposit`,
+        disabled: false,
+      };
+    }
+
+    if (isWaitingForExternalSwapQuote) {
+      return {
+        ...commonState,
+        text: (
+          <>
+            <Trans>Loading swap path…</Trans>
+            <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ),
+        disabled: true,
+      };
+    }
+
+    if (buttonErrorText) {
+      return {
+        ...commonState,
+        text: buttonErrorText,
+        disabled: true,
+      };
+    }
+
+    if (isTpSlEnabled && (stopLoss.error?.percentage || takeProfit.error?.percentage)) {
+      return {
+        ...commonState,
+        text: t`TP/SL orders exceed the position`,
+        disabled: true,
+      };
+    }
+
+    if (isExpressLoading || isMultichainSubmitDisabled) {
+      return {
+        ...commonState,
+        text: (
+          <>
+            <Trans>Loading network fees…</Trans>
+            <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ),
+        disabled: true,
+      };
+    }
+
+    if ((isApproving || isAllowanceLoaded) && tokensToApprove.length) {
+      const tokenToApprove = tokensToApprove[0];
+      const tokenSymbol = getToken(chainId, tokenToApprove).symbol;
+      const isGasPaymentTokenApproval = getIsGasPaymentTokenApproval({
+        tokenAddress: tokenToApprove,
+        gasPaymentTokenAddress: expressParams?.gasPaymentParams.gasPaymentTokenAddress,
+        payTokenAddress: fromToken?.address,
+      });
+      const approveButtonText = getApproveButtonText({ tokenSymbol, isGasPaymentToken: isGasPaymentTokenApproval });
+
+      return {
+        ...commonState,
+        tooltipContent: isGasPaymentTokenApproval ? getGasPaymentTokenApprovalTooltip(tokenSymbol) : tooltipContent,
+        text: isApproving ? (
+          <>
+            {approveButtonText} <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ) : (
+          approveButtonText
+        ),
+        disabled: isApproving,
+      };
+    }
+
+    if (stage === "processing") {
+      return {
+        ...commonState,
+        text: t`Creating order...`,
+        disabled: true,
+      };
+    }
+
+    let submitButtonText = "";
+    {
+      if (buttonErrorText) {
+        submitButtonText = buttonErrorText;
+      } else {
+        if (isSwap) {
+          const modeLabel = localizedTradeModeLabels[tradeMode];
+          submitButtonText = `${modeLabel}: ${t`Swap`} ${fromToken?.symbol}`;
+        } else {
+          const directionLabel = localizedTradeTypeLabels[tradeType!];
+          const isMarket = tradeMode === TradeMode.Market;
+
+          let actionLabel: string;
+          if (isIncrease) {
+            actionLabel = hasExistingPosition ? t`Increase` : t`Open`;
+          } else {
+            const isFullClose = decreaseAmounts?.isFullClose ?? false;
+            actionLabel = isFullClose ? t`Close` : t`Decrease`;
+          }
+
+          if (isMarket) {
+            submitButtonText = `${actionLabel} ${directionLabel}`;
+          } else {
+            const modeLabel = localizedTradeModeLabels[tradeMode];
+            submitButtonText = `${modeLabel}: ${actionLabel} ${directionLabel}`;
+          }
+        }
+      }
+    }
+
+    if (isIncrease && sidecarEntries.length > 0) {
+      const isError = sidecarEntries.some((e) => {
+        if (e.txnType === "cancel") return false;
+
+        return e.sizeUsd?.error || e.percentage?.error || e.price?.error;
+      });
+
+      return {
+        ...commonState,
+        text: submitButtonText,
+        disabled: isError,
+      };
+    }
+
+    return {
+      ...commonState,
+      text: submitButtonText,
+      disabled: false,
+    };
+  }, [
+    tooltipContent,
+    bannerErrorContent,
+    onSubmit,
+    slippageInputId,
+    expressParams,
+    batchParams,
+    totalExecutionFee,
+    isExpressLoading,
+    isMultichainSubmitDisabled,
+    isWaitingForExternalSwapQuote,
+    account,
+    isWalletInitializing,
+    buttonErrorText,
+    shouldShowDepositButton,
+    stopLoss.error?.percentage,
+    takeProfit.error?.percentage,
+    isApproving,
+    tokensToApprove,
+    isAllowanceLoaded,
+    stage,
+    isIncrease,
+    sidecarEntries,
+    isTpSlEnabled,
+    chainId,
+    isSwap,
+    fromToken?.address,
+    fromToken?.symbol,
+    localizedTradeTypeLabels,
+    localizedTradeModeLabels,
+    tradeMode,
+    tradeType,
+    isFromTokenGmxAccount,
+    hasExistingPosition,
+    decreaseAmounts?.isFullClose,
+  ]);
+}
+
+export function useDetectAndSetAvailableMaxLeverage({
+  setToTokenInputValue,
+  enabled,
+}: {
+  setToTokenInputValue: (value: string, shouldResetPriceImpactWarning: boolean) => void;
+  enabled: boolean;
+}) {
+  const tradeFlags = useSelector(selectTradeboxTradeFlags);
+  const { isLong } = tradeFlags;
+  const triggerPrice = useSelector(selectTradeboxTriggerPrice);
+  const tradeMode = useSelector(selectTradeboxTradeMode);
+
+  const { minCollateralUsd } = usePositionsConstants();
+
+  const { collateralToken, marketInfo, selectedTriggerAcceptablePriceImpactBps, setLeverageOption } =
+    useSelector(selectTradeboxState);
+
+  const { isLeverageSliderEnabled, isSetAcceptablePriceImpactEnabled } = useSettings();
+
+  const fromToken = useSelector(selectTradeboxFromToken);
+  const fromTokenAmount = useSelector(selectTradeboxFromTokenAmount);
+  const toToken = useSelector(selectTradeboxToToken);
+  const toTokenAmount = useSelector(selectTradeboxToTokenAmount);
+
+  const existingPosition = useSelector(selectTradeboxExistingPositionForPreview);
+
+  const maxAllowedLeverage = useSelector(selectTradeboxMaxAllowedLeverage);
+
+  const findSwapPath = useSelector(selectTradeboxFindSwapPath);
+  const uiFeeFactor = useUiFeeFactor();
+  const userReferralInfo = useUserReferralInfo();
+  const proDiscountFactor = useSelector(selectProDiscountFactor);
+  const acceptablePriceImpactBuffer = useSelector(selectSavedAcceptablePriceImpactBuffer);
+  const externalSwapQuote = useSelector(selectExternalSwapQuote);
+  const externalSwapQuoteParams = useSelector(selectExternalSwapQuoteParams);
+  const chainId = useSelector(selectChainId);
+  const marketsInfoData = useSelector(selectMarketsInfoData);
+
+  const maxLeverageSearchParams = useMemo((): MaxLeverageIncreaseParams | undefined => {
+    if (!enabled || !collateralToken || !toToken || !fromToken || !marketInfo || minCollateralUsd === undefined) {
+      return undefined;
+    }
+
+    return {
+      collateralToken,
+      findSwapPath,
+      indexToken: toToken,
+      indexTokenAmount: toTokenAmount,
+      initialCollateralAmount: fromTokenAmount,
+      initialCollateralToken: fromToken,
+      externalSwapQuote,
+      isLong,
+      marketInfo,
+      position: existingPosition,
+      uiFeeFactor,
+      userReferralInfo,
+      proDiscountFactor,
+      acceptablePriceImpactBuffer,
+      fixedAcceptablePriceImpactBps: selectedTriggerAcceptablePriceImpactBps,
+      triggerPrice,
+      limitOrderType: getLimitOrderTypeByTradeMode(tradeMode),
+      marketsInfoData,
+      chainId,
+      externalSwapQuoteParams,
+      isSetAcceptablePriceImpactEnabled,
+      maxAllowedLeverage,
+      minCollateralUsd,
+    };
+  }, [
+    enabled,
+    acceptablePriceImpactBuffer,
+    collateralToken,
+    findSwapPath,
+    fromToken,
+    externalSwapQuote,
+    externalSwapQuoteParams,
+    chainId,
+    marketsInfoData,
+    fromTokenAmount,
+    isLong,
+    marketInfo,
+    maxAllowedLeverage,
+    minCollateralUsd,
+    existingPosition,
+    selectedTriggerAcceptablePriceImpactBps,
+    toToken,
+    toTokenAmount,
+    triggerPrice,
+    uiFeeFactor,
+    userReferralInfo,
+    proDiscountFactor,
+    isSetAcceptablePriceImpactEnabled,
+    tradeMode,
+  ]);
+
+  const maxLeverageIncrease = useMemo(
+    () => (maxLeverageSearchParams === undefined ? undefined : findMaxLeverageIncrease(maxLeverageSearchParams)),
+    [maxLeverageSearchParams]
+  );
+
+  const hasAvailableMaxLeverage = maxLeverageIncrease !== undefined;
+
+  const detectAndSetAvailableMaxLeverage = useCallback(() => {
+    if (!maxLeverageIncrease || !toToken) {
+      return;
+    }
+
+    if (isLeverageSliderEnabled) {
+      // round to int if it's > 1x
+      const resultLeverage =
+        maxLeverageIncrease.leverage > 10
+          ? Math.floor(maxLeverageIncrease.leverage / 10)
+          : Math.floor(maxLeverageIncrease.leverage) / 10;
+
+      setLeverageOption(resultLeverage);
+
+      return;
+    }
+
+    const visualMultiplier = BigInt(toToken.visualMultiplier ?? 1);
+
+    setToTokenInputValue(
+      formatAmountFree(
+        substractMaxLeverageSlippage(maxLeverageIncrease.increaseAmounts.sizeDeltaInTokens / visualMultiplier),
+        toToken.decimals,
+        8
+      ),
+      true
+    );
+  }, [isLeverageSliderEnabled, maxLeverageIncrease, setLeverageOption, setToTokenInputValue, toToken]);
+
+  return {
+    hasAvailableMaxLeverage,
+    detectAndSetAvailableMaxLeverage,
+  };
+}
+
+function InsufficientGmxPoolLiquidityTooltipContent() {
+  const chainId = useSelector(selectChainId);
+  const externalSwapBlockReason = useSelector(selectExternalSwapBlockReason);
+  const fromToken = useSelector(selectTradeboxFromToken);
+  const swapToToken = useSelector(selectTradeboxSelectSwapToToken);
+  const isFromTokenGmxAccount = useSelector(selectTradeboxIsFromTokenGmxAccount);
+  const { setTradeMode } = useSelector(selectTradeboxState);
+
+  const handleSwitchToMarketOrder = useCallback(() => {
+    setTradeMode(TradeMode.Market);
+  }, [setTradeMode]);
+
+  switch (externalSwapBlockReason) {
+    case "oneClickTrading":
+      return (
+        <Trans>
+          GMX pools can't fill this swap size. It needs an external route, which isn't available with One-Click Trading.
+          Disable One-Click Trading to proceed.
+        </Trans>
+      );
+    case "gasTokenConflict":
+      return (
+        <Trans>
+          GMX pools can't fill this swap size. It needs an external route, which isn't available while the gas payment
+          token matches the token you're swapping to. Change the gas payment token to proceed.
+        </Trans>
+      );
+    case "orderTypeNotSupported":
+      return (
+        <Trans>
+          TWAP swaps use GMX pool liquidity only, which can't fill this order size.
+          <br />
+          <br />
+          <EmbeddedActionButton onClick={handleSwitchToMarketOrder}>Switch to a market order</EmbeddedActionButton> to
+          enable external routes.
+        </Trans>
+      );
+    case "noRouteFound": {
+      const aggregatorSwapUrl = getExternalAggregatorSwapUrl({
+        chainId,
+        isFromTokenGmxAccount,
+        fromTokenAddress: fromToken?.address,
+        toTokenAddress: swapToToken?.address,
+      });
+
+      if (!aggregatorSwapUrl) {
+        return (
+          <Trans>
+            GMX pools can't fill this swap size, and no external route is currently available. Try reducing the amount.
+          </Trans>
+        );
+      }
+
+      return (
+        <Trans>
+          GMX pools can't fill this swap size, and no external route is currently available. Try reducing the amount or{" "}
+          <ExternalLink href={aggregatorSwapUrl}>swap on an external aggregator</ExternalLink>.
+        </Trans>
+      );
+    }
+    default:
+      return <Trans>GMX pools don't have enough liquidity for this swap size. Try reducing the amount.</Trans>;
+  }
+}
+
+function NoSwapPathTooltipContent({
+  collateralToken,
+  fromToken,
+  chainId,
+  toToken,
+}: {
+  collateralToken: TokenData | undefined;
+  fromToken: TokenData | undefined;
+  chainId: number;
+  toToken: TokenData | undefined;
+}) {
+  const { setFromTokenAddress, setToTokenAddress, setTradeType, setTradeMode } = useSelector(selectTradeboxState);
+  const { isSwap } = useSelector(selectTradeboxTradeFlags);
+  const isFromTokenGmxAccount = useSelector(selectTradeboxIsFromTokenGmxAccount);
+
+  const makeHandleSwapClick = useCallback(
+    (fromTokenSymbol: string, toTokenSymbol: string) => () => {
+      setTradeType(TradeType.Swap);
+      setTradeMode(TradeMode.Market);
+      setFromTokenAddress(getTokenBySymbol(chainId, fromTokenSymbol)?.address);
+      setToTokenAddress(getTokenBySymbol(chainId, toTokenSymbol)?.address);
+    },
+    [chainId, setFromTokenAddress, setToTokenAddress, setTradeMode, setTradeType]
+  );
+
+  if (!fromToken) {
+    return <Trans>No swap path available</Trans>;
+  }
+
+  if (isSwap) {
+    const aggregatorSwapUrl = getExternalAggregatorSwapUrl({
+      chainId,
+      isFromTokenGmxAccount,
+      fromTokenAddress: fromToken.address,
+      toTokenAddress: toToken?.address,
+    });
+
+    if (!aggregatorSwapUrl) {
+      return (
+        <Trans>
+          No GMX swap route found for {fromToken.assetSymbol ?? fromToken.symbol} to{" "}
+          {toToken?.assetSymbol ?? toToken?.symbol}.
+        </Trans>
+      );
+    }
+
+    return (
+      <Trans>
+        No GMX swap route found for {fromToken.assetSymbol ?? fromToken.symbol} to{" "}
+        {toToken?.assetSymbol ?? toToken?.symbol}. Try{" "}
+        <ExternalLink href={aggregatorSwapUrl}>an external aggregator</ExternalLink>.
+      </Trans>
+    );
+  }
+
+  const collateralSymbol = collateralToken?.assetSymbol ?? collateralToken?.symbol;
+
+  return (
+    <Trans>
+      {collateralSymbol} is required for collateral.
+      <br />
+      <br />
+      No swap path found for {fromToken?.assetSymbol ?? fromToken?.symbol} to {collateralSymbol} within GMX.
+      <br />
+      <br />
+      <EmbeddedActionButton onClick={makeHandleSwapClick(fromToken.symbol, collateralToken?.symbol ?? "")}>
+        Swap {collateralSymbol}
+      </EmbeddedActionButton>{" "}
+      or <ExternalLink href={JUMPER_BRIDGE_URL}>bridge {collateralSymbol}</ExternalLink>.
+    </Trans>
+  );
+}

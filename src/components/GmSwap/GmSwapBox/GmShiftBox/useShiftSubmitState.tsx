@@ -1,0 +1,230 @@
+import { t } from "@lingui/macro";
+import { useMemo } from "react";
+
+import { useConnectModal } from "context/ConnectModalContext/ConnectModalContext";
+import { selectAccount, selectChainId } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { ExecutionFee } from "domain/synthetics/fees";
+import type { GlvOrMarketInfo, MarketInfo } from "domain/synthetics/markets/types";
+import type { TokenData, TokensData } from "domain/synthetics/tokens/types";
+import type { ShiftAmounts } from "domain/synthetics/trade/utils/shift";
+import { getCommonError, getGmShiftError, takeValidationResult } from "domain/synthetics/trade/utils/validation";
+import type { DirectDepositAccess } from "domain/synthetics/whitelists/utils";
+import { useTokenApproval } from "domain/tokens/useTokenApproval";
+import { useMultipleWalletExtensionsChainError } from "lib/chains/getMultipleWalletExtensionsChainError";
+import { useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { userAnalytics } from "lib/userAnalytics";
+import type { TokenApproveClickEvent, TokenApproveResultEvent } from "lib/userAnalytics/types";
+import { useIsWalletInitializing } from "lib/wallets/useIsWalletInitializing";
+import type { GmSwapFees } from "sdk/utils/trade/types";
+
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+import { useShiftTransactions } from "./useShiftTransactions";
+import { getGmSwapBoxApproveTokenSymbol } from "../getGmSwapBoxApproveToken";
+
+export function useShiftSubmitState({
+  amounts,
+  executionFee,
+  fees,
+  marketTokenUsd,
+  routerAddress,
+  selectedMarketInfo,
+  selectedToken,
+  shouldDisableValidationForTesting,
+  tokensData,
+  toMarketInfo,
+  toToken,
+  glvOrMarketInfoData,
+  toMarketDirectDepositAccess,
+}: {
+  amounts: ShiftAmounts | undefined;
+  executionFee: ExecutionFee | undefined;
+  fees: GmSwapFees | undefined;
+  marketTokenUsd: bigint | undefined;
+  routerAddress: string;
+  selectedMarketInfo: MarketInfo | undefined;
+  selectedToken: TokenData | undefined;
+  shouldDisableValidationForTesting: boolean;
+  tokensData: TokensData | undefined;
+  toMarketInfo: MarketInfo | undefined;
+  toToken: TokenData | undefined;
+  glvOrMarketInfoData: { [key: string]: GlvOrMarketInfo } | undefined;
+  toMarketDirectDepositAccess: DirectDepositAccess | undefined;
+}) {
+  const chainId = useSelector(selectChainId);
+  const account = useSelector(selectAccount);
+  const isWalletInitializing = useIsWalletInitializing();
+  const hasOutdatedUi = useHasOutdatedUi();
+  const multipleWalletExtensionsChainError = useMultipleWalletExtensionsChainError();
+
+  const { openConnectModal } = useConnectModal();
+
+  const { isSubmitting, onSubmit } = useShiftTransactions({
+    fromMarketToken: selectedToken,
+    fromMarketTokenAmount: amounts?.fromTokenAmount,
+    fromMarketTokenUsd: amounts?.fromTokenUsd,
+    marketToken: toToken,
+    marketTokenAmount: amounts?.toTokenAmount,
+    shouldDisableValidation: shouldDisableValidationForTesting,
+    tokensData,
+    executionFee,
+    marketTokenUsd,
+  });
+
+  const tokens = useMemo(
+    () => (selectedToken ? [{ tokenAddress: selectedToken.address, amount: amounts?.fromTokenAmount }] : []),
+    [selectedToken, amounts?.fromTokenAmount]
+  );
+
+  const { tokensToApprove, isApproving, isAllowanceLoading, isAllowanceLoaded, handleApprove } = useTokenApproval({
+    chainId,
+    spenderAddress: routerAddress,
+    tokens,
+  });
+
+  return useMemo(() => {
+    if (isSubmitting) {
+      return {
+        text: t`Submitting...`,
+        disabled: true,
+      };
+    }
+
+    if (multipleWalletExtensionsChainError.buttonErrorMessage) {
+      return {
+        text: multipleWalletExtensionsChainError.buttonErrorMessage,
+        error: multipleWalletExtensionsChainError.buttonErrorMessage,
+        errorDescription: multipleWalletExtensionsChainError.buttonTooltipMessage,
+        disabled: true,
+        onSubmit,
+      };
+    }
+
+    if (isAllowanceLoading) {
+      return {
+        text: t`Loading...`,
+        disabled: true,
+      };
+    }
+
+    if (!account) {
+      if (isWalletInitializing) {
+        return {
+          text: t`Connecting wallet...`,
+          disabled: true,
+        };
+      }
+
+      return {
+        text: t`Connect wallet`,
+        onSubmit: () => openConnectModal?.(),
+      };
+    }
+
+    const commonError = getCommonError({
+      chainId,
+      isConnected: true,
+      hasOutdatedUi,
+    });
+
+    const shiftError = getGmShiftError({
+      chainId,
+      fromMarketInfo: selectedMarketInfo,
+      fromToken: selectedToken,
+      fromTokenAmount: amounts?.fromTokenAmount,
+      fromTokenUsd: amounts?.fromTokenUsd,
+      fromLongTokenAmount: amounts?.fromLongTokenAmount,
+      fromShortTokenAmount: amounts?.fromShortTokenAmount,
+      toMarketInfo: toMarketInfo,
+      toToken: toToken,
+      toTokenAmount: amounts?.toTokenAmount,
+      fees,
+      priceImpactUsd: amounts?.swapPriceImpactDeltaUsd,
+      toMarketDirectDepositAccess,
+    });
+
+    const error = takeValidationResult(commonError, multipleWalletExtensionsChainError, shiftError);
+
+    if (error.buttonErrorMessage) {
+      return {
+        text: error.buttonErrorMessage,
+        error: error.buttonErrorMessage,
+        errorDescription: error.buttonTooltipMessage,
+        disabled: !shouldDisableValidationForTesting,
+        onSubmit,
+      };
+    }
+
+    if (isApproving && tokensToApprove.length) {
+      const address = tokensToApprove[0];
+      const tokenSymbol = getGmSwapBoxApproveTokenSymbol(address, tokensData, glvOrMarketInfoData);
+
+      return {
+        text: (
+          <>
+            {t`Approve ${tokenSymbol}`} <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ),
+        disabled: true,
+      };
+    }
+
+    if (isAllowanceLoaded && tokensToApprove.length > 0) {
+      const address = tokensToApprove[0];
+      const tokenSymbol = getGmSwapBoxApproveTokenSymbol(address, tokensData, glvOrMarketInfoData);
+
+      return {
+        text: t`Approve ${tokenSymbol}`,
+        onSubmit: () => {
+          userAnalytics.pushEvent<TokenApproveClickEvent>({
+            event: "TokenApproveAction",
+            data: { action: "ApproveClick" },
+          });
+          handleApprove({
+            onApproveFail: () =>
+              userAnalytics.pushEvent<TokenApproveResultEvent>({
+                event: "TokenApproveAction",
+                data: { action: "ApproveFail" },
+              }),
+          });
+        },
+      };
+    }
+
+    return {
+      text: t`Shift GM`,
+      onSubmit,
+      tokensToApprove,
+    };
+  }, [
+    isSubmitting,
+    isAllowanceLoading,
+    account,
+    isWalletInitializing,
+    chainId,
+    hasOutdatedUi,
+    selectedMarketInfo,
+    selectedToken,
+    amounts?.fromTokenAmount,
+    amounts?.fromTokenUsd,
+    amounts?.fromLongTokenAmount,
+    amounts?.fromShortTokenAmount,
+    amounts?.toTokenAmount,
+    amounts?.swapPriceImpactDeltaUsd,
+    toMarketInfo,
+    toToken,
+    toMarketDirectDepositAccess,
+    fees,
+    multipleWalletExtensionsChainError,
+    isApproving,
+    tokensToApprove,
+    isAllowanceLoaded,
+    onSubmit,
+    openConnectModal,
+    shouldDisableValidationForTesting,
+    tokensData,
+    glvOrMarketInfoData,
+    handleApprove,
+  ]);
+}

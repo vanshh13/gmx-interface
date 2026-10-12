@@ -1,0 +1,407 @@
+import { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/macro";
+
+import { ARBITRUM, AVALANCHE, ContractsChainId } from "config/chains";
+
+type EcosystemGmxPage = {
+  title: MessageDescriptor;
+  link: string;
+  linkLabel: string;
+  about: MessageDescriptor;
+  chainIds: ContractsChainId[];
+};
+
+export const gmxPages: EcosystemGmxPage[] = [
+  {
+    title: msg`GMX governance`,
+    link: "https://gov.gmx.io/",
+    linkLabel: "gov.gmx.io",
+    about: msg`GMX governance page`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX proposals`,
+    link: "https://snapshot.org/#/gmx.eth",
+    linkLabel: "snapshot.org",
+    about: msg`GMX proposals voting page`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX announcements`,
+    link: "https://t.me/GMX_Announcements",
+    linkLabel: "t.me",
+    about: msg`GMX announcements and updates`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Dune Analytics for GMX`,
+    link: "https://dune.com/gmx-io/gmx-analytics",
+    linkLabel: "dune.com",
+    about: msg`Dune Analytics dashboard`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX technical announcements`,
+    link: "https://t.me/GMX_Technical_Announcements",
+    linkLabel: "t.me",
+    about: msg`Technical updates and developer announcements`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX Substack`,
+    link: "https://gmxio.substack.com/",
+    linkLabel: "substack.com",
+    about: msg`GMX newsletter and long-form updates`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+];
+
+type EcosystemCommunityProject = {
+  title: MessageDescriptor;
+  link: string;
+  linkLabel: string;
+  about: MessageDescriptor;
+  creatorLabel: string | string[];
+  creatorLink: string | string[];
+  chainIds: ContractsChainId[];
+};
+
+export const communityProjects: EcosystemCommunityProject[] = [
+  {
+    title: msg`GMX positions bot`,
+    link: "https://t.me/GMXv2Positions",
+    linkLabel: "t.me",
+    about: msg`Telegram bot for GMX position updates`,
+    creatorLabel: "@SniperMonke01",
+    creatorLink: "https://t.me/SniperMonke01",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX trading stats`,
+    link: "https://t.me/GMXTradingStats",
+    linkLabel: "t.me",
+    about: msg`Telegram bot for open interest on GMX`,
+    creatorLabel: "@SniperMonke01",
+    creatorLink: "https://x.com/SniperMonke01",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`GMX swaps`,
+    link: "https://t.me/GMXSwaps",
+    linkLabel: "t.me",
+    about: msg`Telegram bot for GMX swap monitoring`,
+    creatorLabel: "@snipermonke01",
+    creatorLink: "https://x.com/snipermonke01",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Copin`,
+    link: "https://app.copin.io",
+    linkLabel: "copin.io",
+    about: msg`Explore, analyze, and copy on-chain traders`,
+    creatorLabel: "@0xanol",
+    creatorLink: "https://x.com/0xanol",
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`GMX V2 Telegram & Discord analytics`,
+    link: "https://t.me/gmx_v2_bot",
+    linkLabel: "t.me",
+    about: msg`GMX V2 data analytics within Telegram`,
+    creatorLabel: "@gmx_v2_bot",
+    creatorLink: "https://t.me/gmx_v2_bot",
+    chainIds: [ARBITRUM],
+  },
+];
+
+type EcosystemDashboardProject = {
+  title: MessageDescriptor;
+  link: string;
+  linkLabel: string;
+  about: MessageDescriptor;
+  creatorLabel: string;
+  creatorLink: string;
+  chainIds: ContractsChainId[];
+};
+
+export const dashboardProjects: EcosystemDashboardProject[] = [
+  {
+    title: msg`GMX referrals dashboard`,
+    link: "https://www.gmxreferrals.com/",
+    linkLabel: "gmxreferrals.com",
+    about: msg`Dashboard for GMX referral stats`,
+    creatorLabel: "@kyzoeth",
+    creatorLink: "https://x.com/kyzoeth",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`TokenTerminal`,
+    link: "https://tokenterminal.com/terminal/projects/gmx",
+    linkLabel: "tokenterminal.com",
+    about: msg`GMX fundamentals`,
+    creatorLabel: "@tokenterminal",
+    creatorLink: "https://x.com/tokenterminal",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Saulius GMX analytics`,
+    link: "https://dune.com/saulius/gmx-analytics",
+    linkLabel: "dune.com",
+    about: msg`Protocol analytics`,
+    creatorLabel: "@sliux",
+    creatorLink: "https://x.com/sliux",
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+];
+
+export const integrations: EcosystemGmxPage[] = [
+  {
+    title: msg`DeBank`,
+    link: "https://debank.com",
+    linkLabel: "debank.com",
+    about: msg`DeFi portfolio tracker`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`DefiLlama`,
+    link: "https://defillama.com",
+    linkLabel: "defillama.com",
+    about: msg`Decentralized finance dashboard`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Jones DAO`,
+    link: "https://jonesdao.io",
+    linkLabel: "jonesdao.io",
+    about: msg`Decentralized options strategies`,
+
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Yield Yak Optimizer`,
+    link: "https://yieldyak.com/",
+    linkLabel: "yieldyak.com",
+    about: msg`Yield optimizer on Avalanche`,
+
+    chainIds: [AVALANCHE],
+  },
+  {
+    title: msg`Stabilize Protocol`,
+    link: "https://www.stabilize.finance/",
+    linkLabel: "stabilize.finance",
+    about: msg`Yield vaults`,
+
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`DODO`,
+    link: "https://dodoex.io/",
+    linkLabel: "dodoex.io",
+    about: msg`Decentralized trading protocol`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`KyberSwap`,
+    link: "https://kyberswap.com/",
+    linkLabel: "kyberswap.com",
+    about: msg`DEX aggregator`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`ParaSwap`,
+    link: "https://www.paraswap.io/",
+    linkLabel: "paraswap.io",
+    about: msg`DEX aggregator`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`1inch`,
+    link: "https://1inch.io/",
+    linkLabel: "1inch.io",
+    about: msg`DEX aggregator`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Yield Yak Swap`,
+    link: "https://yieldyak.com/swap",
+    linkLabel: "yieldyak.com",
+    about: msg`DEX aggregator`,
+
+    chainIds: [AVALANCHE],
+  },
+  {
+    title: msg`Beefy`,
+    link: "https://app.beefy.com/",
+    linkLabel: "beefy.com",
+    about: msg`GLP and GMX autocompounding vaults`,
+
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Dolomite`,
+    link: "https://app.dolomite.io/balances",
+    linkLabel: "dolomite.io",
+    about: msg`Decentralized money market`,
+
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Symbiosis`,
+    link: "https://app.symbiosis.finance/",
+    linkLabel: "symbiosis.finance",
+    about: msg`DEX aggregator`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`0x`,
+    link: "https://0x.org/",
+    linkLabel: "0x.org",
+    about: msg`DEX aggregator`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Harmonix`,
+    link: "https://harmonix.fi/",
+    linkLabel: "harmonix.fi",
+    about: msg`Yield optimizations`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`Perpie`,
+    link: "https://www.perpie.io/",
+    linkLabel: "perpie.io",
+    about: msg`Telegram bot`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`RabbitHole`,
+    link: "https://rabbithole.gg/",
+    linkLabel: "rabbithole.gg",
+    about: msg`Onchain quests and rewards`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Vaultka`,
+    link: "https://www.vaultka.com/",
+    linkLabel: "vaultka.com",
+    about: msg`Yield vaults`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Tradao`,
+    link: "https://www.tradao.xyz/#/",
+    linkLabel: "tradao.xyz",
+    about: msg`Derivatives portfolio tracker`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`DeltaPrime`,
+    link: "https://deltaprime.io/",
+    linkLabel: "deltaprime.io",
+    about: msg`DeFi margin protocol`,
+    chainIds: [ARBITRUM, AVALANCHE],
+  },
+  {
+    title: msg`D2.Finance`,
+    link: "https://d2.finance/",
+    linkLabel: "d2.finance",
+    about: msg`Option-based vaults`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Umami DAO`,
+    link: "https://umami.finance/",
+    linkLabel: "umami.finance",
+    about: msg`Yield vaults`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`BonsaiDAO`,
+    link: "https://www.bonsaidao.xyz/",
+    linkLabel: "bonsaidao.xyz",
+    about: msg`Decentralized yield products`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Pear Protocol`,
+    link: "https://www.pear.garden/",
+    linkLabel: "pear.garden",
+    about: msg`Pairs trading`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Solv Finance`,
+    link: "https://solv.finance/",
+    linkLabel: "solv.finance",
+    about: msg`Asset management`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`HoudiniSwap`,
+    link: "https://houdiniswap.com/",
+    linkLabel: "houdiniswap.com",
+    about: msg`Bridge and swap tokens`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Venus`,
+    link: "https://app.venus.io/#/?chainId=42161",
+    linkLabel: "venus.io",
+    about: msg`Lending and borrowing`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Toros`,
+    link: "https://x.com/torosfinance/",
+    linkLabel: "x.com",
+    about: msg`Leveraged tokens with protection`,
+    chainIds: [ARBITRUM],
+  },
+  {
+    title: msg`Elfa AI`,
+    link: "https://www.elfa.ai/",
+    linkLabel: "elfa.ai",
+    about: msg`AI trading assistant`,
+    chainIds: [ARBITRUM],
+  },
+];
+
+type EcosystemTelegramGroup = {
+  title: MessageDescriptor;
+  link: string;
+  linkLabel: string;
+  about: MessageDescriptor;
+};
+
+export const telegramGroups: EcosystemTelegramGroup[] = [
+  {
+    title: msg`GMX`,
+    link: "https://t.me/GMX_IO",
+    linkLabel: "t.me",
+    about: msg`Telegram group`,
+  },
+  {
+    title: msg`GMX (Chinese)`,
+    link: "https://t.me/gmxch",
+    linkLabel: "t.me",
+    about: msg`Telegram group (Chinese)`,
+  },
+  {
+    title: msg`GMX (Portuguese)`,
+    link: "https://t.me/GMX_Portuguese",
+    linkLabel: "t.me",
+    about: msg`Telegram group (Portuguese)`,
+  },
+  {
+    title: msg`GMX trading chat`,
+    link: "https://t.me/gambittradingchat",
+    linkLabel: "t.me",
+    about: msg`GMX community discussion`,
+  },
+];

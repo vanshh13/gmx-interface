@@ -1,0 +1,825 @@
+import { plural, t, Trans } from "@lingui/macro";
+import mapValues from "lodash/mapValues";
+import { useCallback, useMemo } from "react";
+import { zeroAddress } from "viem";
+
+import { PendingTransaction, usePendingTxns } from "context/PendingTxnsContext/PendingTxnsContext";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useSubaccountContext } from "context/SubaccountContext/SubaccountContextProvider";
+import {
+  getPendingOrderKey,
+  PendingOrderData,
+  PendingPositionUpdate,
+  useSyntheticsEvents,
+} from "context/SyntheticsEvents";
+import { selectOrdersInfoData, selectTokensData } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useTokenPermitsContext } from "context/TokenPermitsContext/TokenPermitsContextProvider";
+import {
+  TokenBalanceUpdate,
+  useTokensBalancesUpdates,
+} from "context/TokensBalancesContext/TokensBalancesContextProvider";
+import { getPositionKey } from "domain/synthetics/positions/utils";
+import { getRemainingSubaccountActions, Subaccount } from "domain/synthetics/subaccount";
+import { TokenBalanceType } from "domain/tokens";
+import { validateTokenPermitSignature } from "domain/tokens/permitUtils";
+import { sendAddressablePixelEventForOrder } from "lib/addressablePixel";
+import { useChainId } from "lib/chains";
+import { parseError } from "lib/errors";
+import {
+  getExpiredPermitDeadlineError,
+  getInvalidPermitSignatureError,
+  getIsInvalidSubaccountApprovalNonceError,
+  getIsPermitExpiredDeadlineOnSimulation,
+  getIsPermitSignatureErrorOnSimulation,
+  getIsPossibleExternalSwapError,
+  getIsPriceImpactTooLargeError,
+} from "lib/errors/customErrors";
+import { helperToast } from "lib/helperToast";
+import {
+  metrics,
+  OrderMetricId,
+  sendOrderSimulatedMetric,
+  sendOrderTxnSubmittedMetric,
+  sendTxnErrorMetric,
+  sendTxnSentMetric,
+} from "lib/metrics";
+import { getByKey } from "lib/objects";
+import { TradingActionName } from "lib/tradingErrorTracker";
+import { TxnEvent, TxnEventName } from "lib/transactions";
+import { useBlockNumber } from "lib/useBlockNumber";
+import { isIncreaseOrderType, isMarketOrderType, isSwapOrderType, isTriggerDecreaseOrderType } from "sdk/utils/orders";
+import { OrderInfo, OrdersInfoData } from "sdk/utils/orders/types";
+import {
+  BatchOrderTxnParams,
+  CancelOrderTxnParams,
+  CreateOrderTxnParams,
+  DecreasePositionOrderParams,
+  getBatchExecutionFeeEstimates,
+  getBatchRequiredActions,
+  getBatchTotalPayCollateralAmount,
+  getExpressBatchOrderParams,
+  getIsTwapOrderPayload,
+  IncreasePositionOrderParams,
+  SwapOrderParams,
+  UpdateOrderTxnParams,
+} from "sdk/utils/orderTransactions";
+
+import { getTxnErrorToast, PermitIssueType } from "components/Errors/errorToasts";
+
+import { getIsSizeIncreaseBatch } from "./getIsSizeIncreaseBatch";
+import { BatchOrderTxnCtx } from "./sendBatchOrderTxn";
+import { getPossiblyInsufficientPayTokens } from "../express/insufficientPayTokens";
+import { ExpressTxnParams } from "../express/types";
+
+export type CallbackUiCtx = {
+  metricId?: OrderMetricId;
+  requestId?: string;
+  slippageInputId?: string;
+  additionalErrorContent?: React.ReactNode;
+  isFundingFeeSettlement?: boolean;
+  onInternalSwapFallback?: () => void;
+  onExternalSwapFallback?: () => void;
+  actionName?: TradingActionName;
+  collateralSymbol?: string;
+};
+
+export function useOrderTxnCallbacks() {
+  const { setPendingTxns } = usePendingTxns();
+  const {
+    setPendingOrder,
+    setPendingTpSlOrderBatches,
+    setPendingPosition,
+    setPendingOrderUpdate,
+    updatePendingExpressTxn,
+    setPendingExpressTxn,
+    setPendingFundingFeeSettlement,
+    orderStatuses,
+  } = useSyntheticsEvents();
+  const { chainId, srcChainId } = useChainId();
+  const { showDebugValues, setIsSettingsVisible } = useSettings();
+  const ordersInfoData = useSelector(selectOrdersInfoData);
+  const { addOptimisticTokensBalancesUpdates, optimisticTokensBalancesUpdates, websocketTokenBalancesUpdates } =
+    useTokensBalancesUpdates();
+  const { setIsPermitsDisabled, resetTokenPermits } = useTokenPermitsContext();
+  const { invalidateSubaccountApproval } = useSubaccountContext();
+  const tokensData = useSelector(selectTokensData);
+  const blockNumber = useBlockNumber(chainId);
+
+  const batchTxnCallback = useCallback(
+    (ctx: CallbackUiCtx, e: TxnEvent<BatchOrderTxnCtx>) => {
+      if (showDebugValues) {
+        // eslint-disable-next-line no-console
+        console.log("TXN EVENT", e, ctx);
+      }
+
+      const { expressParams, batchParams, batchId } = e.data;
+      const isSubaccount = Boolean(expressParams?.subaccount);
+
+      const actionsCount = getBatchRequiredActions(batchParams);
+
+      let mainActionType: "create" | "update" | "cancel";
+      if (batchParams.createOrderParams.length > 0) {
+        mainActionType = "create";
+      } else if (batchParams.updateOrderParams.length > 0) {
+        mainActionType = "update";
+      } else if (batchParams.cancelOrderParams.length > 0) {
+        mainActionType = "cancel";
+      } else {
+        return;
+      }
+
+      let pendingOrderUpdate: PendingOrderData | undefined = undefined;
+
+      const handleTxnSubmitted = async () => {
+        const createdAt = Date.now();
+
+        const pendingOrders = getBatchPendingOrders(e.data.batchParams, ordersInfoData, createdAt);
+
+        const optimisticBatchPayAmounts = getOptimisticBatchPayAmounts(e.data);
+
+        addOptimisticTokensBalancesUpdates(
+          mapValues(
+            optimisticBatchPayAmounts,
+            (amount): TokenBalanceUpdate => ({
+              diff: -amount,
+              isPending: true,
+              balanceType: expressParams?.isGmxAccount ? TokenBalanceType.GmxAccount : TokenBalanceType.Wallet,
+            })
+          )
+        );
+
+        if (mainActionType === "update" && batchParams.updateOrderParams[0]) {
+          const updateOrderParams = batchParams.updateOrderParams[0];
+          const order = getByKey(ordersInfoData, updateOrderParams.params.orderKey);
+          pendingOrderUpdate = order ? getPendingUpdateOrder(updateOrderParams, order, createdAt) : undefined;
+        }
+
+        const pendingPositions = e.data.batchParams.createOrderParams
+          .filter(
+            (cp): cp is CreateOrderTxnParams<IncreasePositionOrderParams | DecreasePositionOrderParams> =>
+              isMarketOrderType(cp.orderPayload.orderType) && !isSwapOrderType(cp.orderPayload.orderType)
+          )
+          .map((cp) =>
+            getPendingPositionFromParams({
+              createOrderParams: cp,
+              blockNumber: blockNumber ?? 0n,
+              timestamp: createdAt,
+            })
+          );
+
+        if (mainActionType === "create") {
+          if (ctx.isFundingFeeSettlement) {
+            setPendingFundingFeeSettlement({
+              orders: pendingOrders,
+              positions: pendingPositions,
+            });
+          } else {
+            if (pendingOrders.length > 0) {
+              setPendingOrder(pendingOrders);
+            }
+
+            if (pendingPositions.length > 0) {
+              setPendingPosition(pendingPositions[0]);
+            }
+          }
+        } else {
+          if (pendingOrderUpdate) {
+            setPendingOrderUpdate(pendingOrderUpdate);
+          }
+
+          const operationMessage = getOperationMessage(
+            mainActionType,
+            "submitted",
+            actionsCount,
+            expressParams?.subaccount,
+            setIsSettingsVisible
+          );
+
+          helperToast.success(operationMessage);
+        }
+
+        const successMessage = getOperationMessage(
+          mainActionType,
+          "success",
+          actionsCount,
+          undefined,
+          setIsSettingsVisible
+        );
+
+        const errorMessage = getOperationMessage(
+          mainActionType,
+          "failed",
+          actionsCount,
+          undefined,
+          setIsSettingsVisible
+        );
+
+        if (expressParams) {
+          setPendingExpressTxn({
+            key: getExpressParamsKey(expressParams),
+            subaccountApproval: expressParams.subaccount?.signedApproval,
+            tokenPermits: expressParams.relayParamsPayload.tokenPermits,
+            payAmounts: optimisticBatchPayAmounts,
+            pendingOrdersKeys: pendingOrders.map(getPendingOrderKey),
+            pendingPositionsKeys: pendingPositions.map((p) => p.positionKey),
+            estimatedExecutionFee: expressParams.executionFeeAmount,
+            estimatedExecutionGasLimit: expressParams.executionGasLimit,
+            estimatedOrders: getBatchExecutionFeeEstimates(getExpressBatchOrderParams(chainId, e.data.batchParams)),
+            metricId: ctx.metricId,
+            createdAt,
+            taskId: undefined,
+            isViewed: false,
+            isRelayerMetricSent: false,
+            successMessage,
+            errorMessage,
+            isGmxAccount: expressParams.isGmxAccount,
+            gasPaymentTokenAddress: expressParams.gasPaymentParams.gasPaymentTokenAddress,
+          });
+        }
+      };
+
+      switch (e.event) {
+        case TxnEventName.Submitted: {
+          const orders = batchParams.createOrderParams
+            .filter(
+              (cp) => isTriggerDecreaseOrderType(cp.orderPayload.orderType) && !getIsTwapOrderPayload(cp.orderPayload)
+            )
+            .map((cp) => getPendingCreateOrder(cp));
+
+          if (orders.length > 0) {
+            setPendingTpSlOrderBatches((batches) => [
+              ...batches,
+              {
+                id: batchId,
+                chainId,
+                orders,
+                existingOrderKeys: [...Object.keys(ordersInfoData ?? {}), ...Object.keys(orderStatuses)],
+              },
+            ]);
+          }
+
+          if (isSubaccount) {
+            handleTxnSubmitted();
+          }
+          return;
+        }
+
+        case TxnEventName.Simulated: {
+          if (ctx.metricId) {
+            sendOrderSimulatedMetric(ctx.metricId);
+          }
+          return;
+        }
+
+        case TxnEventName.Sending: {
+          if (ctx.metricId) {
+            sendOrderTxnSubmittedMetric(ctx.metricId);
+          }
+
+          if (expressParams && !isSubaccount) {
+            handleTxnSubmitted();
+          }
+
+          return;
+        }
+
+        case TxnEventName.Sent: {
+          const sentData = e.data;
+          setPendingTpSlOrderBatches((batches) =>
+            batches.map((batch) =>
+              batch.id === batchId
+                ? {
+                    ...batch,
+                    ...(sentData.type === "wallet"
+                      ? { transactionHash: sentData.transactionHash }
+                      : { relayTaskId: sentData.relayTaskId }),
+                  }
+                : batch
+            )
+          );
+
+          if (ctx.metricId) {
+            sendTxnSentMetric(ctx.metricId);
+
+            if (mainActionType === "create" && batchParams.createOrderParams.length > 0) {
+              const firstOrder = batchParams.createOrderParams[0];
+              const orderType = firstOrder.orderPayload.orderType;
+              sendAddressablePixelEventForOrder({
+                metricId: ctx.metricId,
+                orderType,
+                chainId,
+                srcChainId,
+              });
+            }
+          }
+
+          if (!expressParams) {
+            handleTxnSubmitted();
+          }
+
+          if (e.data.type === "relay") {
+            updatePendingExpressTxn({
+              key: expressParams ? getExpressParamsKey(expressParams) : undefined,
+              taskId: e.data.relayTaskId,
+            });
+          } else if (e.data.type === "wallet") {
+            const estimatedOrders = getBatchExecutionFeeEstimates(e.data.batchParams);
+
+            const pendingTxn: PendingTransaction = {
+              hash: e.data.transactionHash,
+              chainId,
+              onError: () => setPendingTpSlOrderBatches((batches) => batches.filter((batch) => batch.id !== batchId)),
+              onReplaced: batchParams.createOrderParams.some((cp) =>
+                isTriggerDecreaseOrderType(cp.orderPayload.orderType)
+              )
+                ? (transactionHash) =>
+                    setPendingTpSlOrderBatches((batches) =>
+                      batches.map((batch) => (batch.id === batchId ? { ...batch, transactionHash } : batch))
+                    )
+                : undefined,
+              message: getOperationMessage(mainActionType, "success", actionsCount, undefined, setIsSettingsVisible),
+              metricId: ctx.metricId,
+              actionName: ctx.actionName,
+              data: estimatedOrders.length
+                ? {
+                    estimatedExecutionFee: estimatedOrders.reduce((sum, order) => sum + order.executionFee, 0n),
+                    estimatedExecutionGasLimit: estimatedOrders.reduce((sum, order) => sum + order.gasLimit, 0n),
+                    estimatedOrders,
+                  }
+                : undefined,
+            };
+
+            setPendingTxns((txns) => [...txns, pendingTxn]);
+          }
+
+          return;
+        }
+
+        case TxnEventName.Error: {
+          setPendingTpSlOrderBatches((batches) => batches.filter((batch) => batch.id !== batchId));
+          const { error } = e.data;
+          const errorData = parseError(error);
+
+          if (ctx.metricId) {
+            sendTxnErrorMetric(ctx.metricId, error, errorData?.errorContext ?? "unknown");
+          }
+
+          const operationMessage = getOperationMessage(
+            mainActionType,
+            "failed",
+            actionsCount,
+            expressParams?.subaccount,
+            setIsSettingsVisible
+          );
+
+          const sentSubaccountApproval = expressParams?.subaccount?.signedApproval;
+          const isOutdatedSubaccountApproval =
+            sentSubaccountApproval !== undefined && getIsInvalidSubaccountApprovalNonceError(error);
+
+          const fallbackToInternalSwap =
+            !isOutdatedSubaccountApproval &&
+            hasExternalSwap(expressParams, batchParams) &&
+            getIsPossibleExternalSwapError(error)
+              ? ctx.onInternalSwapFallback
+              : undefined;
+
+          const fallbackToExternalSwap =
+            !isOutdatedSubaccountApproval &&
+            !hasExternalSwap(expressParams, batchParams) &&
+            getIsPriceImpactTooLargeError(error)
+              ? ctx.onExternalSwapFallback
+              : undefined;
+
+          let permitIssueType: PermitIssueType | undefined;
+
+          if (expressParams?.relayParamsPayload.tokenPermits?.length) {
+            if (getIsPermitExpiredDeadlineOnSimulation(error)) {
+              permitIssueType = "expiredDeadline";
+            } else if (getIsPermitSignatureErrorOnSimulation(error)) {
+              permitIssueType = "invalidSignature";
+            }
+          }
+
+          const payAmounts = getOptimisticBatchPayAmounts(e.data);
+
+          const toastParams = getTxnErrorToast(chainId, errorData, {
+            defaultMessage: operationMessage,
+            slippageInputId: ctx.slippageInputId,
+            isSizeIncrease: getIsSizeIncreaseBatch(batchParams),
+            additionalContent: ctx.additionalErrorContent,
+            isInternalSwapFallback: Boolean(fallbackToInternalSwap),
+            isExternalSwapFallback: Boolean(fallbackToExternalSwap),
+            permitIssueType,
+            isOutdatedSubaccountApproval,
+            setIsSettingsVisible,
+            expressTxn: expressParams
+              ? {
+                  gasPaymentTokenAddress: expressParams.gasPaymentParams.gasPaymentTokenAddress,
+                  isGmxAccount: expressParams.isGmxAccount,
+                  payTokenAddresses: Object.keys(payAmounts),
+                  possiblyInsufficientTokenAddresses: getPossiblyInsufficientPayTokens({
+                    payAmounts,
+                    tokensData,
+                    optimisticUpdates: optimisticTokensBalancesUpdates,
+                    websocketUpdates: websocketTokenBalancesUpdates,
+                    balanceType: expressParams.isGmxAccount ? TokenBalanceType.GmxAccount : TokenBalanceType.Wallet,
+                  }),
+                }
+              : undefined,
+          });
+
+          helperToast.error(toastParams.errorContent, {
+            autoClose: toastParams.autoCloseToast,
+            tradingErrorInfo: ctx.actionName
+              ? {
+                  actionName: ctx.actionName,
+                  collateral: ctx.collateralSymbol,
+                  errorData: errorData,
+                  requestId: ctx.requestId,
+                }
+              : undefined,
+          });
+
+          if (fallbackToInternalSwap) {
+            fallbackToInternalSwap();
+          }
+
+          if (fallbackToExternalSwap) {
+            fallbackToExternalSwap();
+          }
+
+          if (permitIssueType === "expiredDeadline") {
+            expressParams?.relayParamsPayload.tokenPermits.forEach((permit) => {
+              metrics.pushError(getExpiredPermitDeadlineError({ permit }), "simulation.permitExpiredDeadline");
+            });
+
+            resetTokenPermits();
+          } else if (permitIssueType === "invalidSignature") {
+            expressParams?.relayParamsPayload.tokenPermits.forEach((permit) => {
+              validateTokenPermitSignature(chainId, permit).then((validationResult) => {
+                metrics.pushError(
+                  getInvalidPermitSignatureError({
+                    isValid: validationResult.isValid,
+                    permit,
+                    error: validationResult.error,
+                  }),
+                  "simulation.permitError"
+                );
+              });
+            });
+
+            setIsPermitsDisabled(true);
+            resetTokenPermits();
+          }
+
+          if (isOutdatedSubaccountApproval) {
+            invalidateSubaccountApproval(sentSubaccountApproval);
+          }
+
+          if (expressParams) {
+            updatePendingExpressTxn({
+              key: getExpressParamsKey(expressParams),
+              sendFailed: true,
+            });
+          }
+
+          if (pendingOrderUpdate) {
+            setPendingOrderUpdate(pendingOrderUpdate, "remove");
+          }
+
+          return;
+        }
+      }
+    },
+    [
+      addOptimisticTokensBalancesUpdates,
+      optimisticTokensBalancesUpdates,
+      websocketTokenBalancesUpdates,
+      blockNumber,
+      chainId,
+      srcChainId,
+      invalidateSubaccountApproval,
+      ordersInfoData,
+      orderStatuses,
+      setPendingTpSlOrderBatches,
+      resetTokenPermits,
+      setIsPermitsDisabled,
+      setIsSettingsVisible,
+      setPendingExpressTxn,
+      setPendingFundingFeeSettlement,
+      setPendingOrder,
+      setPendingOrderUpdate,
+      setPendingPosition,
+      setPendingTxns,
+      showDebugValues,
+      tokensData,
+      updatePendingExpressTxn,
+    ]
+  );
+
+  return useMemo(
+    () => ({
+      orderTxnCallback: batchTxnCallback,
+      makeOrderTxnCallback: (ctx: CallbackUiCtx) => (e: TxnEvent<BatchOrderTxnCtx>) => batchTxnCallback(ctx, e),
+    }),
+    [batchTxnCallback]
+  );
+}
+
+function getBatchPendingOrders(
+  txnParams: BatchOrderTxnParams,
+  ordersInfoData: OrdersInfoData | undefined,
+  createdAt: number
+): PendingOrderData[] {
+  const createPendingOrders = txnParams.createOrderParams
+    .filter((cp) => !getIsTwapOrderPayload(cp.orderPayload))
+    .map((cp) => getPendingCreateOrder(cp, false, createdAt));
+
+  const twapPendingOrders = getPendingCreateTwapOrders(txnParams.createOrderParams, createdAt);
+
+  const updatePendingOrders = txnParams.updateOrderParams
+    .map((updateOrderParams) => {
+      const order = getByKey(ordersInfoData, updateOrderParams.params.orderKey);
+      if (!order) {
+        return undefined;
+      }
+
+      return getPendingUpdateOrder(updateOrderParams, order, createdAt);
+    })
+    .filter((o) => o !== undefined);
+
+  const cancelPendingOrders = txnParams.cancelOrderParams
+    .map((cancelOrderParams) => {
+      const order = getByKey(ordersInfoData, cancelOrderParams.orderKey);
+      if (!order) {
+        return undefined;
+      }
+
+      return getPendingCancelOrder(cancelOrderParams, order, createdAt);
+    })
+    .filter((o) => o !== undefined);
+
+  return [
+    ...twapPendingOrders,
+    ...createPendingOrders,
+    ...updatePendingOrders,
+    ...cancelPendingOrders,
+  ] as PendingOrderData[];
+}
+function getPendingCancelOrder(params: CancelOrderTxnParams, order: OrderInfo, createdAt: number): PendingOrderData {
+  return {
+    txnType: "cancel",
+    account: order.account,
+    marketAddress: order.marketAddress,
+    initialCollateralTokenAddress: order.initialCollateralTokenAddress,
+    initialCollateralDeltaAmount: order.initialCollateralDeltaAmount,
+    swapPath: order.swapPath,
+    triggerPrice: "triggerPrice" in order ? order.triggerPrice : 0n,
+    acceptablePrice: "acceptablePrice" in order ? order.acceptablePrice : 0n,
+    autoCancel: "autoCancel" in order ? order.autoCancel : false,
+    sizeDeltaUsd: order.sizeDeltaUsd,
+    isLong: order.isLong,
+    orderType: order.orderType,
+    decreasePositionSwapType: order.decreasePositionSwapType,
+    shouldUnwrapNativeToken: false,
+    externalSwapQuote: undefined,
+    orderKey: params.orderKey,
+    minOutputAmount: 0n,
+    isTwap: order.isTwap,
+    createdAt,
+  };
+}
+
+function getPendingPositionFromParams({
+  createOrderParams: createOrderPayload,
+  blockNumber,
+  timestamp,
+}: {
+  createOrderParams: CreateOrderTxnParams<IncreasePositionOrderParams | DecreasePositionOrderParams>;
+  blockNumber: bigint;
+  timestamp: number;
+}): PendingPositionUpdate {
+  const collateralAddress = createOrderPayload.params.collateralTokenAddress;
+
+  const collateralDeltaAmount = createOrderPayload.params.collateralDeltaAmount;
+  const sizeDeltaUsd = createOrderPayload.params.sizeDeltaUsd;
+  const sizeDeltaInTokens = createOrderPayload.params.sizeDeltaInTokens;
+
+  const positionKey = getPositionKey(
+    createOrderPayload.orderPayload.addresses.receiver ?? zeroAddress,
+    createOrderPayload.orderPayload.addresses.market,
+    collateralAddress,
+    createOrderPayload.orderPayload.isLong
+  );
+
+  return {
+    isIncrease: isIncreaseOrderType(createOrderPayload.orderPayload.orderType),
+    positionKey,
+    collateralDeltaAmount,
+    sizeDeltaUsd,
+    sizeDeltaInTokens,
+    updatedAtBlock: blockNumber,
+    updatedAt: timestamp,
+  };
+}
+
+function getPendingUpdateOrder(
+  updateOrderParams: UpdateOrderTxnParams,
+  order: OrderInfo,
+  createdAt: number
+): PendingOrderData {
+  return {
+    txnType: "update",
+    account: order.account,
+    marketAddress: order.marketAddress,
+    initialCollateralTokenAddress: order.initialCollateralTokenAddress,
+    initialCollateralDeltaAmount: order.initialCollateralDeltaAmount,
+    swapPath: order.swapPath,
+    triggerPrice: "triggerPrice" in order ? order.triggerPrice : 0n,
+    acceptablePrice: "acceptablePrice" in order ? order.acceptablePrice : 0n,
+    autoCancel: "autoCancel" in order ? order.autoCancel : false,
+    sizeDeltaUsd: order.sizeDeltaUsd,
+    minOutputAmount: order.minOutputAmount,
+    isLong: order.isLong,
+    orderType: order.orderType,
+    decreasePositionSwapType: order.decreasePositionSwapType,
+    shouldUnwrapNativeToken: false,
+    externalSwapQuote: undefined,
+    orderKey: updateOrderParams.params.orderKey,
+    isTwap: order.isTwap,
+    createdAt,
+  };
+}
+
+function getOptimisticBatchPayAmounts({
+  expressParams,
+  batchParams,
+}: {
+  expressParams: ExpressTxnParams | undefined;
+  batchParams: BatchOrderTxnParams;
+}) {
+  const batchPayAmounts = getBatchTotalPayCollateralAmount(batchParams);
+
+  if (expressParams) {
+    const { gasPaymentTokenAddress, gasPaymentTokenAmount } = expressParams.gasPaymentParams;
+    if (gasPaymentTokenAddress in batchPayAmounts) {
+      batchPayAmounts[gasPaymentTokenAddress] += gasPaymentTokenAmount;
+    } else {
+      batchPayAmounts[gasPaymentTokenAddress] = gasPaymentTokenAmount;
+    }
+  }
+
+  return batchPayAmounts;
+}
+
+function getPendingCreateOrder(
+  createOrderPayload: CreateOrderTxnParams<IncreasePositionOrderParams | DecreasePositionOrderParams | SwapOrderParams>,
+  isTwap = false,
+  createdAt = Date.now()
+): PendingOrderData {
+  return {
+    account: createOrderPayload.orderPayload.addresses.receiver ?? zeroAddress,
+    marketAddress: createOrderPayload.orderPayload.addresses.market,
+    initialCollateralTokenAddress: createOrderPayload.orderPayload.addresses.initialCollateralToken,
+    initialCollateralDeltaAmount: createOrderPayload.orderPayload.numbers.initialCollateralDeltaAmount,
+    swapPath: createOrderPayload.orderPayload.addresses.swapPath,
+    sizeDeltaUsd: createOrderPayload.orderPayload.numbers.sizeDeltaUsd,
+    minOutputAmount: createOrderPayload.orderPayload.numbers.minOutputAmount,
+    expectedOutputAmount:
+      "expectedOutputAmount" in createOrderPayload.params &&
+      createOrderPayload.params.expectedOutputAmount !== undefined
+        ? createOrderPayload.params.expectedOutputAmount
+        : 0n,
+    triggerPrice: createOrderPayload.orderPayload.numbers.triggerPrice,
+    acceptablePrice: createOrderPayload.orderPayload.numbers.acceptablePrice,
+    autoCancel: createOrderPayload.orderPayload.autoCancel,
+    isLong: createOrderPayload.orderPayload.isLong,
+    orderType: createOrderPayload.orderPayload.orderType,
+    decreasePositionSwapType: createOrderPayload.orderPayload.decreasePositionSwapType,
+    shouldUnwrapNativeToken: createOrderPayload.orderPayload.shouldUnwrapNativeToken,
+    externalSwapQuote: createOrderPayload.params.externalSwapQuote,
+    txnType: "create",
+    isTwap,
+    createdAt,
+  };
+}
+
+function getPendingCreateTwapOrders(
+  createOrderPayloads: CreateOrderTxnParams<
+    IncreasePositionOrderParams | DecreasePositionOrderParams | SwapOrderParams
+  >[],
+  createdAt: number
+): PendingOrderData[] {
+  const ordersByUiFeeReceiver: Record<string, PendingOrderData> = {};
+
+  createOrderPayloads.forEach((cp) => {
+    if (!getIsTwapOrderPayload(cp.orderPayload)) {
+      return;
+    }
+
+    const uiFeeReceiver = cp.orderPayload.addresses.uiFeeReceiver;
+
+    const pendingOrder = getPendingCreateOrder(cp, true, createdAt);
+
+    if (!ordersByUiFeeReceiver[uiFeeReceiver]) {
+      ordersByUiFeeReceiver[uiFeeReceiver] = pendingOrder;
+    } else {
+      const acc = ordersByUiFeeReceiver[uiFeeReceiver];
+
+      acc.sizeDeltaUsd += pendingOrder.sizeDeltaUsd;
+      acc.minOutputAmount += pendingOrder.minOutputAmount;
+      acc.initialCollateralDeltaAmount += pendingOrder.initialCollateralDeltaAmount;
+    }
+  });
+
+  return Object.values(ordersByUiFeeReceiver);
+}
+
+function getOperationMessage(
+  mainActionType: "create" | "update" | "cancel",
+  state: "submitted" | "success" | "failed",
+  actionsCount: number,
+  subaccount: Subaccount | undefined,
+  setIsSettingsVisible: (isVisible: boolean) => void
+) {
+  const isLastAction = subaccount && getRemainingSubaccountActions(subaccount) === BigInt(actionsCount);
+
+  const lastActionsMsg = isLastAction ? (
+    <Trans>
+      Max action count reached.{" "}
+      <span onClick={() => setIsSettingsVisible(true)} className="link-underline">
+        Click here
+      </span>{" "}
+      to update
+    </Trans>
+  ) : undefined;
+
+  const orderText = plural(actionsCount, {
+    one: "Order",
+    other: "# Orders",
+  });
+
+  if (mainActionType === "create") {
+    return undefined;
+  } else if (mainActionType === "update") {
+    switch (state) {
+      case "submitted": {
+        return (
+          <div>
+            {t`Updating ${orderText}...`}
+            {lastActionsMsg && <br />}
+            {lastActionsMsg}
+          </div>
+        );
+      }
+
+      case "success": {
+        return t`${orderText} updated`;
+      }
+
+      case "failed": {
+        return t`${orderText} update failed`;
+      }
+
+      default: {
+        return "";
+      }
+    }
+  } else if (mainActionType === "cancel") {
+    switch (state) {
+      case "submitted": {
+        return (
+          <div>
+            {t`Cancelling ${orderText}...`}
+            {lastActionsMsg && <br />}
+            {lastActionsMsg}
+          </div>
+        );
+      }
+
+      case "success": {
+        return t`${orderText} cancelled`;
+      }
+
+      case "failed": {
+        return t`${orderText} cancellation failed`;
+      }
+
+      default: {
+        return "";
+      }
+    }
+  }
+}
+
+function hasExternalSwap(expressParams: ExpressTxnParams | undefined, batchParams: BatchOrderTxnParams) {
+  return (
+    expressParams?.relayParamsPayload.externalCalls.externalCallDataList.length ||
+    batchParams.createOrderParams.some((cp) => cp.tokenTransfersParams?.externalCalls?.externalCallDataList.length)
+  );
+}
+
+function getExpressParamsKey(expressParams: ExpressTxnParams) {
+  return `${expressParams.gasPaymentParams.gasPaymentTokenAmount}${expressParams.gasLimit}`;
+}

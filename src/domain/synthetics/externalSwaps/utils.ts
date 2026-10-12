@@ -1,0 +1,378 @@
+import { getSwapDebugSettings } from "config/externalSwaps";
+import { BASIS_POINTS_DIVISOR_BIGINT } from "config/factors";
+import { getExternalAggregatorSwapUrlFromAddresses } from "config/links";
+import { UserReferralInfo } from "domain/referrals";
+import { applyFactor } from "lib/numbers";
+import { getFeeItem, getPositionFee } from "sdk/utils/fees";
+import { MarketInfo, MarketsInfoData } from "sdk/utils/markets/types";
+import { PositionInfo } from "sdk/utils/positions/types";
+import { SwapStrategyForSwapOrders } from "sdk/utils/swap/types";
+import { convertToTokenAmount, convertToUsd } from "sdk/utils/tokens";
+import { TokenData } from "sdk/utils/tokens/types";
+import {
+  ExternalSwapAggregator,
+  ExternalSwapCalculationStrategy,
+  ExternalSwapInputs,
+  ExternalSwapQuote,
+  SwapAmounts,
+} from "sdk/utils/trade/types";
+import { mustNeverExist } from "sdk/utils/types";
+
+import {
+  FindSwapPath,
+  getIncreasePositionPrices,
+  getSwapAmountsByFromValue,
+  getSwapAmountsByToValue,
+  leverageBySizeValues,
+} from "../trade";
+import { ExternalSwapRequestKey } from "./types";
+
+export function getExternalSwapInputsByFromValue({
+  tokenIn,
+  tokenOut,
+  amountIn,
+  findSwapPath,
+  uiFeeFactor,
+  marketsInfoData,
+  chainId,
+}: {
+  tokenIn: TokenData;
+  tokenOut: TokenData;
+  amountIn: bigint;
+  findSwapPath: FindSwapPath;
+  uiFeeFactor: bigint;
+  marketsInfoData: MarketsInfoData | undefined;
+  chainId: number;
+}): ExternalSwapInputs {
+  const swapAmounts = getSwapAmountsByFromValue({
+    tokenIn,
+    tokenOut,
+    amountIn,
+    isLimit: false,
+    findSwapPath,
+    uiFeeFactor,
+    marketsInfoData,
+    chainId,
+    externalSwapQuoteParams: undefined,
+    allowSameTokenSwap: false,
+  });
+
+  const internalSwapTotalFeesDeltaUsd = swapAmounts.swapStrategy.swapPathStats
+    ? swapAmounts.swapStrategy.swapPathStats.totalFeesDeltaUsd
+    : undefined;
+
+  const internalSwapTotalFeeItem = getFeeItem(internalSwapTotalFeesDeltaUsd, swapAmounts.usdIn);
+
+  return {
+    amountIn,
+    priceIn: swapAmounts.priceIn,
+    priceOut: swapAmounts.priceOut,
+    usdIn: swapAmounts.usdIn,
+    usdOut: swapAmounts.usdOut,
+    strategy: "byFromValue",
+    internalSwapTotalFeeItem,
+    internalSwapTotalFeesDeltaUsd,
+    internalSwapAmounts: swapAmounts,
+  };
+}
+
+export function getExternalSwapInputsByToValue({
+  tokenIn,
+  tokenOut,
+  amountOut,
+  findSwapPath,
+  uiFeeFactor,
+  marketsInfoData,
+  chainId,
+}: {
+  tokenIn: TokenData;
+  tokenOut: TokenData;
+  amountOut: bigint;
+  findSwapPath: FindSwapPath;
+  uiFeeFactor: bigint;
+  marketsInfoData: MarketsInfoData | undefined;
+  chainId: number;
+}): ExternalSwapInputs {
+  const swapAmounts = getSwapAmountsByToValue({
+    tokenIn,
+    tokenOut,
+    amountOut,
+    isLimit: false,
+    findSwapPath,
+    uiFeeFactor,
+    marketsInfoData,
+    chainId,
+    externalSwapQuoteParams: undefined,
+    allowSameTokenSwap: false,
+  });
+
+  const internalSwapTotalFeesDeltaUsd = swapAmounts.swapStrategy.swapPathStats
+    ? swapAmounts.swapStrategy.swapPathStats.totalFeesDeltaUsd
+    : undefined;
+
+  const internalSwapTotalFeeItem = getFeeItem(internalSwapTotalFeesDeltaUsd, swapAmounts.usdIn);
+
+  // Estimate amountIn from oracle prices for the initial KyberSwap request
+  const estimatedUsdIn = convertToUsd(amountOut, tokenOut.decimals, tokenOut.prices.maxPrice)!;
+  const estimatedAmountIn = convertToTokenAmount(estimatedUsdIn, tokenIn.decimals, tokenIn.prices.minPrice)!;
+
+  return {
+    amountIn: swapAmounts.amountIn > 0n ? swapAmounts.amountIn : estimatedAmountIn,
+    priceIn: swapAmounts.priceIn,
+    priceOut: swapAmounts.priceOut,
+    usdIn: swapAmounts.usdIn > 0n ? swapAmounts.usdIn : estimatedUsdIn,
+    usdOut: swapAmounts.usdOut,
+    strategy: "byToValue",
+    desiredAmountOut: amountOut,
+    internalSwapTotalFeeItem,
+    internalSwapTotalFeesDeltaUsd,
+    internalSwapAmounts: swapAmounts,
+  };
+}
+
+export function getExternalSwapInputsByLeverageSize({
+  marketInfo,
+  tokenIn,
+  collateralToken,
+  indexTokenAmount,
+  findSwapPath,
+  uiFeeFactor,
+  triggerPrice,
+  existingPosition,
+  leverage,
+  isLong,
+  userReferralInfo,
+  marketsInfoData,
+  chainId,
+}: {
+  tokenIn: TokenData;
+  collateralToken: TokenData;
+  marketInfo: MarketInfo;
+  indexTokenAmount: bigint;
+  uiFeeFactor: bigint;
+  triggerPrice?: bigint;
+  existingPosition?: PositionInfo;
+  leverage: bigint;
+  isLong: boolean;
+  findSwapPath: FindSwapPath;
+  userReferralInfo: UserReferralInfo | undefined;
+  marketsInfoData: MarketsInfoData | undefined;
+  chainId: number;
+}): ExternalSwapInputs {
+  const prices = getIncreasePositionPrices({
+    triggerPrice,
+    indexToken: marketInfo.indexToken,
+    initialCollateralToken: tokenIn,
+    collateralToken,
+    isLong,
+  });
+
+  const sizeDeltaUsd = convertToUsd(indexTokenAmount, marketInfo.indexToken.decimals, prices.indexPrice)!;
+
+  const positionFeeInfo = getPositionFee(marketInfo, sizeDeltaUsd, false, userReferralInfo);
+
+  const positionFeeUsd = positionFeeInfo.positionFeeUsd;
+  const uiFeeUsd = applyFactor(sizeDeltaUsd, uiFeeFactor);
+
+  const { baseCollateralAmount } = leverageBySizeValues({
+    collateralToken,
+    leverage,
+    sizeDeltaUsd,
+    collateralPrice: prices.collateralPrice,
+    uiFeeFactor,
+    positionFeeUsd,
+    fundingFeeUsd: existingPosition?.pendingFundingFeesUsd || 0n,
+    borrowingFeeUsd: existingPosition?.pendingBorrowingFeesUsd || 0n,
+    uiFeeUsd,
+    swapUiFeeUsd: 0n,
+  });
+
+  const usdOut = convertToUsd(baseCollateralAmount, collateralToken.decimals, collateralToken.prices.maxPrice)!;
+  const baseUsdIn = usdOut;
+  const baseAmountIn = convertToTokenAmount(baseUsdIn, tokenIn.decimals, tokenIn.prices.minPrice)!;
+
+  const swapAmounts = getSwapAmountsByToValue({
+    tokenIn,
+    tokenOut: collateralToken,
+    amountOut: baseCollateralAmount,
+    isLimit: false,
+    findSwapPath,
+    uiFeeFactor,
+    marketsInfoData,
+    chainId,
+    externalSwapQuoteParams: undefined,
+    allowSameTokenSwap: false,
+  });
+
+  const internalSwapTotalFeesDeltaUsd = swapAmounts.swapStrategy.swapPathStats
+    ? swapAmounts.swapStrategy.swapPathStats.totalFeesDeltaUsd
+    : undefined;
+
+  const internalSwapTotalFeeItem = getFeeItem(internalSwapTotalFeesDeltaUsd, swapAmounts.usdIn);
+
+  return {
+    amountIn: baseAmountIn,
+    priceIn: swapAmounts.priceIn,
+    priceOut: swapAmounts.priceOut,
+    usdIn: baseUsdIn,
+    usdOut: swapAmounts.usdOut,
+    strategy: "leverageBySize",
+    internalSwapTotalFeeItem,
+    internalSwapTotalFeesDeltaUsd,
+    internalSwapAmounts: swapAmounts,
+  };
+}
+
+export function isInternalSwapBetterByFeeRate(params: {
+  internalFeesDeltaUsd: bigint | undefined;
+  internalUsdIn: bigint;
+  internalAmountOut: bigint;
+  internalSwapType: SwapStrategyForSwapOrders["type"];
+  externalUsdIn: bigint;
+  externalFeesUsd: bigint;
+}): boolean {
+  const { internalFeesDeltaUsd, internalUsdIn, internalAmountOut, internalSwapType, externalUsdIn, externalFeesUsd } =
+    params;
+  return (
+    internalSwapType !== "noSwap" &&
+    internalAmountOut > 0n &&
+    internalFeesDeltaUsd !== undefined &&
+    internalUsdIn > 0n &&
+    externalUsdIn > 0n &&
+    // Cross-multiplied from internalFee/internalUsdIn > -externalFee/externalUsdIn to avoid division.
+    internalFeesDeltaUsd * externalUsdIn > -externalFeesUsd * internalUsdIn
+  );
+}
+
+export function inflateAmountForSlippage(amount: bigint, slippageBps: bigint): bigint {
+  if (slippageBps <= 0n || slippageBps >= BASIS_POINTS_DIVISOR_BIGINT) return amount;
+  // Ceiling division: ensures that subsequent floor-style slippage reduction upstream
+  // cannot yield less than the original amount due to compounded rounding.
+  const denominator = BASIS_POINTS_DIVISOR_BIGINT - slippageBps;
+  return (amount * BASIS_POINTS_DIVISOR_BIGINT + denominator - 1n) / denominator;
+}
+
+export function overrideQuoteWithOraclePrices(
+  quote: ExternalSwapQuote,
+  oracle: { usdIn: bigint; usdOut: bigint; feesUsd: bigint; priceIn: bigint; priceOut: bigint }
+): ExternalSwapQuote {
+  return { ...quote, ...oracle };
+}
+
+export function getExternalSwapRequestKey(params: {
+  fromTokenAddress: string | undefined;
+  toTokenAddress: string | undefined;
+  strategy: ExternalSwapCalculationStrategy | undefined;
+  amountIn: bigint | undefined;
+  desiredAmountOut: bigint | undefined;
+  slippage: number | undefined;
+}): ExternalSwapRequestKey | undefined {
+  const { fromTokenAddress, toTokenAddress, strategy, amountIn, desiredAmountOut, slippage } = params;
+  if (!fromTokenAddress || !toTokenAddress || !strategy || slippage === undefined) return undefined;
+  const amount = strategy === "byToValue" ? desiredAmountOut : amountIn;
+  if (amount === undefined || amount <= 0n) return undefined;
+  return {
+    structuralKey: `${fromTokenAddress}:${toTokenAddress}:${strategy}:${slippage}`,
+    amount,
+    strategy,
+  };
+}
+
+export const EXTERNAL_SWAP_KEY_AMOUNT_TOLERANCE_BPS = 30n;
+
+export function isAmountWithinKeyTolerance(a: bigint, b: bigint): boolean {
+  if (a <= 0n || b <= 0n) return false;
+  if (a === b) return true;
+  const diff = a > b ? a - b : b - a;
+  const reference = a > b ? a : b;
+  return diff * BASIS_POINTS_DIVISOR_BIGINT <= reference * EXTERNAL_SWAP_KEY_AMOUNT_TOLERANCE_BPS;
+}
+
+export function externalSwapRequestKeysMatch(
+  a: ExternalSwapRequestKey | undefined,
+  b: ExternalSwapRequestKey | undefined
+): boolean {
+  if (!a || !b) return false;
+  if (a.structuralKey !== b.structuralKey) return false;
+
+  return a.strategy === "leverageBySize" ? isAmountWithinKeyTolerance(a.amount, b.amount) : a.amount === b.amount;
+}
+
+export function getBestSwapStrategy({
+  internalSwapAmounts,
+  externalSwapQuote,
+}: {
+  internalSwapAmounts: SwapAmounts | undefined;
+  externalSwapQuote: ExternalSwapQuote | undefined;
+}) {
+  const forceExternalSwaps = getSwapDebugSettings()?.failExternalSwaps;
+
+  let amountIn: bigint;
+  let amountOut: bigint;
+  let usdIn: bigint;
+  let usdOut: bigint;
+
+  if (
+    externalSwapQuote &&
+    (externalSwapQuote.usdOut > (internalSwapAmounts?.swapStrategy.swapPathStats?.usdOut ?? 0n) || forceExternalSwaps)
+  ) {
+    amountIn = externalSwapQuote.amountIn;
+    amountOut = externalSwapQuote.amountOut;
+    usdIn = externalSwapQuote.usdIn;
+    usdOut = externalSwapQuote.usdOut;
+
+    return {
+      amountIn,
+      amountOut,
+      usdIn,
+      usdOut,
+      externalSwapQuote,
+    };
+  } else if (internalSwapAmounts?.swapStrategy.swapPathStats) {
+    amountIn = internalSwapAmounts.amountIn;
+    amountOut = internalSwapAmounts.amountOut;
+    usdIn = internalSwapAmounts.usdIn;
+    usdOut = internalSwapAmounts.usdOut;
+
+    return {
+      amountIn,
+      amountOut,
+      usdIn,
+      usdOut,
+      swapPath: internalSwapAmounts.swapStrategy.swapPathStats.swapPath,
+    };
+  } else {
+    return undefined;
+  }
+}
+
+export function isAbortError(e: unknown): boolean {
+  return (e as Error | undefined)?.name === "AbortError";
+}
+
+export function getExternalAggregatorSwapUrl({
+  chainId,
+  isFromTokenGmxAccount,
+  fromTokenAddress,
+  toTokenAddress,
+}: {
+  chainId: number;
+  isFromTokenGmxAccount: boolean;
+  fromTokenAddress: string | undefined;
+  toTokenAddress: string | undefined;
+}): string | undefined {
+  if (isFromTokenGmxAccount) {
+    return undefined;
+  }
+
+  return getExternalAggregatorSwapUrlFromAddresses(chainId, fromTokenAddress, toTokenAddress);
+}
+
+export function getExternalSwapAggregatorLabel(aggregator: ExternalSwapAggregator): string {
+  switch (aggregator) {
+    case ExternalSwapAggregator.KyberSwap:
+      return "KyberSwap";
+    default:
+      return mustNeverExist(aggregator);
+  }
+}

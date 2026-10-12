@@ -1,0 +1,621 @@
+import { t, Trans } from "@lingui/macro";
+import { ReactNode, useEffect, useMemo, useState } from "react";
+import Skeleton from "react-loading-skeleton";
+import { Address, encodeAbiParameters } from "viem";
+import { useAccount } from "wagmi";
+
+import {
+  ContractsChainId,
+  getChainName,
+  GMX_ACCOUNT_PSEUDO_CHAIN_ID,
+  SettlementChainId,
+  SourceChainId,
+} from "config/chains";
+import { getChainIcon } from "config/icons";
+import { getLayerZeroEndpointId, getStargatePoolAddress } from "config/multichain";
+import { useGmxAccountSettlementChainId } from "context/GmxAccountContext/hooks";
+import { selectMultichainMarketTokenBalances } from "context/PoolsDetailsContext/selectors/selectMultichainMarketTokenBalances";
+import {
+  selectDepositMarketTokensData,
+  selectTokensData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { selectGmxAccountGasPaymentTokenAddress } from "context/SyntheticsStateContext/selectors/settingsSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useArbitraryError, useArbitraryRelayParamsAndPayload } from "domain/multichain/arbitraryRelayParams";
+import { getMultichainTransferSendParams } from "domain/multichain/getSendParams";
+import { toastCustomOrStargateError } from "domain/multichain/toastCustomOrStargateError";
+import type { BridgeOutParams } from "domain/multichain/types";
+import { useQuoteSendNativeFee } from "domain/multichain/useQuoteSend";
+import { buildAndSignBridgeOutTxn } from "domain/synthetics/express/expressOrderUtils";
+import { ExpressTransactionBuilder } from "domain/synthetics/express/types";
+import { GMX_ACCOUNT_NETWORK_FEE_SOURCE } from "domain/synthetics/fees/networkFeeSource";
+import { getGlvOrMarketAddress, GlvOrMarketInfo } from "domain/synthetics/markets";
+import { createBridgeOutTxn } from "domain/synthetics/markets/createBridgeOutTxn";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { getInsufficientFeeButtonMessage, ValidationBannerErrorName } from "domain/synthetics/trade/utils/validation";
+import { convertToUsd, getMidPrice, getTokenData } from "domain/tokens";
+import { useMaxAvailableAmount } from "domain/tokens/useMaxAvailableAmount";
+import { useChainId } from "lib/chains";
+import { useMultipleWalletExtensionsChainError } from "lib/chains/getMultipleWalletExtensionsChainError";
+import { helperToast } from "lib/helperToast";
+import { getPageOutdatedError, useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { getToken, getWrappedToken } from "sdk/configs/tokens";
+import { getMarketIndexName } from "sdk/utils/markets";
+import { formatBalanceAmount, parseValue } from "sdk/utils/numbers";
+
+import { AlertInfoCard } from "components/AlertInfo/AlertInfoCard";
+import Button from "components/Button/Button";
+import BuyInputSection from "components/BuyInputSection/BuyInputSection";
+import { DropdownSelector } from "components/DropdownSelector/DropdownSelector";
+import { ValidationBannerErrorContent } from "components/Errors/gasErrors";
+import { getSimulationErrorButtonContent } from "components/Errors/getSimulationErrorButtonContent";
+import { SelectedPoolLabel } from "components/GmSwap/GmSwapBox/SelectedPool";
+import { useGmxAccountWithdrawNetworks } from "components/GmxAccountModal/hooks";
+import { wrapChainAction } from "components/GmxAccountModal/wrapChainAction";
+import { SlideModal } from "components/Modal/SlideModal";
+import { NetworkFeeValue, type NetworkFeeDetails } from "components/NetworkFeeRow/NetworkFeeValue";
+import { SimpleNetworkFeeRow } from "components/NetworkFeeRow/SimpleNetworkFeeRow";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import { SyntheticsInfoRow } from "components/SyntheticsInfoRow";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+import { ButtonTooltipWrapper } from "components/Tooltip/ButtonTooltipWrapper";
+import { ValueTransition } from "components/ValueTransition/ValueTransition";
+
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+export function BridgeOutModal({
+  isVisible,
+  setIsVisible,
+  glvOrMarketInfo,
+}: {
+  isVisible: boolean;
+  setIsVisible: (isVisible: boolean) => void;
+  glvOrMarketInfo: GlvOrMarketInfo | undefined;
+}) {
+  const { chainId, srcChainId } = useChainId();
+  const hasOutdatedUi = useHasOutdatedUi();
+  const [, setSettlementChainId] = useGmxAccountSettlementChainId();
+  const [bridgeOutChain, setBridgeOutChain] = useState<SourceChainId | undefined>(srcChainId);
+  const multipleWalletExtensionsChainError = useMultipleWalletExtensionsChainError();
+  const [bridgeOutInputValue, setBridgeOutInputValue] = useState("");
+  const [isCreatingTxn, setIsCreatingTxn] = useState(false);
+
+  const tokensData = useSelector(selectTokensData);
+  const depositMarketTokensData = useSelector(selectDepositMarketTokensData);
+  const glvOrMarketAddress = glvOrMarketInfo ? getGlvOrMarketAddress(glvOrMarketInfo) : undefined;
+  const marketToken = getTokenData(depositMarketTokensData, glvOrMarketAddress);
+  const isGlv = isGlvInfo(glvOrMarketInfo);
+  const gasPaymentTokenAddress = useSelector(selectGmxAccountGasPaymentTokenAddress);
+  const gasPaymentToken = getTokenData(tokensData, gasPaymentTokenAddress);
+
+  const marketTokenDecimals = isGlv ? glvOrMarketInfo?.glvToken.decimals : marketToken?.decimals;
+  let marketTokenPrice: bigint | undefined = undefined;
+  if (isGlv && glvOrMarketInfo?.glvToken.prices) {
+    marketTokenPrice = getMidPrice(glvOrMarketInfo?.glvToken.prices);
+  } else if (marketToken?.prices) {
+    marketTokenPrice = getMidPrice(marketToken?.prices);
+  }
+
+  const bridgeOutAmount = useMemo(() => {
+    return bridgeOutInputValue && marketTokenDecimals !== undefined
+      ? parseValue(bridgeOutInputValue, marketTokenDecimals)
+      : undefined;
+  }, [bridgeOutInputValue, marketTokenDecimals]);
+
+  const bridgeOutUsd = useMemo(() => {
+    return bridgeOutAmount !== undefined && marketTokenDecimals !== undefined
+      ? convertToUsd(bridgeOutAmount, marketTokenDecimals, marketTokenPrice)
+      : undefined;
+  }, [bridgeOutAmount, marketTokenDecimals, marketTokenPrice]);
+
+  const glvOrGm = isGlv ? "GLV" : "GM";
+  const { address: account } = useAccount();
+
+  const multichainMarketTokensBalances = useSelector(selectMultichainMarketTokenBalances);
+  const multichainMarketTokenBalances = glvOrMarketAddress
+    ? multichainMarketTokensBalances[glvOrMarketAddress]
+    : undefined;
+
+  const networks = useGmxAccountWithdrawNetworks();
+
+  const gmxAccountMarketTokenBalance: bigint | undefined =
+    multichainMarketTokenBalances?.balances[GMX_ACCOUNT_PSEUDO_CHAIN_ID]?.balance;
+
+  const nextGmxAccountMarketTokenBalance: bigint | undefined =
+    gmxAccountMarketTokenBalance !== undefined &&
+    bridgeOutAmount !== undefined &&
+    bridgeOutAmount <= gmxAccountMarketTokenBalance
+      ? gmxAccountMarketTokenBalance - bridgeOutAmount
+      : undefined;
+
+  const { formattedBalance, formattedMaxAvailableAmount, maxAvailableAmount, maxActions } = useMaxAvailableAmount({
+    fromToken: marketToken,
+    fromTokenBalance: gmxAccountMarketTokenBalance,
+    fromTokenAmount: bridgeOutAmount,
+  });
+
+  const bridgeOutParams = useBridgeOutParams({
+    bridgeOutChain,
+    glvOrMarketAddress,
+    bridgeOutAmount,
+    chainId,
+  });
+
+  const expressTransactionBuilder: ExpressTransactionBuilder | undefined = useMemo(() => {
+    if (account === undefined || bridgeOutParams === undefined || bridgeOutChain === undefined) {
+      return;
+    }
+
+    const expressTransactionBuilder: ExpressTransactionBuilder = async ({ gasPaymentParams, relayParams }) => ({
+      txnData: await buildAndSignBridgeOutTxn({
+        chainId: chainId as SettlementChainId,
+        signer: undefined,
+        account,
+        relayParamsPayload: relayParams,
+        params: bridgeOutParams,
+        emptySignature: true,
+        relayerFeeTokenAddress: gasPaymentParams.relayerFeeTokenAddress,
+        relayerFeeAmount: gasPaymentParams.relayerFeeAmount,
+        srcChainId: bridgeOutChain,
+      }),
+    });
+
+    return expressTransactionBuilder;
+  }, [account, bridgeOutChain, bridgeOutParams, chainId]);
+
+  const expressTxnParamsAsyncResult = useArbitraryRelayParamsAndPayload({
+    expressTransactionBuilder,
+    isGmxAccount: true,
+    enabled: isVisible,
+    overrideWnt: true,
+  });
+
+  const errors = useArbitraryError(expressTxnParamsAsyncResult.error, { isGmxAccount: true });
+
+  const sendParams = useMemo(() => {
+    if (!bridgeOutChain || !account || bridgeOutAmount === undefined || bridgeOutAmount <= 0n) {
+      return;
+    }
+
+    return getMultichainTransferSendParams({
+      dstChainId: bridgeOutChain,
+      account,
+      amountLD: bridgeOutAmount,
+      isToGmx: false,
+      isManualGas: true,
+      srcChainId: chainId,
+    });
+  }, [bridgeOutChain, account, bridgeOutAmount, chainId]);
+
+  const { data: quotedTransferNativeFee, error: transferNativeFeeError } = useQuoteSendNativeFee({
+    fromChainId: chainId,
+    toChainId: bridgeOutChain,
+    sendParams,
+    fromStargateAddress: bridgeOutParams?.provider,
+  });
+  const transferNativeFee = bridgeOutChain === chainId ? 0n : quotedTransferNativeFee;
+
+  const expressFeeDetails = useMemo((): NetworkFeeDetails | undefined => {
+    if (gasPaymentToken === undefined) {
+      return undefined;
+    }
+
+    const amount =
+      errors?.isOutOfTokenError?.isGasPaymentToken && errors.isOutOfTokenError.requiredAmount !== undefined
+        ? errors.isOutOfTokenError.requiredAmount
+        : expressTxnParamsAsyncResult.data?.gasPaymentParams.gasPaymentTokenAmount;
+
+    if (amount === undefined) {
+      return undefined;
+    }
+
+    return {
+      amount,
+      usd: convertToUsd(amount, gasPaymentToken.decimals, getMidPrice(gasPaymentToken.prices))!,
+      decimals: gasPaymentToken.decimals,
+      symbol: gasPaymentToken.symbol,
+      isStable: gasPaymentToken.isStable,
+    };
+  }, [errors?.isOutOfTokenError, expressTxnParamsAsyncResult.data, gasPaymentToken]);
+
+  const bridgeFeeDetails = useMemo((): NetworkFeeDetails | undefined => {
+    const wrappedToken = getTokenData(tokensData, getWrappedToken(chainId).address);
+
+    if (transferNativeFee === undefined || wrappedToken === undefined) {
+      return undefined;
+    }
+
+    return {
+      amount: transferNativeFee,
+      usd: convertToUsd(transferNativeFee, wrappedToken.decimals, wrappedToken.prices.minPrice)!,
+      decimals: wrappedToken.decimals,
+      symbol: wrappedToken.symbol,
+    };
+  }, [chainId, tokensData, transferNativeFee]);
+  const bridgeFeeTokenSymbol = bridgeFeeDetails?.symbol;
+
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!account) {
+      helperToast.error(t`Wallet disconnected. Reconnect and retry`);
+      return;
+    }
+
+    if (!bridgeOutChain || !bridgeOutParams) {
+      helperToast.error(t`Missing parameters. Refresh and retry`);
+      return;
+    }
+
+    const expressTxnParams = await expressTxnParamsAsyncResult.promise;
+
+    if (expressTxnParams === undefined) {
+      helperToast.error(t`Missing parameters. Refresh and retry`);
+      return;
+    }
+
+    try {
+      setIsCreatingTxn(true);
+      await wrapChainAction(bridgeOutChain, setSettlementChainId, async (signer) => {
+        await createBridgeOutTxn({
+          chainId: chainId as SettlementChainId,
+          srcChainId: bridgeOutChain,
+          account,
+          expressTxnParams,
+          relayerFeeAmount: expressTxnParams.gasPaymentParams.relayerFeeAmount,
+          relayerFeeTokenAddress: expressTxnParams.gasPaymentParams.relayerFeeTokenAddress,
+          params: bridgeOutParams,
+          signer,
+        });
+      });
+    } catch (error) {
+      toastCustomOrStargateError(chainId, error, {
+        actionName: "Bridge Withdrawal",
+        collateral: marketToken?.address,
+        defaultMessage: t`Withdrawal failed`,
+        expressTxn: { gasPaymentTokenAddress, isGmxAccount: true },
+      });
+    } finally {
+      setIsCreatingTxn(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isVisible) {
+      return;
+    }
+
+    if (bridgeOutChain === undefined && srcChainId !== undefined) {
+      setBridgeOutChain(srcChainId);
+    }
+  }, [bridgeOutChain, isVisible, srcChainId]);
+
+  const buttonState = useMemo((): {
+    text: ReactNode;
+    disabled?: boolean;
+    bannerErrorName?: ValidationBannerErrorName;
+    errorDescription?: ReactNode;
+  } => {
+    if (hasOutdatedUi) {
+      return {
+        text: getPageOutdatedError(),
+        disabled: true,
+      };
+    }
+
+    if (multipleWalletExtensionsChainError.buttonErrorMessage) {
+      return {
+        text: multipleWalletExtensionsChainError.buttonErrorMessage,
+        errorDescription: multipleWalletExtensionsChainError.buttonTooltipMessage,
+        disabled: true,
+      };
+    }
+
+    if (isCreatingTxn) {
+      return {
+        text: (
+          <>
+            {t`Withdrawing...`}
+            <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ),
+        disabled: true,
+      };
+    }
+
+    if (!bridgeOutInputValue) {
+      return {
+        text: t`Enter an amount`,
+        disabled: true,
+      };
+    }
+
+    if (bridgeOutChain === undefined) {
+      return {
+        text: t`Select network`,
+        disabled: true,
+      };
+    }
+
+    if (
+      gmxAccountMarketTokenBalance === undefined ||
+      marketTokenDecimals === undefined ||
+      bridgeOutAmount === undefined ||
+      bridgeOutAmount > gmxAccountMarketTokenBalance
+    ) {
+      return {
+        text: t`Insufficient balance`,
+        disabled: true,
+      };
+    }
+
+    if (errors?.isOutOfTokenError?.isGasPaymentToken) {
+      return {
+        text: getInsufficientFeeButtonMessage({
+          tokenSymbol: getToken(chainId, gasPaymentTokenAddress).symbol,
+          feeSource: GMX_ACCOUNT_NETWORK_FEE_SOURCE,
+        }),
+        bannerErrorName: ValidationBannerErrorName.insufficientGmxAccountCurrentGasTokenBalance,
+        disabled: true,
+      };
+    }
+
+    if (errors?.isOutOfTokenError?.tokenAddress === getWrappedToken(chainId).address) {
+      return {
+        text: getInsufficientFeeButtonMessage({
+          tokenSymbol: getWrappedToken(chainId).symbol,
+          feeSource: GMX_ACCOUNT_NETWORK_FEE_SOURCE,
+        }),
+        bannerErrorName: ValidationBannerErrorName.insufficientGmxAccountWntBalance,
+        disabled: true,
+      };
+    }
+
+    if (errors?.isOutOfTokenError) {
+      return {
+        text: t`Insufficient balance`,
+        disabled: true,
+      };
+    }
+
+    if (expressTxnParamsAsyncResult.error) {
+      return {
+        ...getSimulationErrorButtonContent({
+          chainId,
+          error: expressTxnParamsAsyncResult.error,
+          fallbackText: t`Error simulating withdrawal`,
+        }),
+        disabled: true,
+      };
+    }
+
+    if (expressTxnParamsAsyncResult.data === undefined) {
+      return {
+        text: (
+          <>
+            {t`Loading...`}
+            <SpinnerIcon className="ml-4 animate-spin" />
+          </>
+        ),
+        disabled: true,
+      };
+    }
+
+    return {
+      text: t`Withdraw`,
+      disabled: false,
+    };
+  }, [
+    hasOutdatedUi,
+    multipleWalletExtensionsChainError,
+    isCreatingTxn,
+    bridgeOutInputValue,
+    bridgeOutChain,
+    gmxAccountMarketTokenBalance,
+    marketTokenDecimals,
+    bridgeOutAmount,
+    errors?.isOutOfTokenError,
+    expressTxnParamsAsyncResult.error,
+    expressTxnParamsAsyncResult.data,
+    chainId,
+    gasPaymentTokenAddress,
+  ]);
+
+  if (!glvOrMarketInfo) {
+    return null;
+  }
+
+  return (
+    <SlideModal
+      isVisible={isVisible}
+      setIsVisible={setIsVisible}
+      label={t`Withdraw ${glvOrGm}: ${getMarketIndexName(glvOrMarketInfo)}`}
+      desktopContentClassName="w-[420px]"
+    >
+      <form onSubmit={handleSubmit} className="flex flex-col gap-12">
+        <BuyInputSection
+          topLeftLabel={t`Withdraw`}
+          inputValue={bridgeOutInputValue}
+          onInputValueChange={(e) => setBridgeOutInputValue(e.target.value)}
+          bottomLeftValue={<UsdValue usd={bridgeOutUsd} />}
+          bottomRightValue={formattedBalance}
+          bottomRightLabel={t`Available`}
+          onClickMax={
+            maxAvailableAmount > 0n
+              ? () => {
+                  setBridgeOutInputValue(formattedMaxAvailableAmount);
+                }
+              : undefined
+          }
+          isMaxSelected={maxActions.selected === "max"}
+          maxDecimals={marketTokenDecimals}
+        >
+          <span className="inline-flex items-center">
+            <TokenIcon
+              className="mr-5"
+              symbol={isGlvInfo(glvOrMarketInfo) ? glvOrMarketInfo.glvToken.symbol : glvOrMarketInfo.indexToken.symbol}
+              displaySize={20}
+              chainIdBadge={0}
+            />
+            <SelectedPoolLabel glvOrMarketInfo={glvOrMarketInfo} />
+          </span>
+        </BuyInputSection>
+
+        <DropdownSelector
+          value={bridgeOutChain}
+          onChange={(value) => {
+            setBridgeOutChain(Number(value) as SourceChainId);
+          }}
+          placeholder={t`Select network`}
+          button={
+            <div className="flex items-center gap-8 text-14">
+              {bridgeOutChain !== undefined ? (
+                <>
+                  <img src={getChainIcon(bridgeOutChain)} alt={getChainName(bridgeOutChain)} className="size-20" />
+                  <div>
+                    <Trans comment="to network">
+                      <span className="text-typography-secondary">To </span>
+                      <span>{getChainName(bridgeOutChain)}</span>
+                    </Trans>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Skeleton baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" width={20} height={20} borderRadius={10} />
+                  <Skeleton baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" width={40} height={16} />
+                </>
+              )}
+            </div>
+          }
+          options={networks}
+          item={NetworkItem}
+          itemKey={networkItemKey}
+        />
+
+        {buttonState.bannerErrorName && (
+          <AlertInfoCard type="error" hideClose>
+            <ValidationBannerErrorContent
+              validationBannerErrorName={buttonState.bannerErrorName}
+              chainId={chainId}
+              srcChainId={bridgeOutChain}
+              gasPaymentTokenAddress={gasPaymentTokenAddress}
+              onBeforeNavigation={() => setIsVisible(false)}
+            />
+          </AlertInfoCard>
+        )}
+
+        <ButtonTooltipWrapper content={buttonState.errorDescription}>
+          <Button className="w-full" type="submit" variant="primary-action" disabled={buttonState.disabled}>
+            {buttonState.text}
+          </Button>
+        </ButtonTooltipWrapper>
+
+        <SimpleNetworkFeeRow
+          details={expressFeeDetails}
+          isLoading={expressFeeDetails === undefined && !expressTxnParamsAsyncResult.error}
+          source={GMX_ACCOUNT_NETWORK_FEE_SOURCE}
+          isExpress
+        />
+
+        <SyntheticsInfoRow
+          label={t`Bridge fee`}
+          labelClassName="whitespace-nowrap"
+          value={
+            bridgeFeeDetails ? (
+              <NetworkFeeValue
+                amount={bridgeFeeDetails.amount}
+                usd={bridgeFeeDetails.usd}
+                decimals={bridgeFeeDetails.decimals}
+                symbol={bridgeFeeDetails.symbol}
+                source={GMX_ACCOUNT_NETWORK_FEE_SOURCE}
+                tooltipContent={t`The bridge fee is paid in ${bridgeFeeTokenSymbol} from your GMX Account.`}
+              />
+            ) : transferNativeFeeError !== undefined ? (
+              "-"
+            ) : (
+              "..."
+            )
+          }
+        />
+
+        <SyntheticsInfoRow
+          label={t`GMX Account balance`}
+          value={
+            <ValueTransition
+              from={
+                gmxAccountMarketTokenBalance !== undefined && marketTokenDecimals !== undefined
+                  ? formatBalanceAmount(gmxAccountMarketTokenBalance, marketTokenDecimals, glvOrGm)
+                  : undefined
+              }
+              to={
+                nextGmxAccountMarketTokenBalance !== undefined && marketTokenDecimals !== undefined
+                  ? formatBalanceAmount(nextGmxAccountMarketTokenBalance, marketTokenDecimals, glvOrGm)
+                  : undefined
+              }
+            />
+          }
+        />
+      </form>
+    </SlideModal>
+  );
+}
+
+function networkItemKey(option: { id: number; name: string }) {
+  return option.id;
+}
+
+function NetworkItem({ option }: { option: { id: number; name: string } }) {
+  return (
+    <div className="flex items-center justify-between">
+      <div className="flex items-center gap-8">
+        <img src={getChainIcon(option.id)} alt={option.name} className="size-20" />
+        <span className="text-body-large">{option.name}</span>
+      </div>
+    </div>
+  );
+}
+
+function useBridgeOutParams({
+  bridgeOutChain,
+  glvOrMarketAddress,
+  bridgeOutAmount,
+  chainId,
+}: {
+  bridgeOutChain: SourceChainId | undefined;
+  glvOrMarketAddress: string | undefined;
+  bridgeOutAmount: bigint | undefined;
+  chainId: ContractsChainId;
+}): BridgeOutParams | undefined {
+  return useMemo(() => {
+    if (
+      bridgeOutChain === undefined ||
+      glvOrMarketAddress === undefined ||
+      bridgeOutAmount === undefined ||
+      bridgeOutAmount <= 0n
+    ) {
+      return;
+    }
+
+    const dstEid = getLayerZeroEndpointId(bridgeOutChain);
+    const stargateAddress = getStargatePoolAddress(chainId, glvOrMarketAddress);
+
+    if (dstEid === undefined || stargateAddress === undefined) {
+      return;
+    }
+
+    return {
+      token: glvOrMarketAddress as Address,
+      amount: bridgeOutAmount,
+      minAmountOut: 0n,
+      data: encodeAbiParameters(
+        [
+          {
+            type: "uint32",
+            name: "dstEid",
+          },
+        ],
+        [dstEid]
+      ),
+      provider: stargateAddress,
+    };
+  }, [bridgeOutChain, glvOrMarketAddress, bridgeOutAmount, chainId]);
+}

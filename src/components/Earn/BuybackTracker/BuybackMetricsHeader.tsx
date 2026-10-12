@@ -1,0 +1,97 @@
+import { Trans } from "@lingui/macro";
+
+import type { BuybackDerivedMetrics } from "domain/buyback/useBuybackChartData";
+import { numberWithCommas, numberWithCommasParts } from "lib/numbers";
+
+import { NumericValue } from "components/NumericValue/NumericValue";
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import InfoIcon from "img/ic_info_circle_stroke.svg?react";
+
+function formatPercent(value: number): string {
+  return `${(value * 100).toFixed(2)}%`;
+}
+
+export function BuybackMetricsHeader({
+  metrics,
+  isLoading,
+  error,
+}: {
+  metrics: BuybackDerivedMetrics | undefined;
+  isLoading: boolean;
+  error: Error | undefined;
+}) {
+  const isUnavailable = !isLoading && (!!error || metrics === undefined);
+
+  return (
+    <div className="flex gap-28 max-md:flex-col max-md:gap-12">
+      <MetricItem
+        label={<Trans>Total bought GMX</Trans>}
+        tooltip={
+          <Trans>
+            Total amount of GMX bought back since tracking began. The USD value is based on the current GMX price.
+          </Trans>
+        }
+        value={metrics ? `${numberWithCommas(Math.round(metrics.totalBoughtGmx))} GMX` : "N/A"}
+        subtitle={
+          metrics?.totalBoughtUsd !== undefined ? (
+            <>
+              (<NumericValue parts={numberWithCommasParts(Math.round(metrics.totalBoughtUsd), { showDollar: true })} />)
+            </>
+          ) : undefined
+        }
+        isLoading={isLoading}
+        isUnavailable={isUnavailable}
+      />
+      <MetricItem
+        label={<Trans>Annualized rate</Trans>}
+        tooltip={
+          <Trans>
+            Estimated yearly buyback rate. At the recent average pace, GMX buybacks would equal this percentage of total
+            GMX supply over one year. This is a protocol-wide buyback metric, not a personal staking APR.
+          </Trans>
+        }
+        value={metrics ? (metrics.annualizedRate !== undefined ? formatPercent(metrics.annualizedRate) : "N/A") : "N/A"}
+        isLoading={isLoading}
+        isUnavailable={isUnavailable}
+      />
+    </div>
+  );
+}
+
+function MetricItem({
+  label,
+  tooltip,
+  value,
+  subtitle,
+  isLoading,
+  isUnavailable,
+}: {
+  label: React.ReactNode;
+  tooltip: React.ReactNode;
+  value: React.ReactNode;
+  subtitle?: React.ReactNode;
+  isLoading: boolean;
+  isUnavailable: boolean;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      <TooltipWithPortal
+        variant="none"
+        handle={
+          <span className="text-body-small inline-flex items-center gap-4 font-medium text-typography-secondary">
+            {label}
+            <InfoIcon className="size-16 text-typography-secondary" />
+          </span>
+        }
+        content={tooltip}
+      />
+      <div className="flex flex-wrap items-baseline gap-x-8">
+        <span className="text-h2 numbers">{isLoading ? "..." : isUnavailable ? "N/A" : value}</span>
+        {subtitle && !isLoading && !isUnavailable && (
+          <span className="text-14 font-medium text-typography-secondary numbers">{subtitle}</span>
+        )}
+      </div>
+    </div>
+  );
+}

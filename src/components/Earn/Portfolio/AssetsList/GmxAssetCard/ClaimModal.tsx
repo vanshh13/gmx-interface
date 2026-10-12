@@ -1,0 +1,385 @@
+import { Trans, t } from "@lingui/macro";
+import cx from "classnames";
+import { ethers } from "ethers";
+import noop from "lodash/noop";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+
+import { ARBITRUM, type ContractsChainId } from "config/chains";
+import { getContract } from "config/contracts";
+import { SetPendingTransactions } from "context/PendingTxnsContext/PendingTxnsContext";
+import { useGovTokenAmount } from "domain/synthetics/governance/useGovTokenAmount";
+import { useGovTokenDelegates } from "domain/synthetics/governance/useGovTokenDelegates";
+import { useTokensAllowanceData } from "domain/synthetics/tokens";
+import { approveTokens } from "domain/tokens";
+import { callContract } from "lib/contracts";
+import { useLocalStorageSerializeKey } from "lib/localStorage";
+import { formatAmount } from "lib/numbers";
+import { UncheckedJsonRpcSigner } from "lib/rpc/UncheckedJsonRpcSigner";
+import { getPageOutdatedError, useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { abis } from "sdk/abis";
+import { NATIVE_TOKEN_ADDRESS } from "sdk/configs/tokens";
+
+import { AlertInfoCard } from "components/AlertInfo/AlertInfoCard";
+import Button from "components/Button/Button";
+import Checkbox from "components/Checkbox/Checkbox";
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import ModalWithPortal from "components/Modal/ModalWithPortal";
+import { SwitchToSettlementChainButtons } from "components/SwitchToSettlementChain/SwitchToSettlementChainButtons";
+import { SwitchToSettlementChainWarning } from "components/SwitchToSettlementChain/SwitchToSettlementChainWarning";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+
+import { GMX_DAO_LINKS } from "./constants";
+
+export function ClaimModal(props: {
+  isVisible: boolean;
+  setIsVisible: (isVisible: boolean) => void;
+  rewardRouterAddress: string;
+  signer: UncheckedJsonRpcSigner | undefined;
+  chainId: ContractsChainId;
+  setPendingTxns: SetPendingTransactions;
+  totalGmxRewards: bigint | undefined;
+  totalEsGmxRewards: bigint | undefined;
+  totalNativeTokenRewards: bigint | undefined;
+  nativeTokenSymbol: string;
+  wrappedTokenSymbol: string;
+  isNativeTokenToClaim?: boolean;
+  gmxUsageOptionsMsg?: React.ReactNode;
+  onClaimSuccess?: () => void;
+}) {
+  const {
+    isVisible,
+    setIsVisible,
+    rewardRouterAddress,
+    signer,
+    chainId,
+    setPendingTxns,
+    totalGmxRewards,
+    totalEsGmxRewards,
+    totalNativeTokenRewards,
+    nativeTokenSymbol,
+    wrappedTokenSymbol,
+    isNativeTokenToClaim,
+    gmxUsageOptionsMsg,
+    onClaimSuccess,
+  } = props;
+  const [isClaiming, setIsClaiming] = useState(false);
+  const hasOutdatedUi = useHasOutdatedUi();
+  const [shouldClaimGmx, setShouldClaimGmx] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-claim-gmx"],
+    true
+  );
+  const [shouldStakeGmx, setShouldStakeGmx] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-stake-gmx"],
+    true
+  );
+  const [shouldClaimEsGmx, setShouldClaimEsGmx] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-claim-es-gmx"],
+    true
+  );
+  const [shouldStakeEsGmx, setShouldStakeEsGmx] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-stake-es-gmx"],
+    true
+  );
+  const [shouldClaimWeth, setShouldClaimWeth] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-claim-weth"],
+    true
+  );
+  const [shouldConvertWeth, setShouldConvertWeth] = useLocalStorageSerializeKey(
+    [chainId, "StakeV2-compound-should-convert-weth"],
+    true
+  );
+
+  const govTokenAmount = useGovTokenAmount(chainId);
+  const govTokenDelegatesAddress = useGovTokenDelegates(chainId);
+  const hasUndelegatedGovToken =
+    chainId === ARBITRUM &&
+    govTokenDelegatesAddress === NATIVE_TOKEN_ADDRESS &&
+    govTokenAmount !== undefined &&
+    govTokenAmount > 0n;
+
+  const gmxAddress = getContract(chainId, "GMX");
+  const stakedGmxTrackerAddress = getContract(chainId, "StakedGmxTracker");
+
+  const [isApproving, setIsApproving] = useState(false);
+
+  const { tokensAllowanceData: gmxAllowanceData } = useTokensAllowanceData(chainId, {
+    spenderAddress: stakedGmxTrackerAddress,
+    tokenAddresses: [gmxAddress],
+  });
+
+  const gmxTokenAllowance = gmxAllowanceData?.[gmxAddress];
+
+  const needApproval =
+    shouldStakeGmx &&
+    totalGmxRewards !== undefined &&
+    ((gmxTokenAllowance !== undefined && totalGmxRewards > gmxTokenAllowance) ||
+      (totalGmxRewards > 0n && gmxTokenAllowance === undefined));
+
+  useEffect(() => {
+    if (!needApproval && isApproving) {
+      setIsApproving(false);
+    }
+  }, [isApproving, needApproval]);
+
+  const isAnySelectedToClaim = shouldClaimGmx || shouldClaimEsGmx || shouldClaimWeth;
+
+  const hasAnyPendingRewards =
+    (totalGmxRewards !== undefined && totalGmxRewards > 0n) ||
+    (totalEsGmxRewards !== undefined && totalEsGmxRewards > 0n) ||
+    (totalNativeTokenRewards !== undefined && totalNativeTokenRewards > 0n);
+
+  const isPrimaryEnabled =
+    !isClaiming && !isApproving && hasAnyPendingRewards && isAnySelectedToClaim && !hasOutdatedUi;
+
+  const primaryText = useMemo(() => {
+    if (hasOutdatedUi) {
+      return getPageOutdatedError();
+    }
+    if (!hasAnyPendingRewards) {
+      return <Trans>No rewards</Trans>;
+    }
+    if (!isAnySelectedToClaim) {
+      return <Trans>Select rewards to claim</Trans>;
+    }
+    if (isApproving) {
+      return <Trans>Pending GMX approval...</Trans>;
+    }
+    if (needApproval) {
+      return <Trans>Approve GMX</Trans>;
+    }
+    if (isClaiming) {
+      return <Trans>Claiming...</Trans>;
+    }
+    return <Trans>Claim</Trans>;
+  }, [hasOutdatedUi, hasAnyPendingRewards, isAnySelectedToClaim, needApproval, isApproving, isClaiming]);
+
+  const onClickPrimary = useCallback(() => {
+    if (needApproval) {
+      setIsApproving(true);
+      approveTokens({
+        setIsApproving: noop,
+        signer,
+        tokenAddress: gmxAddress,
+        spender: stakedGmxTrackerAddress,
+        chainId,
+        permitParams: undefined,
+        approveAmount: undefined,
+        onApproveFail: () => {
+          setIsApproving(false);
+        },
+      });
+      return;
+    }
+
+    setIsClaiming(true);
+
+    const contract = new ethers.Contract(rewardRouterAddress, abis.RewardRouter, signer);
+    callContract(
+      chainId,
+      contract,
+      "handleRewards",
+      [
+        shouldClaimGmx || shouldStakeGmx,
+        shouldStakeGmx,
+        shouldClaimEsGmx || shouldStakeEsGmx,
+        shouldStakeEsGmx,
+        true,
+        isNativeTokenToClaim ? shouldClaimWeth || shouldConvertWeth : false,
+        isNativeTokenToClaim ? shouldConvertWeth : false,
+      ],
+      {
+        sentMsg: t`Claim submitted`,
+        failMsg: t`Claim failed`,
+        successMsg: t`Claim completed`,
+        successDetailsMsg: !shouldStakeGmx ? gmxUsageOptionsMsg : undefined,
+        setPendingTxns,
+      }
+    )
+      .then(() => {
+        setIsVisible(false);
+        onClaimSuccess?.();
+      })
+      .finally(() => {
+        setIsClaiming(false);
+      });
+  }, [
+    needApproval,
+    signer,
+    gmxAddress,
+    stakedGmxTrackerAddress,
+    chainId,
+    rewardRouterAddress,
+    shouldClaimGmx,
+    shouldStakeGmx,
+    shouldClaimEsGmx,
+    shouldStakeEsGmx,
+    isNativeTokenToClaim,
+    shouldClaimWeth,
+    shouldConvertWeth,
+    gmxUsageOptionsMsg,
+    setPendingTxns,
+    setIsVisible,
+    onClaimSuccess,
+  ]);
+
+  const toggleShouldStakeGmx = useCallback(
+    (value: boolean) => {
+      if (value) {
+        setShouldClaimGmx(true);
+      }
+      setShouldStakeGmx(value);
+    },
+    [setShouldClaimGmx, setShouldStakeGmx]
+  );
+
+  const toggleShouldStakeEsGmx = useCallback(
+    (value: boolean) => {
+      if (value) {
+        setShouldClaimEsGmx(true);
+      }
+      setShouldStakeEsGmx(value);
+    },
+    [setShouldClaimEsGmx, setShouldStakeEsGmx]
+  );
+
+  const toggleConvertWeth = useCallback(
+    (value: boolean) => {
+      if (value) {
+        setShouldClaimWeth(true);
+      }
+      setShouldConvertWeth(value);
+    },
+    [setShouldClaimWeth, setShouldConvertWeth]
+  );
+
+  return (
+    <ModalWithPortal
+      isVisible={isVisible}
+      setIsVisible={setIsVisible}
+      label={t`Claim rewards`}
+      withMobileBottomPosition
+    >
+      <div className="flex flex-col gap-12 pb-20 ">
+        <ClaimRewardOption
+          tokenSymbol="GMX"
+          amount={totalGmxRewards}
+          amountDecimals={18}
+          amountSymbol="GMX"
+          primaryChecked={shouldClaimGmx}
+          setPrimaryChecked={setShouldClaimGmx}
+          secondaryChecked={shouldStakeGmx}
+          setSecondaryChecked={toggleShouldStakeGmx}
+        />
+        <ClaimRewardOption
+          tokenSymbol="esGMX"
+          amount={totalEsGmxRewards}
+          amountDecimals={18}
+          amountSymbol="esGMX"
+          primaryChecked={shouldClaimEsGmx}
+          setPrimaryChecked={setShouldClaimEsGmx}
+          secondaryChecked={shouldStakeEsGmx}
+          setSecondaryChecked={toggleShouldStakeEsGmx}
+        />
+        {isNativeTokenToClaim && (
+          <ClaimRewardOption
+            tokenSymbol={wrappedTokenSymbol}
+            amount={totalNativeTokenRewards}
+            amountDecimals={18}
+            amountSymbol={wrappedTokenSymbol}
+            primaryChecked={shouldClaimWeth}
+            setPrimaryChecked={setShouldClaimWeth}
+            secondaryChecked={shouldConvertWeth}
+            setSecondaryChecked={toggleConvertWeth}
+            nativeTokenSymbol={nativeTokenSymbol}
+            isNativeTokenToClaim={isNativeTokenToClaim}
+          />
+        )}
+      </div>
+      {hasUndelegatedGovToken ? (
+        <AlertInfoCard type="warning" hideClose>
+          <Trans>
+            Delegating your undelegated {formatAmount(govTokenAmount, 18, 2, true)} GMX DAO voting power is optional for
+            claiming.{" "}
+            <ExternalLink href={GMX_DAO_LINKS.VOTING_POWER} className="display-inline">
+              Delegate voting power
+            </ExternalLink>
+          </Trans>
+        </AlertInfoCard>
+      ) : null}
+      <SwitchToSettlementChainWarning topic="staking" />
+      <div className="Exchange-swap-button-container">
+        <SwitchToSettlementChainButtons>
+          <Button variant="primary-action" className="w-full" onClick={onClickPrimary} disabled={!isPrimaryEnabled}>
+            {primaryText}
+          </Button>
+        </SwitchToSettlementChainButtons>
+      </div>
+    </ModalWithPortal>
+  );
+}
+
+function ClaimRewardOption({
+  tokenSymbol,
+  amount,
+  amountDecimals,
+  amountSymbol,
+  primaryChecked,
+  setPrimaryChecked,
+  secondaryChecked,
+  setSecondaryChecked,
+  nativeTokenSymbol,
+  isNativeTokenToClaim,
+}: {
+  tokenSymbol: string;
+  amount: bigint | undefined;
+  amountDecimals: number;
+  amountSymbol: string;
+  primaryChecked: boolean | undefined;
+  setPrimaryChecked: (value: boolean) => void;
+  secondaryChecked: boolean | undefined;
+  setSecondaryChecked: (value: boolean) => void;
+  nativeTokenSymbol?: string;
+  isNativeTokenToClaim?: boolean;
+}) {
+  const amountText = amount !== undefined ? `${formatAmount(amount, amountDecimals)} ${amountSymbol}` : "...";
+  const isPrimaryDisabled = Boolean(secondaryChecked);
+
+  return (
+    <div className="overflow-hidden rounded-8 bg-slate-800">
+      <Checkbox
+        isChecked={primaryChecked}
+        setIsChecked={setPrimaryChecked}
+        disabled={isPrimaryDisabled}
+        className={cx(
+          "w-full justify-between px-16 py-14 text-left",
+          isPrimaryDisabled ? "text-typography-secondary" : "text-typography-primary"
+        )}
+      >
+        <div className="flex items-center gap-4">
+          <TokenIcon symbol={tokenSymbol} displaySize={20} className="!rounded-0" />
+          <span className="text-body-medium font-medium text-typography-primary">
+            <Trans>Claim {tokenSymbol} rewards</Trans>
+          </span>
+        </div>
+        <span className={cx("text-body-medium ml-auto numbers", "text-typography-secondary")}>{amountText}</span>
+      </Checkbox>
+
+      <div className="border-t-1/2 border-slate-600" />
+      <Checkbox
+        isChecked={Boolean(secondaryChecked)}
+        setIsChecked={setSecondaryChecked}
+        className="w-full justify-start px-16 py-14 text-left"
+      >
+        <span className="text-body-medium">
+          {nativeTokenSymbol && isNativeTokenToClaim ? (
+            <Trans>
+              Convert {tokenSymbol} to {nativeTokenSymbol}
+            </Trans>
+          ) : (
+            <Trans>Stake {tokenSymbol} rewards</Trans>
+          )}
+        </span>
+      </Checkbox>
+    </div>
+  );
+}

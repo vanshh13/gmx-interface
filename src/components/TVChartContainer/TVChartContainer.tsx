@@ -1,0 +1,983 @@
+import { gql } from "@apollo/client";
+import { t } from "@lingui/macro";
+import { CSSProperties, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLatest, useLocalStorage, useMedia } from "react-use";
+import { isAddressEqual, type Address } from "viem";
+
+import { colors } from "config/colors";
+import { WAS_TV_CHART_OVERRIDDEN_KEY } from "config/localStorage";
+import { type TradingViewResolution, RESOLUTION_TO_SECONDS, SUPPORTED_RESOLUTIONS_V2 } from "config/tradingview";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useSyntheticsEvents } from "context/SyntheticsEvents/SyntheticsEventsProvider";
+import { selectChartToken } from "context/SyntheticsStateContext/selectors/chartSelectors";
+import { selectChartDynamicLines } from "context/SyntheticsStateContext/selectors/chartSelectors/selectChartDynamicLines";
+import {
+  selectMarketsInfoData,
+  selectPositionsInfoData,
+  selectTokensData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useTheme } from "context/ThemeContext/ThemeContext";
+import { OrderType, isDecreaseOrderType, isIncreaseOrderType } from "domain/synthetics/orders";
+import { getPositionKey } from "domain/synthetics/positions";
+import { parseContractPrice } from "domain/synthetics/tokens";
+import { processRawTradeActions } from "domain/synthetics/tradeHistory/processTradeActions";
+import { fetchRawTradeActions } from "domain/synthetics/tradeHistory/useTradeHistory";
+import { TokenPrices } from "domain/tokens";
+import { DataFeed } from "domain/tradingview/DataFeed";
+import { getObjectKeyFromValue, getSymbolName } from "domain/tradingview/utils";
+import { getSubsquidGraphClient } from "lib/indexers/clients";
+import { formatUsd, calculateDisplayDecimals } from "lib/numbers";
+import { useOracleKeeperFetcher } from "lib/oracleKeeperFetcher";
+import useWallet from "lib/wallets/useWallet";
+import { ContractsChainId } from "sdk/configs/chains";
+import { isChartAvailableForToken, getTokenBySymbolSafe } from "sdk/configs/tokens";
+import { convertTokenAddress } from "sdk/configs/tokens";
+import { TradeActionType, isPositionTradeAction, type TradeAction } from "sdk/utils/tradeHistory/types";
+
+import Loader from "components/Loader/Loader";
+import type { MarketFilterLongShortItemData } from "components/TableMarketFilter/MarketFilterLongShort";
+
+import { ChartContextMenu } from "./ChartContextMenu";
+import {
+  PRICE_LINE_COLOR_KEY,
+  getChartThemeOverrides,
+  getThemeOverridesToApply,
+  isAppChartValue,
+  readSavedChartValues,
+} from "./chartThemeOverrides";
+import { defaultChartProps, disabledFeaturesOnMobile } from "./constants";
+import { CrosshairPercentageLabel } from "./CrosshairPercentageLabel";
+import { DynamicLines } from "./DynamicLines";
+import { SaveLoadAdapter } from "./SaveLoadAdapter";
+import { stackOverlappingChartLines } from "./stackOverlappingChartLines";
+import { StaticLines } from "./StaticLines";
+import type { StaticChartLine } from "./types";
+import type { OpenChartTPSLModalParams } from "./useChartContextMenu";
+import { useChartContextMenu } from "./useChartContextMenu";
+import { useCrosshairPercentage } from "./useCrosshairPercentage";
+import type {
+  ChartingLibraryWidgetOptions,
+  IChartingLibraryWidget,
+  PlusClickParams,
+  ResolutionString,
+  Mark,
+} from "../../charting_library";
+
+/** Maximum number of trade actions to fetch per marks request */
+const MARKS_PAGE_SIZE = 100;
+/** How long fetched marks data stays valid in cache */
+const MARKS_CACHE_TTL_MS = 60_000;
+
+function getNormalizedPositionKey(account: string, market: string, collateral: string, isLong: boolean) {
+  return getPositionKey(account.toLowerCase(), market.toLowerCase(), collateral.toLowerCase(), isLong);
+}
+
+const OPENED_AT_QUERY_LIMIT = 500;
+
+async function fetchOpenPositionsOpenedAt(chainId: number, contractKeys: string[]): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  const client = getSubsquidGraphClient(chainId);
+  if (!client || contractKeys.length === 0) {
+    return result;
+  }
+
+  const keysList = contractKeys.map((key) => `"${key}"`).join(",");
+  const query = gql(`{
+    positions(limit: ${OPENED_AT_QUERY_LIMIT}, where: { positionKey_in: [${keysList}], isSnapshot_eq: false }) {
+      positionKey
+      openedAt
+    }
+  }`);
+
+  const res = await client.query<{ positions: { positionKey: string; openedAt: number }[] }>({
+    query,
+    fetchPolicy: "no-cache",
+  });
+
+  for (const position of res.data?.positions || []) {
+    if (position.positionKey && typeof position.openedAt === "number") {
+      result.set(position.positionKey.toLowerCase(), position.openedAt);
+    }
+  }
+
+  return result;
+}
+
+type Props = {
+  chainId: number;
+  chartLines: StaticChartLine[];
+  period: string;
+  setPeriod: (period: string) => void;
+  chartToken:
+    | ({
+        symbol: string;
+      } & TokenPrices)
+    | { symbol: string };
+  supportedResolutions: typeof SUPPORTED_RESOLUTIONS_V2;
+  visualMultiplier?: number;
+  setIsCandlesLoaded?: (isCandlesLoaded: boolean) => void;
+  onOpenTPSLModal?: (params: OpenChartTPSLModalParams) => void;
+};
+
+export default function TVChartContainer({
+  chartToken,
+  chainId,
+  chartLines,
+  period,
+  setPeriod,
+  supportedResolutions,
+  visualMultiplier,
+  setIsCandlesLoaded,
+  onOpenTPSLModal,
+}: Props) {
+  const { shouldShowPositionLines, buySellIconsMode } = useSettings();
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const tvWidgetRef = useRef<IChartingLibraryWidget | null>(null);
+  const [chartReady, setChartReady] = useState(false);
+  const [isChartChangingSymbol, setIsChartChangingSymbol] = useState(false);
+  const [chartDataLoading, setChartDataLoading] = useState(true);
+  const [wasChartOverridden, setWasChartOverridden] = useLocalStorage<boolean>(WAS_TV_CHART_OVERRIDDEN_KEY, false);
+
+  const { theme } = useTheme();
+
+  const oracleKeeperFetcher = useOracleKeeperFetcher(chainId as ContractsChainId);
+
+  const [datafeed, setDatafeed] = useState<DataFeed | null>(null);
+  const { positionIncreaseEvents, positionDecreaseEvents } = useSyntheticsEvents();
+  const marketsInfoData = useSelector(selectMarketsInfoData);
+  const tokensData = useSelector(selectTokensData);
+  const positionsInfoData = useSelector(selectPositionsInfoData);
+  const { chartToken: selectedChartToken } = useSelector(selectChartToken);
+  const dynamicChartLines = useSelector(selectChartDynamicLines);
+  const { account } = useWallet();
+
+  const openPositionKeySet = useMemo(() => {
+    const set = new Set<string>();
+    if (!positionsInfoData) return set;
+    for (const pos of Object.values(positionsInfoData)) {
+      if (!pos || pos.sizeInUsd === 0n) continue;
+      set.add(getNormalizedPositionKey(pos.account, pos.marketAddress, pos.collateralTokenAddress, pos.isLong));
+    }
+    return set;
+  }, [positionsInfoData]);
+
+  const openPositionsKey = useMemo(() => Array.from(openPositionKeySet).sort().join(","), [openPositionKeySet]);
+
+  const openContractKeys = useMemo(() => {
+    const keys: string[] = [];
+    if (!positionsInfoData) return keys;
+    for (const pos of Object.values(positionsInfoData)) {
+      if (!pos || pos.sizeInUsd === 0n || !pos.contractKey) continue;
+      keys.push(pos.contractKey.toLowerCase());
+    }
+    return keys;
+  }, [positionsInfoData]);
+  const openContractKeysKey = useMemo(() => openContractKeys.slice().sort().join(","), [openContractKeys]);
+
+  const [openedAtByContractKey, setOpenedAtByContractKey] = useState<Map<string, number>>(() => new Map());
+
+  useEffect(() => {
+    if (!account || buySellIconsMode !== "current" || openContractKeys.length === 0) {
+      setOpenedAtByContractKey((prev) => (prev.size === 0 ? prev : new Map()));
+      return;
+    }
+    let cancelled = false;
+    fetchOpenPositionsOpenedAt(chainId, openContractKeys)
+      .then((map) => {
+        if (!cancelled) setOpenedAtByContractKey(map);
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("Error fetching positions openedAt:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chainId, account, buySellIconsMode, openContractKeysKey]);
+
+  const openedAtByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    if (!positionsInfoData) return map;
+    for (const pos of Object.values(positionsInfoData)) {
+      if (!pos || pos.sizeInUsd === 0n || !pos.contractKey) continue;
+      const openedAt = openedAtByContractKey.get(pos.contractKey.toLowerCase());
+      if (openedAt === undefined) continue;
+      map.set(
+        getNormalizedPositionKey(pos.account, pos.marketAddress, pos.collateralTokenAddress, pos.isLong),
+        openedAt
+      );
+    }
+    return map;
+  }, [positionsInfoData, openedAtByContractKey]);
+
+  const marksStateRef = useLatest({
+    positionIncreaseEvents,
+    positionDecreaseEvents,
+    marketsInfoData,
+    tokensData,
+    openPositionKeySet,
+    openedAtByKey,
+    selectedChartToken,
+    visualMultiplier,
+    chainId,
+    account,
+    buySellIconsMode,
+  });
+  const marksHistoryCacheRef = useRef<{
+    key?: string;
+    raw?: NonNullable<Awaited<ReturnType<typeof fetchRawTradeActions>>>["tradeActions"];
+    fetchedAt?: number;
+  }>({});
+
+  useEffect(() => {
+    const widget = tvWidgetRef.current;
+
+    if (!chartReady || !widget) {
+      return;
+    }
+
+    const themeOverrides = getChartThemeOverrides(theme);
+
+    if (!wasChartOverridden || !widget.layoutName()) {
+      widget.applyOverrides(themeOverrides);
+      widget.saveChartToServer();
+      setWasChartOverridden(true);
+      return;
+    }
+
+    widget.save((state) => {
+      const overrides = getThemeOverridesToApply({
+        theme,
+        savedValues: readSavedChartValues(state, Object.keys(themeOverrides)),
+      });
+
+      if (Object.keys(overrides).length === 0 || tvWidgetRef.current !== widget) {
+        return;
+      }
+
+      widget.applyOverrides(overrides);
+      widget.saveChartToServer();
+    });
+  }, [chartReady, wasChartOverridden, setWasChartOverridden, theme]);
+
+  useEffect(() => {
+    const newDatafeed = new DataFeed(chainId, oracleKeeperFetcher);
+    newDatafeed.setTokenPriceGetter((symbol) => {
+      const data = marksStateRef.current.tokensData;
+      if (!data) return undefined;
+      const token = Object.values(data).find((t) => t.symbol === symbol);
+      return token?.prices?.minPrice;
+    });
+    newDatafeed.setMarksGetter(async (_symbolInfo, from, to, resolution) => {
+      const {
+        positionIncreaseEvents: inc,
+        positionDecreaseEvents: dec,
+        marketsInfoData: markets,
+        tokensData,
+        openPositionKeySet,
+        openedAtByKey,
+        selectedChartToken: selToken,
+        visualMultiplier: vm,
+        chainId: cid,
+        account: acc,
+        buySellIconsMode: mode,
+      } = marksStateRef.current;
+      if (mode === "off") {
+        return [];
+      }
+      if (!selToken?.address) {
+        return [];
+      }
+
+      const periodSeconds = RESOLUTION_TO_SECONDS[String(resolution)];
+      if (!periodSeconds) {
+        return [];
+      }
+      const wrappedSelected = convertTokenAddress(cid as ContractsChainId, selToken.address, "wrapped");
+      if (!acc || !markets || !tokensData) {
+        return [];
+      }
+
+      const makeMark = (p: {
+        id: string;
+        isIncrease: boolean;
+        isLong: boolean;
+        ts: number;
+        marketAddress: string;
+        executionPrice?: bigint;
+      }): Mark | null => {
+        const market = markets?.[p.marketAddress];
+        if (!market) {
+          return null;
+        }
+        const marketIndexWrapped = convertTokenAddress(cid as ContractsChainId, market.indexTokenAddress, "wrapped");
+        if (!isAddressEqual(marketIndexWrapped as Address, wrappedSelected as Address)) {
+          return null;
+        }
+
+        const isBuy = p.isIncrease ? p.isLong : !p.isLong;
+        const label = isBuy ? "B" : "S";
+        const color = isBuy ? "green" : "red";
+
+        if (p.ts < from || p.ts > to) {
+          return null;
+        }
+        const time = Math.floor(p.ts / periodSeconds) * periodSeconds;
+
+        const action = p.isIncrease
+          ? p.isLong
+            ? t`Open long`
+            : t`Open short`
+          : p.isLong
+            ? t`Close long`
+            : t`Close short`;
+        const indexToken = market.indexToken;
+        const tokenVm = indexToken?.visualMultiplier ?? vm ?? 1;
+        const marketPriceDecimals = indexToken?.prices?.minPrice
+          ? calculateDisplayDecimals(indexToken.prices.minPrice, undefined, tokenVm)
+          : undefined;
+        const priceText = p.executionPrice
+          ? ` · Exec. ${formatUsd(p.executionPrice, { displayDecimals: marketPriceDecimals, visualMultiplier: tokenVm })}`
+          : "";
+
+        return {
+          id: p.id,
+          time,
+          color,
+          text: `${action}${priceText}`,
+          label,
+          labelFontColor: "#ffffff",
+          minSize: 12,
+        };
+      };
+
+      const combinations = [
+        {
+          eventName: TradeActionType.OrderExecuted,
+          isTwap: false,
+          orderType: [
+            OrderType.MarketIncrease,
+            OrderType.LimitIncrease,
+            OrderType.StopIncrease,
+            OrderType.MarketDecrease,
+            OrderType.LimitDecrease,
+            OrderType.StopLossDecrease,
+            OrderType.Liquidation,
+          ],
+        },
+        {
+          eventName: TradeActionType.OrderExecuted,
+          isTwap: true,
+          orderType: [OrderType.LimitIncrease, OrderType.LimitDecrease],
+        },
+      ];
+
+      let raw: NonNullable<Awaited<ReturnType<typeof fetchRawTradeActions>>>["tradeActions"] | undefined;
+      let marketAddresses: string[] = [];
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const toClamped = Math.min(to, now);
+        const toBucketed = Math.ceil(toClamped / 60) * 60;
+
+        marketAddresses = Object.values(markets)
+          .filter((m) =>
+            isAddressEqual(
+              convertTokenAddress(cid as ContractsChainId, m.indexTokenAddress, "wrapped") as Address,
+              wrappedSelected as Address
+            )
+          )
+          .map((m) => m.marketTokenAddress);
+
+        const marketFilters: MarketFilterLongShortItemData[] = marketAddresses.map((addr) => ({
+          marketAddress: addr as Address,
+          direction: "any",
+        }));
+
+        const marketAddressesKey = marketAddresses.slice().sort().join(",");
+        const cacheKey = `${cid}:${acc}:${wrappedSelected}:${resolution}:${from}:${toBucketed}:${marketAddressesKey}`;
+        const cached = marksHistoryCacheRef.current;
+
+        if (
+          cached.key === cacheKey &&
+          cached.raw &&
+          cached.fetchedAt &&
+          Date.now() - cached.fetchedAt < MARKS_CACHE_TTL_MS
+        ) {
+          raw = cached.raw;
+        } else {
+          const rawResult = await fetchRawTradeActions({
+            chainId: cid,
+            pageIndex: 0,
+            pageSize: MARKS_PAGE_SIZE,
+            includeTotalCount: false,
+            marketsDirectionsFilter: marketFilters,
+            forAllAccounts: false,
+            account: acc,
+            fromTxTimestamp: from,
+            toTxTimestamp: toBucketed,
+            orderEventCombinations: combinations,
+            showDebugValues: false,
+          });
+          raw = rawResult?.tradeActions;
+          marksHistoryCacheRef.current = { key: cacheKey, raw, fetchedAt: Date.now() };
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("Error fetching trade history marks:", err);
+        raw = undefined;
+      }
+
+      const marks: Mark[] = [];
+      const addedMarkIds = new Set<string>();
+
+      const addMark = (mark: Mark | null) => {
+        if (!mark) return;
+        const id = String(mark.id);
+        if (addedMarkIds.has(id)) return;
+        addedMarkIds.add(id);
+        marks.push(mark);
+      };
+
+      let processed: TradeAction[] = [];
+      if (raw && markets && tokensData) {
+        processed =
+          processRawTradeActions({
+            chainId: cid,
+            rawActions: raw,
+            marketsInfoData: markets,
+            tokensData,
+            marketsDirectionsFilter: undefined,
+          }) || [];
+      }
+
+      const liveGenesisByKey = new Map<string, number>();
+      if (mode === "current") {
+        (inc || []).forEach((e) => {
+          if (e.sizeDeltaUsd === 0n || e.sizeInUsd !== e.sizeDeltaUsd) return;
+          if (acc && e.account && !isAddressEqual(e.account as Address, acc as Address)) return;
+          const key = getNormalizedPositionKey(e.account, e.marketAddress, e.collateralTokenAddress, e.isLong);
+          const ts = Number(e.increasedAtTime);
+          const prev = liveGenesisByKey.get(key);
+          if (prev === undefined || ts > prev) liveGenesisByKey.set(key, ts);
+        });
+      }
+
+      const getGenesisTs = (key: string): number | undefined => {
+        const indexed = openedAtByKey.get(key);
+        const live = liveGenesisByKey.get(key);
+        if (indexed === undefined) return live;
+        if (live === undefined) return indexed;
+        return Math.max(indexed, live);
+      };
+
+      const isOpenPositionMark = (
+        account: string,
+        marketAddress: string,
+        collateralTokenAddress: string,
+        isLong: boolean,
+        ts: number
+      ): boolean => {
+        if (mode === "all") return true;
+        const key = getNormalizedPositionKey(account, marketAddress, collateralTokenAddress, isLong);
+        if (!openPositionKeySet.has(key)) return false;
+        const genesisTs = getGenesisTs(key);
+        if (genesisTs === undefined) return false;
+        return ts >= genesisTs;
+      };
+
+      processed.forEach((pa) => {
+        if (!isPositionTradeAction(pa)) return;
+        const ot = pa.orderType;
+        const isIncrease = isIncreaseOrderType(ot);
+        const isDecrease = isDecreaseOrderType(ot) || ot === OrderType.Liquidation;
+        if (!isIncrease && !isDecrease) return;
+        const collateralTokenAddress = isIncrease ? pa.targetCollateralToken.address : pa.initialCollateralTokenAddress;
+        const ts = Number(pa.timestamp);
+        if (!isOpenPositionMark(pa.account, pa.marketAddress, collateralTokenAddress, pa.isLong, ts)) return;
+        addMark(
+          makeMark({
+            id: String(pa.orderKey || pa.id),
+            isIncrease,
+            isLong: pa.isLong,
+            ts,
+            marketAddress: pa.marketAddress,
+            executionPrice: pa.executionPrice,
+          })
+        );
+      });
+
+      (inc || []).forEach((e) => {
+        if (e.sizeDeltaUsd === 0n) return;
+        if (acc && e.account && !isAddressEqual(e.account as Address, acc as Address)) return;
+        const ts = Number(e.increasedAtTime);
+        if (!isOpenPositionMark(e.account, e.marketAddress, e.collateralTokenAddress, e.isLong, ts)) return;
+        const marketForEvent = markets?.[e.marketAddress];
+        const tokenDecimals: number | undefined = marketForEvent?.indexToken?.decimals;
+        const execPrice =
+          e.executionPrice !== undefined && e.executionPrice !== null && tokenDecimals !== undefined
+            ? parseContractPrice(BigInt(e.executionPrice), tokenDecimals)
+            : undefined;
+
+        addMark(
+          makeMark({
+            id: String(e.orderKey),
+            isIncrease: true,
+            isLong: e.isLong,
+            ts,
+            marketAddress: e.marketAddress,
+            executionPrice: execPrice,
+          })
+        );
+      });
+
+      (dec || []).forEach((e) => {
+        if (e.sizeDeltaUsd === 0n) return;
+        if (acc && e.account && !isAddressEqual(e.account as Address, acc as Address)) return;
+        const ts = Number(e.decreasedAtTime);
+        if (!isOpenPositionMark(e.account, e.marketAddress, e.collateralTokenAddress, e.isLong, ts)) return;
+        const marketForEvent = markets?.[e.marketAddress];
+        const tokenDecimals: number | undefined = marketForEvent?.indexToken?.decimals;
+        const execPrice =
+          e.executionPrice !== undefined && e.executionPrice !== null && tokenDecimals !== undefined
+            ? parseContractPrice(BigInt(e.executionPrice), tokenDecimals)
+            : undefined;
+        addMark(
+          makeMark({
+            id: String(e.orderKey),
+            isIncrease: false,
+            isLong: e.isLong,
+            ts,
+            marketAddress: e.marketAddress,
+            executionPrice: execPrice,
+          })
+        );
+      });
+
+      marks.sort((a, b) => (a.time !== b.time ? a.time - b.time : String(a.id).localeCompare(String(b.id))));
+      return marks;
+    });
+    if (setIsCandlesLoaded) {
+      newDatafeed.addEventListener("candlesDisplay.success", (event: Event) => {
+        const isFirstDraw = (event as CustomEvent).detail.isFirstTimeLoad;
+        if (isFirstDraw) {
+          setIsCandlesLoaded(true);
+        }
+      });
+    }
+    setDatafeed((prev) => {
+      if (prev) {
+        prev.destroy();
+      }
+      return newDatafeed;
+    });
+  }, [chainId, oracleKeeperFetcher, setIsCandlesLoaded, marksStateRef]);
+
+  const isMobile = useMedia("(max-width: 550px)");
+  const symbolRef = useRef(chartToken.symbol);
+
+  const [pricePerPixel, setPricePerPixel] = useState<number>(0);
+  const [plotWidthPx, setPlotWidthPx] = useState<number>(0);
+
+  useEffect(() => {
+    if (!chartReady || chartDataLoading || !tvWidgetRef.current) return;
+
+    let chart;
+    try {
+      chart = tvWidgetRef.current.activeChart();
+    } catch {
+      return;
+    }
+
+    const update = () => {
+      const pane = chart.getPanes()?.[0];
+      if (!pane) return;
+
+      const priceScale = pane.getMainSourcePriceScale();
+      if (!priceScale) return;
+
+      let range;
+      try {
+        range = priceScale.getVisiblePriceRange();
+      } catch {
+        return;
+      }
+      if (!range) return;
+
+      const height = pane.getHeight();
+      if (height <= 0) return;
+
+      setPricePerPixel((range.to - range.from) / height);
+
+      const container = chartContainerRef.current;
+      const iframe = container?.querySelector("iframe");
+      if (!container || !iframe?.contentDocument) return;
+
+      const priceAxes = Array.from(iframe.contentDocument.querySelectorAll(".price-axis"));
+      if (priceAxes.length === 0) return;
+
+      let rightmostPriceAxisRect: DOMRect | null = null;
+      for (const el of priceAxes) {
+        const rect = el.getBoundingClientRect();
+        if (rightmostPriceAxisRect === null || rect.left > rightmostPriceAxisRect.left) {
+          rightmostPriceAxisRect = rect;
+        }
+      }
+
+      if (!rightmostPriceAxisRect) return;
+
+      const containerRect = container.getBoundingClientRect();
+      const iframeRect = iframe.getBoundingClientRect();
+      const axisLeftInContainer = iframeRect.left - containerRect.left + rightmostPriceAxisRect.left;
+
+      if (Number.isFinite(axisLeftInContainer) && axisLeftInContainer > 0) {
+        setPlotWidthPx(axisLeftInContainer);
+      }
+    };
+
+    update();
+    chart.onVisibleRangeChanged().subscribe(null, update);
+    const resizeObserver =
+      chartContainerRef.current && typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
+    if (resizeObserver && chartContainerRef.current) {
+      resizeObserver.observe(chartContainerRef.current);
+    }
+
+    return () => {
+      chart.onVisibleRangeChanged().unsubscribe(null, update);
+      resizeObserver?.disconnect();
+    };
+  }, [chartReady, chartDataLoading]);
+
+  const bodyFontSizePt = useMemo(() => {
+    if (plotWidthPx <= 0) return 14;
+    if (plotWidthPx >= 700) return 14;
+    if (plotWidthPx >= 550) return 13;
+    return 12;
+  }, [plotWidthPx]);
+
+  const { staticLines: stackedStaticLines, dynamicLines: stackedDynamicLines } = useMemo(
+    () =>
+      stackOverlappingChartLines({
+        staticLines: chartLines,
+        dynamicLines: dynamicChartLines,
+        pricePerPixel,
+        isMobile,
+        plotWidthPx,
+        bodyFontSizePt,
+      }),
+    [chartLines, dynamicChartLines, isMobile, plotWidthPx, pricePerPixel, bodyFontSizePt]
+  );
+
+  const hasSizableChartLines = useMemo(
+    () =>
+      shouldShowPositionLines &&
+      (dynamicChartLines.some((line) => line.sizeData !== undefined) ||
+        chartLines.some((line) => line.positionData !== undefined)),
+    [shouldShowPositionLines, dynamicChartLines, chartLines]
+  );
+
+  const { menuState, closeMenu, handlePlusClick, getContextMenuItems } = useChartContextMenu(
+    visualMultiplier,
+    chartContainerRef,
+    hasSizableChartLines,
+    { onOpenTPSLModal }
+  );
+
+  const crosshairPercentageState = useCrosshairPercentage(tvWidgetRef, chartContainerRef, chartReady, visualMultiplier);
+
+  const getContextMenuItemsRef = useLatest(getContextMenuItems);
+  const handlePlusClickRef = useLatest(handlePlusClick);
+  const closeMenuRef = useLatest(closeMenu);
+
+  useEffect(() => {
+    if (tokensData && datafeed) {
+      datafeed.notifyPricesReady();
+    }
+  }, [tokensData, datafeed]);
+
+  useEffect(() => {
+    if (
+      !chartReady ||
+      !tvWidgetRef.current ||
+      !chartToken.symbol ||
+      !isChartAvailableForToken(chainId, chartToken.symbol)
+    ) {
+      return;
+    }
+
+    const newSymbolWithMultiplier = getSymbolName(chartToken.symbol, visualMultiplier);
+    const currentSymbolInfo = tvWidgetRef.current?.activeChart().symbolExt();
+    const currentSymbolWithMultiplier = currentSymbolInfo
+      ? getSymbolName(
+          currentSymbolInfo.name,
+          currentSymbolInfo.unit_id ? parseInt(currentSymbolInfo.unit_id) : undefined
+        )
+      : undefined;
+
+    if (newSymbolWithMultiplier !== currentSymbolWithMultiplier) {
+      setIsChartChangingSymbol(true);
+
+      tvWidgetRef.current.setSymbol(newSymbolWithMultiplier, tvWidgetRef.current.activeChart().resolution(), () => {
+        const priceScale = tvWidgetRef.current?.activeChart().getPanes().at(0)?.getMainSourcePriceScale();
+        if (priceScale) {
+          priceScale.setAutoScale(true);
+        }
+        setIsChartChangingSymbol(false);
+      });
+    }
+  }, [chainId, chartReady, chartToken.symbol, visualMultiplier]);
+
+  useEffect(() => {
+    if (!chartReady || !tvWidgetRef.current || !chartToken.symbol) return;
+
+    const token = getTokenBySymbolSafe(chainId, chartToken.symbol);
+    const isStable = token?.isStable ?? false;
+
+    tvWidgetRef.current.applyOverrides({
+      "mainSeriesProperties.highLowAvgPrice.highLowPriceLinesVisible": false,
+      "mainSeriesProperties.highLowAvgPrice.highLowPriceLabelsVisible": !isStable,
+    });
+  }, [chainId, chartReady, chartToken.symbol, theme]);
+
+  const lastPeriod = useLatest(period);
+  const lastSupportedResolutions = useLatest(supportedResolutions);
+
+  useLayoutEffect(() => {
+    if (symbolRef.current) {
+      datafeed?.prefetchBars(
+        symbolRef.current,
+        getObjectKeyFromValue(lastPeriod.current, lastSupportedResolutions.current) as ResolutionString
+      );
+    }
+  }, [datafeed, lastPeriod, lastSupportedResolutions]);
+
+  const hasMarketsInfo = Boolean(marketsInfoData);
+  const hasTokensData = Boolean(tokensData);
+
+  const markPriceDirectionRef = useRef<"up" | "down" | "flat" | undefined>(undefined);
+
+  useEffect(() => {
+    markPriceDirectionRef.current = undefined;
+  }, [chainId, datafeed, theme]);
+
+  useEffect(() => {
+    if (!datafeed) return;
+
+    const onCurrentCandleUpdate = (event: Event) => {
+      const widget = tvWidgetRef.current;
+      if (!chartReady || !widget) return;
+
+      const detail = (event as CustomEvent).detail as {
+        symbol: string;
+        resolution: ResolutionString;
+        bar: { open: number; close: number };
+      };
+
+      if (widget.activeChart().resolution() !== detail.resolution) return;
+      if (widget.activeChart().symbolExt()?.name !== detail.symbol) return;
+
+      const direction =
+        detail.bar.close > detail.bar.open ? "up" : detail.bar.close < detail.bar.open ? "down" : "flat";
+      if (markPriceDirectionRef.current === direction) return;
+      markPriceDirectionRef.current = direction;
+
+      widget.save((state) => {
+        const savedPriceLineColor = readSavedChartValues(state, [PRICE_LINE_COLOR_KEY])[PRICE_LINE_COLOR_KEY];
+        if (!isAppChartValue(PRICE_LINE_COLOR_KEY, savedPriceLineColor) || tvWidgetRef.current !== widget) return;
+
+        const neutralColor = getChartThemeOverrides(theme)[PRICE_LINE_COLOR_KEY] as string;
+        const priceLineColor =
+          direction === "up" ? colors.green[500][theme] : direction === "down" ? colors.red[500][theme] : neutralColor;
+
+        widget.applyOverrides({
+          [PRICE_LINE_COLOR_KEY]: priceLineColor,
+        });
+      });
+    };
+
+    datafeed.addEventListener("currentCandle.update", onCurrentCandleUpdate);
+    return () => {
+      datafeed.removeEventListener("currentCandle.update", onCurrentCandleUpdate);
+    };
+  }, [chartReady, datafeed, theme]);
+
+  useEffect(() => {
+    if (chartReady) {
+      tvWidgetRef.current?.activeChart().clearMarks();
+      tvWidgetRef.current?.activeChart().refreshMarks();
+    }
+  }, [
+    chartReady,
+    positionIncreaseEvents,
+    positionDecreaseEvents,
+    account,
+    selectedChartToken?.address,
+    hasMarketsInfo,
+    hasTokensData,
+    visualMultiplier,
+    buySellIconsMode,
+    openPositionsKey,
+    openedAtByContractKey,
+  ]);
+
+  useEffect(() => {
+    if (!datafeed) return;
+
+    const widgetOptions: ChartingLibraryWidgetOptions = {
+      debug: false,
+      symbol: symbolRef.current && getSymbolName(symbolRef.current, visualMultiplier), // Using ref to avoid unnecessary re-renders on symbol change and still have access to the latest symbol
+      datafeed,
+      theme: theme,
+      container: chartContainerRef.current!,
+      library_path: defaultChartProps.library_path,
+      locale: defaultChartProps.locale,
+      loading_screen:
+        theme === "light"
+          ? { backgroundColor: "#FFFFFF", foregroundColor: "#2962ff" }
+          : defaultChartProps.loading_screen,
+      enabled_features: defaultChartProps.enabled_features,
+      disabled_features: isMobile
+        ? defaultChartProps.disabled_features.concat(disabledFeaturesOnMobile)
+        : defaultChartProps.disabled_features,
+      client_id: defaultChartProps.client_id,
+      user_id: defaultChartProps.user_id,
+      fullscreen: defaultChartProps.fullscreen,
+      autosize: defaultChartProps.autosize,
+      custom_css_url: defaultChartProps.custom_css_url,
+      overrides: getChartThemeOverrides(theme),
+      interval: getObjectKeyFromValue(period, supportedResolutions) as ResolutionString,
+      favorites: { ...defaultChartProps.favorites, intervals: Object.keys(supportedResolutions) as ResolutionString[] },
+      custom_formatters: defaultChartProps.custom_formatters,
+      load_last_chart: true,
+      auto_save_delay: 1,
+      save_load_adapter: new SaveLoadAdapter(),
+    };
+    const widget = new window.TradingView.widget(widgetOptions);
+
+    let didTriggerOnChartReady = { current: false };
+
+    widget.onChartReady(function () {
+      didTriggerOnChartReady.current = true;
+      tvWidgetRef.current = widget;
+      setChartReady(true);
+
+      const savedPeriod = tvWidgetRef.current?.activeChart().resolution();
+      const preferredPeriod = getObjectKeyFromValue(period, supportedResolutions) as ResolutionString;
+
+      if (savedPeriod && savedPeriod !== preferredPeriod) {
+        tvWidgetRef.current?.activeChart().setResolution(preferredPeriod);
+      }
+
+      tvWidgetRef.current
+        ?.activeChart()
+        .onIntervalChanged()
+        .subscribe(null, (interval) => {
+          const res = interval as TradingViewResolution;
+          if (supportedResolutions[res]) {
+            const period = supportedResolutions[res];
+            setPeriod(period);
+            tvWidgetRef.current?.saveChartToServer(undefined, undefined, {
+              chartName: `gmx-chart-v2`,
+            });
+
+            const priceScale = tvWidgetRef.current?.activeChart().getPanes().at(0)?.getMainSourcePriceScale();
+            if (priceScale) {
+              priceScale.setAutoScale(true);
+            }
+          }
+        });
+
+      tvWidgetRef.current?.subscribe("onAutoSaveNeeded", () => {
+        tvWidgetRef.current?.saveChartToServer(undefined, undefined, {
+          chartName: `gmx-chart-v2`,
+        });
+      });
+
+      tvWidgetRef.current?.activeChart().dataReady(() => {
+        setChartDataLoading(false);
+      });
+
+      tvWidgetRef.current?.onContextMenu((_unixTime, price) => {
+        return getContextMenuItemsRef.current(price);
+      });
+
+      tvWidgetRef.current?.subscribe("onPlusClick", (params: PlusClickParams) => {
+        handlePlusClickRef.current(params);
+      });
+
+      tvWidgetRef.current?.subscribe("mouse_down", () => {
+        closeMenuRef.current();
+      });
+    });
+
+    /*
+    For some reason on prod TV sometimes does not get initialized properly,
+    for these cases we wait some fixed amount of time and force TV into initialization
+    */
+
+    const forceInitTimeout = setTimeout(() => {
+      if (didTriggerOnChartReady.current || !chartContainerRef.current) {
+        return;
+      }
+
+      const iframe = chartContainerRef.current.querySelector("iframe");
+
+      if (!iframe || !iframe.contentWindow) {
+        return;
+      }
+      const iframeWindow = iframe.contentWindow;
+      const iframeDocument = iframeWindow.document;
+
+      if (iframeDocument.readyState !== "complete") {
+        iframeDocument.addEventListener("readystatechange", () => {
+          if (iframeDocument.readyState === "complete") {
+            iframeWindow.dispatchEvent(new Event("innerWindowLoad"));
+          }
+        });
+      } else {
+        iframeWindow.dispatchEvent(new Event("innerWindowLoad"));
+      }
+    }, 800);
+
+    return () => {
+      clearTimeout(forceInitTimeout);
+      widget.remove();
+      tvWidgetRef.current = null;
+      setChartReady(false);
+      setChartDataLoading(true);
+    };
+    // We don't want to re-initialize the chart when the symbol changes. This will make the chart flicker.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chainId, datafeed, theme]);
+
+  const style = useMemo<CSSProperties>(
+    () => ({ visibility: !chartDataLoading ? "visible" : "hidden" }),
+    [chartDataLoading]
+  );
+
+  return (
+    <div className="ExchangeChart-error">
+      {chartDataLoading && <Loader />}
+      <div style={style} ref={chartContainerRef} className="ExchangeChart-bottom-content" />
+      {chartReady && (
+        <div style={style} className="ExchangeChart-bottom-content pointer-events-none">
+          <CrosshairPercentageLabel state={crosshairPercentageState} />
+        </div>
+      )}
+      {shouldShowPositionLines && chartReady && !isChartChangingSymbol && (
+        <>
+          <StaticLines tvWidgetRef={tvWidgetRef} chartLines={stackedStaticLines} bodyFontSizePt={bodyFontSizePt} />
+          <DynamicLines
+            isMobile={isMobile}
+            tvWidgetRef={tvWidgetRef}
+            lines={stackedDynamicLines}
+            bodyFontSizePt={bodyFontSizePt}
+          />
+        </>
+      )}
+      <ChartContextMenu menuState={menuState} onClose={closeMenu} />
+    </div>
+  );
+}

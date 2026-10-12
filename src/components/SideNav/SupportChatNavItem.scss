@@ -1,0 +1,16 @@
+.support-chat-icon-gradient-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.support-chat-icon-collapsed path {
+  fill: url(#support-chat-icon-collapsed-gradient);
+}
+
+.image-capture-in-progress,
+.image-capture-in-progress * {
+  animation: none !important;
+}

@@ -1,0 +1,107 @@
+import { Dispatch, SetStateAction, useEffect } from "react";
+
+import { selectAccountWhitelistsResult } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { getGlvOrMarketAddress } from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import type { GlvAndGmMarketsInfoData, GlvOrMarketInfo, MarketInfo } from "domain/synthetics/markets/types";
+import { getDirectDepositAccess, getIsDirectDepositBlocked } from "domain/synthetics/whitelists/utils";
+import { getByKey } from "lib/objects";
+
+import { getShiftAvailableRelatedMarkets } from "./getShiftAvailableRelatedMarkets";
+
+export function useUpdateMarkets({
+  chainId,
+  glvAndMarketsInfoData,
+  selectedGlvOrMarketAddress,
+  shiftAvailableGlvOrMarkets,
+  onSelectGlvOrMarket,
+  toMarketAddress,
+  toMarketInfo,
+  selectedMarketInfo,
+  setToMarketAddress,
+}: {
+  chainId: number;
+  glvAndMarketsInfoData: GlvAndGmMarketsInfoData | undefined;
+  selectedGlvOrMarketAddress: string | undefined;
+  shiftAvailableGlvOrMarkets: GlvOrMarketInfo[];
+  onSelectGlvOrMarket: (glvOrMarketAddress: string) => void;
+  toMarketAddress: string | undefined;
+  toMarketInfo: MarketInfo | undefined;
+  selectedMarketInfo: MarketInfo | undefined;
+  setToMarketAddress: Dispatch<SetStateAction<string | undefined>>;
+}): void {
+  const whitelistsResult = useSelector(selectAccountWhitelistsResult);
+
+  useEffect(
+    function updateMarkets() {
+      if (!glvAndMarketsInfoData) {
+        return;
+      }
+
+      let newSelectedGlvOrMarketAddress = selectedGlvOrMarketAddress;
+
+      const isSelectedGlvOrMarketValid = Boolean(
+        selectedGlvOrMarketAddress &&
+          shiftAvailableGlvOrMarkets.find((market) => getGlvOrMarketAddress(market) === selectedGlvOrMarketAddress)
+      );
+
+      if (!isSelectedGlvOrMarketValid) {
+        const someAvailableGlvOrMarket = shiftAvailableGlvOrMarkets[0];
+
+        if (!someAvailableGlvOrMarket) {
+          return;
+        }
+
+        newSelectedGlvOrMarketAddress = getGlvOrMarketAddress(someAvailableGlvOrMarket);
+        onSelectGlvOrMarket(newSelectedGlvOrMarketAddress);
+      }
+
+      const isToMarketAvailable = Boolean(toMarketAddress && getByKey(glvAndMarketsInfoData, toMarketAddress));
+      const isToMarketRelated =
+        toMarketInfo?.longTokenAddress === selectedMarketInfo?.longTokenAddress &&
+        toMarketInfo?.shortTokenAddress === selectedMarketInfo?.shortTokenAddress;
+      const isToMarketSameAsSelected = toMarketAddress === newSelectedGlvOrMarketAddress;
+      const toMarketDirectDepositAccess = toMarketInfo
+        ? getDirectDepositAccess({ chainId, glvOrMarket: toMarketInfo, whitelistsResult })
+        : undefined;
+      const isToMarketBlocked = getIsDirectDepositBlocked(toMarketDirectDepositAccess);
+      const isToMarketValid =
+        isToMarketAvailable && isToMarketRelated && !isToMarketSameAsSelected && !isToMarketBlocked;
+
+      if (toMarketInfo && isGlvInfo(toMarketInfo)) {
+        return;
+      }
+
+      if (!isToMarketValid) {
+        const someAvailableMarket = getShiftAvailableRelatedMarkets({
+          chainId,
+          marketsInfoData: glvAndMarketsInfoData,
+          sortedMarketsInfoByIndexToken: shiftAvailableGlvOrMarkets,
+          marketTokenAddress: newSelectedGlvOrMarketAddress,
+          whitelistsResult,
+        })[0];
+
+        if (!someAvailableMarket) {
+          setToMarketAddress(undefined);
+          return;
+        }
+
+        setToMarketAddress(getGlvOrMarketAddress(someAvailableMarket));
+      }
+    },
+    [
+      chainId,
+      glvAndMarketsInfoData,
+      onSelectGlvOrMarket,
+      selectedGlvOrMarketAddress,
+      selectedMarketInfo?.longTokenAddress,
+      selectedMarketInfo?.shortTokenAddress,
+      setToMarketAddress,
+      shiftAvailableGlvOrMarkets,
+      toMarketAddress,
+      toMarketInfo,
+      whitelistsResult,
+    ]
+  );
+}

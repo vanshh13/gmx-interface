@@ -1,0 +1,165 @@
+import { t } from "@lingui/macro";
+import { Signer, Wallet, ethers } from "ethers";
+import { encodeFunctionData, type Address } from "viem";
+
+import { getContract } from "config/contracts";
+import { callContract } from "lib/contracts";
+import { ExpressTxnData } from "lib/transactions";
+import { WalletSigner } from "lib/wallets";
+import { signTypedData } from "lib/wallets/signing";
+import { getPublicClientWithRpc } from "lib/wallets/walletConfig";
+import { abis } from "sdk/abis";
+import { ContractsChainId, SourceChainId } from "sdk/configs/chains";
+import { applyGasLimitBuffer } from "sdk/utils/gas/applyBuffer";
+
+import { validateSignerAddress } from "components/Errors/errorToasts";
+
+import { RelayParamsPayload, getGelatoRelayRouterDomain, hashRelayParams } from "../express";
+import { getMultichainInfoFromSigner } from "../express/expressOrderUtils";
+
+type Params = {
+  account: string;
+  fundingFees: {
+    marketAddresses: string[];
+    tokenAddresses: string[];
+  };
+  setPendingTxns: (txns: any) => void;
+};
+
+export async function claimFundingFeesTxn(chainId: ContractsChainId, signer: Signer, p: Params) {
+  const { setPendingTxns, fundingFees, account } = p;
+
+  await validateSignerAddress(signer, account);
+
+  const contract = new ethers.Contract(getContract(chainId, "ExchangeRouter"), abis.ExchangeRouter, signer);
+
+  return callContract(
+    chainId,
+    contract,
+    "claimFundingFees",
+    [fundingFees.marketAddresses, fundingFees.tokenAddresses, account],
+    {
+      sentMsg: t`Claiming funding fees...`,
+      successMsg: t`Funding fees claimed`,
+      failMsg: t`Claim failed`,
+      hideSuccessMsg: true,
+      setPendingTxns,
+    }
+  );
+}
+
+export async function estimateClaimFundingFeesGas(
+  chainId: ContractsChainId,
+  { account, marketAddresses, tokenAddresses }: { account: string; marketAddresses: string[]; tokenAddresses: string[] }
+): Promise<bigint> {
+  const client = getPublicClientWithRpc(chainId);
+
+  const callData = encodeFunctionData({
+    abi: abis.ExchangeRouter,
+    functionName: "claimFundingFees",
+    args: [marketAddresses, tokenAddresses, account],
+  });
+
+  return client
+    .estimateGas({
+      account: account as Address,
+      to: getContract(chainId, "ExchangeRouter"),
+      data: callData,
+    })
+    .then(applyGasLimitBuffer);
+}
+
+export async function buildAndSignClaimFundingFeesTxn({
+  signer,
+  relayParams,
+  account,
+  markets,
+  tokens,
+  receiver,
+  chainId,
+  emptySignature = false,
+  relayerFeeTokenAddress,
+  relayerFeeAmount,
+}: {
+  signer: WalletSigner;
+  relayParams: RelayParamsPayload;
+  account: string;
+  markets: string[];
+  tokens: string[];
+  receiver: string;
+  chainId: ContractsChainId;
+  emptySignature?: boolean;
+  relayerFeeTokenAddress: string;
+  relayerFeeAmount: bigint;
+}): Promise<ExpressTxnData> {
+  const srcChainId = await getMultichainInfoFromSigner(signer, chainId);
+  if (!srcChainId) {
+    throw new Error("No srcChainId");
+  }
+
+  let signature: string;
+
+  if (emptySignature) {
+    signature = "0x";
+  } else {
+    signature = await signClaimFundingFeesPayload({
+      signer,
+      relayParams,
+      markets,
+      tokens,
+      receiver,
+      chainId,
+      srcChainId,
+    });
+  }
+
+  const claimFundingFeesCallData = encodeFunctionData({
+    abi: abis.MultichainClaimsRouter,
+    functionName: "claimFundingFees",
+    args: [{ ...relayParams, signature }, account, BigInt(srcChainId), markets, tokens, receiver],
+  });
+
+  return {
+    callData: claimFundingFeesCallData,
+    to: getContract(chainId, "MultichainClaimsRouter"),
+    feeToken: relayerFeeTokenAddress,
+    feeAmount: relayerFeeAmount,
+  };
+}
+
+async function signClaimFundingFeesPayload({
+  signer,
+  relayParams,
+  markets,
+  tokens,
+  receiver,
+  chainId,
+  srcChainId,
+}: {
+  signer: WalletSigner | Wallet;
+  relayParams: RelayParamsPayload;
+  markets: string[];
+  tokens: string[];
+  receiver: string;
+  chainId: ContractsChainId;
+  srcChainId: SourceChainId;
+}) {
+  const types = {
+    ClaimFundingFees: [
+      { name: "markets", type: "address[]" },
+      { name: "tokens", type: "address[]" },
+      { name: "receiver", type: "address" },
+      { name: "relayParams", type: "bytes32" },
+    ],
+  };
+
+  const domain = getGelatoRelayRouterDomain(srcChainId, getContract(chainId, "MultichainClaimsRouter"));
+  const typedData = {
+    markets,
+    tokens,
+    receiver,
+    relayParams: hashRelayParams(relayParams),
+  };
+
+  return signTypedData({ signer, domain, types, typedData, verificationChainId: chainId });
+}

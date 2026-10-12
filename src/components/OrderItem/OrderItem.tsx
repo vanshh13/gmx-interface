@@ -1,0 +1,1045 @@
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { useCallback, useMemo } from "react";
+
+import { USD_DECIMALS } from "config/factors";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useEditingOrderState } from "context/SyntheticsStateContext/hooks/orderEditorHooks";
+import { useOrderErrors } from "context/SyntheticsStateContext/hooks/orderHooks";
+import {
+  selectChainId,
+  selectMarketsInfoData,
+  selectOracleSettings,
+  selectPositionsInfoData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { selectTradeboxSelectedOrderKey } from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { isBoundaryAcceptablePrice } from "domain/prices";
+import { getMarketIndexName, getMarketPoolName } from "domain/synthetics/markets";
+import {
+  OrderInfo,
+  PositionOrderInfo,
+  SwapOrderInfo,
+  TwapOrderInfo,
+  getOrderTradeboxKey,
+  isDecreaseOrderType,
+  isIncreaseOrderType,
+  isLimitOrderType,
+  isMarketOrderType,
+  isStopIncreaseOrderType,
+  isStopLossOrderType,
+  isSwapOrderType,
+  isTwapOrder,
+} from "domain/synthetics/orders";
+import { isMarginDepositOrder } from "domain/synthetics/orders/marginDeposit";
+import { useDisabledCancelMarketOrderMessage } from "domain/synthetics/orders/useDisabledCancelMarketOrderMessage";
+import { PositionsInfoData, getNameByOrderType, getPositionKey } from "domain/synthetics/positions";
+import { convertToTokenAmount, convertToUsd, getTokensRatioByPrice } from "domain/synthetics/tokens";
+import { getMarkPrice } from "domain/synthetics/trade";
+import { TokensRatioAndSlippage } from "domain/tokens";
+import { isFullClosePositionOrder } from "domain/tpsl/utils";
+import {
+  calculateDisplayDecimals,
+  formatAmount,
+  formatBalanceAmount,
+  formatUsd,
+  formatUsdParts,
+  numberParts,
+} from "lib/numbers";
+import { getByKey } from "lib/objects";
+import { useIsTruncated } from "lib/useIsTruncated";
+import { getWrappedToken } from "sdk/configs/tokens";
+
+import { AppCard, AppCardSection } from "components/AppCard/AppCard";
+import Button from "components/Button/Button";
+import Checkbox from "components/Checkbox/Checkbox";
+import { MarketWithDirectionLabel } from "components/MarketWithDirectionLabel/MarketWithDirectionLabel";
+import { NumericValue } from "components/NumericValue/NumericValue";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import StatsTooltipRow from "components/StatsTooltip/StatsTooltipRow";
+import { SwapMarketLabel } from "components/SwapMarketLabel/SwapMarketLabel";
+import { TableTd, TableTr } from "components/Table/Table";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import CloseIcon from "img/ic_close.svg?react";
+import EditIcon from "img/ic_edit.svg?react";
+
+import TwapOrdersList from "./TwapOrdersList/TwapOrdersList";
+import { getSwapPathMarketFullNames, getSwapPathTokenSymbols } from "../TradeHistory/TradeHistoryRow/utils/swap";
+
+import "./OrderItem.scss";
+
+const TOOLTIP_HANDLE_CLASSNAME = "cursor-help underline decoration-dashed decoration-1 underline-offset-2";
+
+type Props = {
+  order: OrderInfo;
+  onToggleOrder?: () => void;
+  onCancelOrder?: () => void;
+  isSelected?: boolean;
+  isCanceling?: boolean;
+  hideActions?: boolean;
+  isLarge: boolean;
+  positionsInfoData?: PositionsInfoData;
+  setRef?: (el: HTMLElement | null, orderKey: string) => void;
+  onSelectOrderClick: () => void | undefined;
+};
+
+export function OrderItem(p: Props) {
+  const { showDebugValues, isSetAcceptablePriceImpactEnabled } = useSettings();
+
+  const [, setEditingOrderState] = useEditingOrderState();
+
+  const setEditingOrderKey = useCallback(() => {
+    setEditingOrderState({ orderKey: p.order.key, source: "PositionsList" });
+  }, [p.order.key, setEditingOrderState]);
+
+  const isCurrentMarket = useSelector(selectTradeboxSelectedOrderKey) === getOrderTradeboxKey(p.order);
+
+  return p.isLarge ? (
+    <OrderItemLarge
+      order={p.order}
+      hideActions={p.hideActions}
+      showDebugValues={showDebugValues}
+      isSetAcceptablePriceImpactEnabled={isSetAcceptablePriceImpactEnabled}
+      onToggleOrder={p.onToggleOrder}
+      setEditingOrderKey={setEditingOrderKey}
+      onCancelOrder={p.onCancelOrder}
+      isCanceling={p.isCanceling}
+      isSelected={p.isSelected}
+      setRef={p.setRef}
+      isCurrentMarket={isCurrentMarket}
+      onSelectOrderClick={p.onSelectOrderClick}
+    />
+  ) : (
+    <OrderItemSmall
+      order={p.order}
+      isSetAcceptablePriceImpactEnabled={isSetAcceptablePriceImpactEnabled}
+      showDebugValues={showDebugValues}
+      hideActions={p.hideActions}
+      onCancelOrder={p.onCancelOrder}
+      setEditingOrderKey={setEditingOrderKey}
+      isSelected={p.isSelected}
+      onToggleOrder={p.onToggleOrder}
+      setRef={p.setRef}
+      isCurrentMarket={isCurrentMarket}
+      onSelectOrderClick={p.onSelectOrderClick}
+    />
+  );
+}
+
+function OrderSize({
+  order,
+  showDebugValues,
+  className,
+}: {
+  order: OrderInfo;
+  showDebugValues: boolean | undefined;
+  className?: string;
+}) {
+  const chainId = useSelector(selectChainId);
+  const positionsInfoData = useSelector(selectPositionsInfoData);
+
+  if (isSwapOrderType(order.orderType)) {
+    if (showDebugValues) {
+      return (
+        <TooltipWithPortal
+          variant="none"
+          handle={<SizeWithIcon order={order} className={className} />}
+          position="bottom-start"
+          content={
+            <>
+              <StatsTooltipRow
+                label={t`Key`}
+                value={<div className="debug-key muted">{order.key}</div>}
+                showDollar={false}
+              />
+              <StatsTooltipRow
+                label={t`Amount`}
+                value={<div className="debug-key muted">{order.minOutputAmount.toString()}</div>}
+                showDollar={false}
+              />
+            </>
+          }
+        />
+      );
+    }
+
+    return <SizeWithIcon order={order} className={className} />;
+  }
+
+  const positionOrder = order as PositionOrderInfo;
+  const isCollateralSwap =
+    positionOrder.shouldUnwrapNativeToken ||
+    positionOrder.initialCollateralToken.address !== positionOrder.targetCollateralToken.address;
+
+  const wrappedToken = getWrappedToken(chainId);
+
+  const position = getByKey(
+    positionsInfoData,
+    getPositionKey(
+      positionOrder.account,
+      positionOrder.marketAddress,
+      positionOrder.targetCollateralToken.address,
+      positionOrder.isLong
+    )
+  );
+  const isFullClose = isFullClosePositionOrder(order, position?.sizeInUsd);
+
+  function getCollateralLabel() {
+    if (isDecreaseOrderType(positionOrder.orderType)) {
+      return t`Margin delta`;
+    }
+    return t`Margin`;
+  }
+
+  function getCollateralText() {
+    const useLivePositionMargin = isFullClose && position;
+    const sourceAmount = useLivePositionMargin ? position.collateralAmount : positionOrder.initialCollateralDeltaAmount;
+    const sourceToken = useLivePositionMargin ? position.collateralToken : positionOrder.initialCollateralToken;
+
+    const collateralUsd = convertToUsd(sourceAmount, sourceToken.decimals, sourceToken.prices.minPrice)!;
+
+    const targetCollateralAmount = convertToTokenAmount(
+      collateralUsd,
+      positionOrder.targetCollateralToken.decimals,
+      positionOrder.targetCollateralToken.prices.minPrice
+    )!;
+
+    const decreaseMultiplier = isDecreaseOrderType(positionOrder.orderType) ? -1n : 1n;
+
+    const signedTargetCollateralAmount = targetCollateralAmount * decreaseMultiplier;
+
+    const tokenAmountText = formatBalanceAmount(
+      signedTargetCollateralAmount,
+      positionOrder.targetCollateralToken.decimals,
+      positionOrder.targetCollateralToken.isNative ? wrappedToken.symbol : positionOrder.targetCollateralToken.symbol,
+      { isStable: positionOrder.targetCollateralToken.isStable }
+    );
+
+    return `${tokenAmountText}`;
+  }
+
+  return (
+    <TooltipWithPortal
+      handle={<SizeWithIcon order={order} className={className} positionSizeUsd={position?.sizeInUsd} />}
+      position="bottom-start"
+      tooltipClassName={isTwapOrder(order) ? "!p-0" : undefined}
+      maxAllowedWidth={400}
+      variant="none"
+      content={
+        isTwapOrder(order) ? (
+          <TwapOrdersList order={order} />
+        ) : (
+          <>
+            <StatsTooltipRow label={getCollateralLabel()} value={getCollateralText()} showDollar={false} />
+
+            {isCollateralSwap && (
+              <div className="OrderItem-tooltip-row">
+                <Trans>
+                  {formatBalanceAmount(
+                    positionOrder.initialCollateralDeltaAmount,
+                    positionOrder.initialCollateralToken.decimals,
+                    positionOrder.initialCollateralToken[
+                      positionOrder.shouldUnwrapNativeToken ? "baseSymbol" : "symbol"
+                    ],
+                    { isStable: positionOrder.initialCollateralToken.isStable }
+                  )}{" "}
+                  swapped to{" "}
+                  {positionOrder.targetCollateralToken.isNative
+                    ? wrappedToken.symbol
+                    : positionOrder.targetCollateralToken.symbol}{" "}
+                  when executed
+                </Trans>
+              </div>
+            )}
+
+            {showDebugValues && (
+              <div className="OrderItem-tooltip-row">
+                <StatsTooltipRow
+                  label={t`Key`}
+                  value={<div className="debug-key muted">{positionOrder.key}</div>}
+                  showDollar={false}
+                />
+              </div>
+            )}
+          </>
+        )
+      }
+    />
+  );
+}
+
+export function TwapOrderProgress({ order, className }: { order: TwapOrderInfo; className?: string }) {
+  const content = ` (${order.numberOfParts - order.orders.length}/${order.numberOfParts})`;
+  return <span className={className}>{content}</span>;
+}
+
+function SizeWithIcon({
+  order,
+  className,
+  positionSizeUsd,
+}: {
+  order: OrderInfo;
+  className?: string;
+  positionSizeUsd?: bigint;
+}) {
+  if (isSwapOrderType(order.orderType)) {
+    const { initialCollateralToken, targetCollateralToken, minOutputAmount, initialCollateralDeltaAmount } = order;
+
+    const fromTokenText = formatBalanceAmount(
+      initialCollateralDeltaAmount,
+      initialCollateralToken.decimals,
+      undefined,
+      {
+        isStable: initialCollateralToken.isStable,
+      }
+    );
+    const fromTokenIcon = <TokenIcon symbol={initialCollateralToken.symbol} displaySize={18} />;
+
+    const toTokenText = formatBalanceAmount(minOutputAmount, targetCollateralToken.decimals, undefined, {
+      isStable: targetCollateralToken.isStable,
+    });
+    const toTokenIcon = <TokenIcon symbol={targetCollateralToken.symbol} displaySize={18} />;
+
+    const handle = (
+      <span className={className}>
+        <Trans>
+          <span>{fromTokenText} </span>
+          {fromTokenIcon}
+          <span> to </span>
+          {isTwapOrder(order) ? null : <span>{toTokenText} </span>}
+          {toTokenIcon}
+          {isTwapOrder(order) ? (
+            <TwapOrderProgress order={order} className="font-normal text-typography-secondary" />
+          ) : null}
+        </Trans>
+      </span>
+    );
+
+    return (
+      <div className={cx("inline-flex flex-wrap gap-y-8 whitespace-pre-wrap")}>
+        {isTwapOrder(order) ? (
+          <TooltipWithPortal
+            handle={handle}
+            position="bottom-start"
+            content={<TwapOrdersList order={order} />}
+            tooltipClassName="!p-0"
+            maxAllowedWidth={450}
+            variant="none"
+          />
+        ) : (
+          handle
+        )}
+      </div>
+    );
+  }
+
+  const { sizeDeltaUsd } = order;
+  if (isFullClosePositionOrder(order, positionSizeUsd)) {
+    return (
+      <span className={className}>
+        <Trans>Full position close</Trans>
+      </span>
+    );
+  }
+
+  if (isMarginDepositOrder(order)) {
+    const depositToken = order.initialCollateralToken;
+
+    return (
+      <span className={className}>
+        {formatBalanceAmount(order.initialCollateralDeltaAmount, depositToken.decimals, depositToken.symbol, {
+          isStable: depositToken.isStable,
+        })}
+      </span>
+    );
+  }
+
+  const sizeText = <UsdValue usd={sizeDeltaUsd * (isIncreaseOrderType(order.orderType) ? 1n : -1n)} displayPlus />;
+
+  return (
+    <span className={className}>
+      {sizeText} {isTwapOrder(order) && <TwapOrderProgress order={order} className="text-typography-secondary" />}
+    </span>
+  );
+}
+
+function MarkPrice({ order, className, isTruncated }: { order: OrderInfo; className?: string; isTruncated?: boolean }) {
+  const markPrice = useMemo(() => {
+    if (isSwapOrderType(order.orderType)) {
+      return undefined;
+    }
+
+    const positionOrder = order as PositionOrderInfo;
+
+    return getMarkPrice({
+      prices: positionOrder.indexToken.prices,
+      isIncrease: isIncreaseOrderType(positionOrder.orderType),
+      isLong: positionOrder.isLong,
+    });
+  }, [order]);
+
+  const positionOrder = order as PositionOrderInfo;
+  const priceDecimals = calculateDisplayDecimals(
+    positionOrder.indexToken?.prices?.minPrice,
+    undefined,
+    positionOrder.indexToken?.visualMultiplier
+  );
+
+  const markPriceParts = useMemo(() => {
+    return formatUsdParts(markPrice, {
+      displayDecimals: priceDecimals,
+      visualMultiplier: positionOrder.indexToken?.visualMultiplier,
+    });
+  }, [markPrice, priceDecimals, positionOrder.indexToken?.visualMultiplier]);
+
+  if (isTwapOrder(order) || isMarketOrderType(order.orderType)) {
+    const { markSwapRatioText } = getSwapRatioText(order);
+    const text = isSwapOrderType(order.orderType) ? markSwapRatioText : <NumericValue parts={markPriceParts} />;
+
+    return (
+      <TooltipWithPortal
+        as="span"
+        className={className}
+        disabled={!isTruncated}
+        handle={text}
+        content={text}
+        variant="none"
+      />
+    );
+  }
+
+  if (isSwapOrderType(order.orderType)) {
+    const { markSwapRatioText } = getSwapRatioText(order);
+
+    return (
+      <TooltipWithPortal
+        as="span"
+        disabled={!isTruncated}
+        handle={markSwapRatioText}
+        content={markSwapRatioText}
+        variant="none"
+      />
+    );
+  } else {
+    const positionOrder = order as PositionOrderInfo;
+
+    return (
+      <TooltipWithPortal
+        as="span"
+        handle={<NumericValue parts={markPriceParts} className={cx("numbers", TOOLTIP_HANDLE_CLASSNAME)} />}
+        position="bottom-end"
+        renderContent={() => {
+          return (
+            <>
+              {isTruncated && (
+                <div className="mb-4">
+                  <NumericValue parts={markPriceParts} />
+                </div>
+              )}
+              <Trans>
+                Executes when oracle price is {positionOrder.triggerThresholdType}{" "}
+                {formatUsd(positionOrder.triggerPrice, {
+                  displayDecimals: priceDecimals,
+                  visualMultiplier: positionOrder.indexToken?.visualMultiplier,
+                })}
+              </Trans>
+            </>
+          );
+        }}
+      />
+    );
+  }
+}
+
+function TriggerPrice({
+  order,
+  hideActions,
+  isSetAcceptablePriceImpactEnabled,
+  isTruncated,
+  className,
+}: {
+  order: OrderInfo;
+  hideActions: boolean | undefined;
+  isSetAcceptablePriceImpactEnabled: boolean;
+  isTruncated?: boolean;
+  className?: string;
+}) {
+  if (isTwapOrder(order)) {
+    return (
+      <span className={className}>
+        <Trans>N/A</Trans>
+      </span>
+    );
+  }
+
+  if (isMarketOrderType(order.orderType)) {
+    const positionOrder = order as PositionOrderInfo;
+    const priceDecimals = calculateDisplayDecimals(
+      positionOrder?.indexToken?.prices?.minPrice,
+      undefined,
+      positionOrder?.indexToken?.visualMultiplier
+    );
+
+    const handle = (
+      <span className="font-medium">
+        <Trans>N/A</Trans>
+      </span>
+    );
+
+    const isBoundary = isBoundaryAcceptablePrice(positionOrder.acceptablePrice);
+
+    return !isSetAcceptablePriceImpactEnabled || isBoundary ? (
+      handle
+    ) : (
+      <TooltipWithPortal
+        position="bottom-end"
+        handle={handle}
+        content={
+          <StatsTooltipRow
+            label={t`Acceptable price`}
+            value={
+              <UsdValue
+                usd={positionOrder.acceptablePrice}
+                displayDecimals={priceDecimals}
+                visualMultiplier={positionOrder.indexToken?.visualMultiplier}
+              />
+            }
+            showDollar={false}
+          />
+        }
+      />
+    );
+  }
+
+  if (isSwapOrderType(order.orderType)) {
+    const swapOrder = order as SwapOrderInfo;
+    const toAmount = swapOrder.minOutputAmount;
+    const toToken = order.targetCollateralToken;
+    const toAmountText = formatBalanceAmount(toAmount, toToken.decimals, toToken.symbol, {
+      isStable: toToken.isStable,
+    });
+    const { swapRatioText, acceptablePriceText } = getSwapRatioText(order);
+
+    return (
+      <>
+        {!hideActions ? (
+          <TooltipWithPortal
+            as="span"
+            position="bottom-end"
+            handle={<span className={cx("numbers", TOOLTIP_HANDLE_CLASSNAME)}>{swapRatioText}</span>}
+            renderContent={() => (
+              <>
+                {isTruncated && <div className="mb-4">{swapRatioText}</div>}
+                {isSetAcceptablePriceImpactEnabled && (
+                  <div className="pb-8">
+                    <StatsTooltipRow label={t`Acceptable price`} value={acceptablePriceText} showDollar={false} />
+                  </div>
+                )}
+                {t`Receive at least ${toAmountText} if executed. Price updates based on fees and price impact.`}
+              </>
+            )}
+          />
+        ) : (
+          <TooltipWithPortal
+            as="span"
+            disabled={!isTruncated}
+            handle={swapRatioText}
+            content={swapRatioText}
+            variant="none"
+          />
+        )}
+      </>
+    );
+  } else {
+    const positionOrder = order as PositionOrderInfo;
+    const priceDecimals = calculateDisplayDecimals(
+      positionOrder?.indexToken?.prices?.minPrice,
+      undefined,
+      positionOrder?.indexToken?.visualMultiplier
+    );
+
+    const isBoundary = isBoundaryAcceptablePrice(positionOrder.acceptablePrice);
+
+    const triggerPriceParts = numberParts(
+      `${positionOrder.triggerThresholdType} `,
+      formatUsdParts(positionOrder.triggerPrice, {
+        displayDecimals: priceDecimals,
+        visualMultiplier: positionOrder.indexToken?.visualMultiplier,
+      })
+    );
+
+    return !isSetAcceptablePriceImpactEnabled || isBoundary ? (
+      <TooltipWithPortal
+        as="span"
+        disabled={!isTruncated}
+        handle={<NumericValue parts={triggerPriceParts} />}
+        content={<NumericValue parts={triggerPriceParts} />}
+        variant="none"
+      />
+    ) : (
+      <TooltipWithPortal
+        as="span"
+        handle={<NumericValue parts={triggerPriceParts} className={TOOLTIP_HANDLE_CLASSNAME} />}
+        position="bottom-end"
+        renderContent={() => (
+          <>
+            {isTruncated && (
+              <div className="mb-4">
+                <NumericValue parts={triggerPriceParts} />
+              </div>
+            )}
+            <StatsTooltipRow
+              label={t`Acceptable price`}
+              value={
+                isStopLossOrderType(positionOrder.orderType) ||
+                isStopIncreaseOrderType(positionOrder.orderType) ||
+                isMarginDepositOrder(positionOrder) ? (
+                  "N/A"
+                ) : (
+                  <NumericValue
+                    parts={numberParts(
+                      `${positionOrder.triggerThresholdType} `,
+                      formatUsdParts(positionOrder.acceptablePrice, {
+                        displayDecimals: priceDecimals,
+                        visualMultiplier: positionOrder.indexToken?.visualMultiplier,
+                      })
+                    )}
+                  />
+                )
+              }
+              showDollar={false}
+            />
+          </>
+        )}
+      />
+    );
+  }
+}
+
+function OrderItemLarge({
+  order,
+  setRef,
+  hideActions,
+  onToggleOrder,
+  showDebugValues,
+  isSetAcceptablePriceImpactEnabled,
+  setEditingOrderKey,
+  onCancelOrder,
+  isCanceling,
+  isSelected,
+  isCurrentMarket,
+  onSelectOrderClick,
+}: {
+  order: OrderInfo;
+  setRef?: (el: HTMLElement | null, orderKey: string) => void;
+  hideActions: boolean | undefined;
+  showDebugValues: boolean | undefined;
+  isSetAcceptablePriceImpactEnabled: boolean;
+  onToggleOrder: undefined | (() => void);
+  setEditingOrderKey: undefined | (() => void);
+  onCancelOrder: undefined | (() => void);
+  isCanceling: boolean | undefined;
+  isSelected: boolean | undefined;
+  isCurrentMarket: boolean | undefined;
+  onSelectOrderClick: undefined | (() => void);
+}) {
+  const marketInfoData = useSelector(selectMarketsInfoData);
+  const isSwap = isSwapOrderType(order.orderType);
+  const { indexName, poolName, tokenSymbol } = useMemo(() => {
+    const marketInfo = marketInfoData?.[order.marketAddress];
+
+    if (!marketInfo || isSwap)
+      return {
+        indexName: "...",
+        tokenSymbol: "...",
+      };
+    return {
+      indexName: getMarketIndexName(marketInfo),
+      poolName: getMarketPoolName(marketInfo),
+      tokenSymbol: marketInfo.indexToken.symbol,
+    };
+  }, [isSwap, marketInfoData, order.marketAddress]);
+
+  const { swapPathTokenSymbols, swapPathMarketFullNames } = useMemo(() => {
+    if (!isSwap) return {};
+    const swapPathTokenSymbols = getSwapPathTokenSymbols(marketInfoData, order.initialCollateralToken, order.swapPath);
+    const swapPathMarketFullNames = getSwapPathMarketFullNames(marketInfoData, order.swapPath);
+    return { swapPathTokenSymbols, swapPathMarketFullNames };
+  }, [isSwap, marketInfoData, order.initialCollateralToken, order.swapPath]);
+
+  const handleSetRef = useCallback(
+    (el: HTMLElement | null) => {
+      if (setRef) setRef(el, order.key);
+    },
+    [order.key, setRef]
+  );
+
+  const oracleSettings = useSelector(selectOracleSettings);
+  const disabledCancelMarketOrderMessage = useDisabledCancelMarketOrderMessage(order, oracleSettings);
+
+  const [triggerPriceTruncRef, isTriggerPriceTruncated] = useIsTruncated();
+  const [markPriceTruncRef, isMarkPriceTruncated] = useIsTruncated();
+
+  const cancelButton = (
+    <Button
+      variant="ghost"
+      className="max-2xl:px-4"
+      disabled={isCanceling || Boolean(disabledCancelMarketOrderMessage)}
+      onClick={onCancelOrder}
+    >
+      <CloseIcon className="size-14" />
+    </Button>
+  );
+
+  return (
+    <TableTr
+      hoverable={true}
+      ref={handleSetRef}
+      className={cx({
+        "shadow-[inset_2px_0_0] shadow-cold-blue-500": isCurrentMarket,
+      })}
+    >
+      {!hideActions && onToggleOrder && (
+        <TableTd className="cursor-pointer" onClick={onToggleOrder}>
+          <Checkbox isChecked={isSelected} setIsChecked={onToggleOrder} />
+        </TableTd>
+      )}
+      <TableTd onClick={onSelectOrderClick} className="cursor-pointer">
+        {isSwap ? (
+          <TooltipWithPortal
+            handle={
+              <SwapMarketLabel
+                bordered
+                fromSymbol={swapPathTokenSymbols?.at(0)}
+                toSymbol={swapPathTokenSymbols?.at(-1)}
+              />
+            }
+            content={
+              <>
+                {swapPathMarketFullNames?.map((market, index) => (
+                  <span key={market.indexName}>
+                    {index > 0 && " → "}
+                    <span>{market.indexName}</span>
+                    <span className="subtext leading-1">[{market.poolName}]</span>
+                  </span>
+                ))}
+              </>
+            }
+            variant="none"
+          />
+        ) : (
+          <TooltipWithPortal
+            handle={
+              <MarketWithDirectionLabel
+                bordered
+                indexName={indexName}
+                isLong={order.isLong}
+                tokenSymbol={tokenSymbol}
+              />
+            }
+            content={
+              <StatsTooltipRow
+                label={t`Market`}
+                value={
+                  <div className="flex items-center">
+                    <span>{indexName && indexName}</span>
+                    <span className="subtext leading-1">{poolName && `[${poolName}]`}</span>
+                  </div>
+                }
+                showDollar={false}
+              />
+            }
+            variant="none"
+          />
+        )}
+      </TableTd>
+      <TableTd>
+        <OrderItemTypeLabel order={order} />
+      </TableTd>
+      <TableTd>
+        <OrderSize order={order} showDebugValues={showDebugValues} />
+      </TableTd>
+
+      <TableTd className="overflow-hidden">
+        <div ref={triggerPriceTruncRef} className="truncate">
+          <TriggerPrice
+            order={order}
+            hideActions={hideActions}
+            isSetAcceptablePriceImpactEnabled={isSetAcceptablePriceImpactEnabled}
+            isTruncated={isTriggerPriceTruncated}
+          />
+        </div>
+      </TableTd>
+      <TableTd className="overflow-hidden">
+        <div ref={markPriceTruncRef} className="truncate">
+          <MarkPrice order={order} isTruncated={isMarkPriceTruncated} />
+        </div>
+      </TableTd>
+      {!hideActions && (
+        <TableTd>
+          <div className="inline-flex w-full items-center justify-end">
+            {!isTwapOrder(order) && !isMarketOrderType(order.orderType) && (
+              <Button variant="ghost" onClick={setEditingOrderKey} className="max-2xl:px-4">
+                <EditIcon title={t`Edit order`} className="size-16" />
+              </Button>
+            )}
+            {onCancelOrder ? (
+              disabledCancelMarketOrderMessage ? (
+                <TooltipWithPortal handle={cancelButton} content={disabledCancelMarketOrderMessage} />
+              ) : (
+                cancelButton
+              )
+            ) : null}
+          </div>
+        </TableTd>
+      )}
+    </TableTr>
+  );
+}
+
+function OrderItemSmall({
+  showDebugValues,
+  order,
+  isSetAcceptablePriceImpactEnabled,
+  setEditingOrderKey,
+  onCancelOrder,
+  hideActions,
+  isSelected,
+  onToggleOrder,
+  setRef,
+  isCurrentMarket,
+  onSelectOrderClick,
+}: {
+  showDebugValues: boolean;
+  order: OrderInfo;
+  isSetAcceptablePriceImpactEnabled: boolean;
+  hideActions: boolean | undefined;
+  setEditingOrderKey: undefined | (() => void);
+  onCancelOrder: undefined | (() => void);
+  isSelected: boolean | undefined;
+  onToggleOrder: undefined | (() => void);
+  setRef?: (el: HTMLElement | null, orderKey: string) => void;
+  isCurrentMarket: boolean | undefined;
+  onSelectOrderClick: undefined | (() => void);
+}) {
+  const marketInfoData = useSelector(selectMarketsInfoData);
+
+  const title = useMemo(() => {
+    if (isSwapOrderType(order.orderType)) {
+      const swapPathTokenSymbols = getSwapPathTokenSymbols(
+        marketInfoData,
+        order.initialCollateralToken,
+        order.swapPath
+      );
+
+      return <SwapMarketLabel fromSymbol={swapPathTokenSymbols?.at(0)} toSymbol={swapPathTokenSymbols?.at(-1)} />;
+    }
+
+    const marketInfo = marketInfoData?.[order.marketAddress];
+
+    if (!marketInfo) {
+      return "...";
+    }
+
+    const indexName = getMarketIndexName(marketInfo);
+
+    const tokenSymbol = marketInfoData?.[order.marketAddress]?.indexToken.symbol;
+
+    return <MarketWithDirectionLabel isLong={order.isLong} indexName={indexName} tokenSymbol={tokenSymbol} />;
+  }, [
+    marketInfoData,
+    order.initialCollateralToken,
+    order.isLong,
+    order.marketAddress,
+    order.orderType,
+    order.swapPath,
+  ]);
+
+  const handleSetRef = useCallback(
+    (el: HTMLElement | null) => {
+      if (setRef) setRef(el, order.key);
+    },
+    [order.key, setRef]
+  );
+
+  const oracleSettings = useSelector(selectOracleSettings);
+  const disabledCancelMarketOrderMessage = useDisabledCancelMarketOrderMessage(order, oracleSettings);
+  const cancelButton = (
+    <Button variant="secondary" onClick={onCancelOrder} disabled={Boolean(disabledCancelMarketOrderMessage)}>
+      <Trans>Cancel</Trans>
+    </Button>
+  );
+
+  return (
+    <AppCard ref={handleSetRef}>
+      <AppCardSection
+        className={cx("relative", {
+          "after:absolute after:left-10 after:top-[50%] after:h-16 after:w-2 after:-translate-y-[50%] after:bg-blue-300":
+            isCurrentMarket,
+        })}
+      >
+        <div className="flex cursor-pointer items-center gap-8" onClick={onSelectOrderClick}>
+          {hideActions ? (
+            title
+          ) : (
+            <>
+              <Checkbox isChecked={isSelected} setIsChecked={onToggleOrder}></Checkbox>
+              {title}
+            </>
+          )}
+        </div>
+      </AppCardSection>
+      <AppCardSection>
+        {showDebugValues && (
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Key</Trans>
+            </div>
+            <div className="debug-key muted">{order.key}</div>
+          </div>
+        )}
+        <div className="App-card-row">
+          <div className="font-medium text-typography-secondary">
+            <Trans>Order type</Trans>
+          </div>
+          <div>
+            <OrderItemTypeLabel order={order} />
+          </div>
+        </div>
+        <div className="App-card-row">
+          <div className="font-medium text-typography-secondary">
+            <Trans>Size</Trans>
+          </div>
+          <OrderSize order={order} showDebugValues={showDebugValues} />
+        </div>
+        <div className="App-card-row">
+          <div className="font-medium text-typography-secondary">
+            <Trans>Trigger price</Trans>
+          </div>
+          <div>
+            <TriggerPrice
+              order={order}
+              hideActions={hideActions}
+              isSetAcceptablePriceImpactEnabled={isSetAcceptablePriceImpactEnabled}
+            />
+          </div>
+        </div>
+
+        <div className="App-card-row">
+          <div className="font-medium text-typography-secondary">
+            <Trans>Mark price</Trans>
+          </div>
+          <div>
+            <MarkPrice order={order} />
+          </div>
+        </div>
+      </AppCardSection>
+      {!hideActions && (
+        <AppCardSection>
+          <div className="flex items-center gap-8">
+            {!isTwapOrder(order) && !isMarketOrderType(order.orderType) && (
+              <Button variant="secondary" onClick={setEditingOrderKey}>
+                <Trans>Edit</Trans>
+              </Button>
+            )}
+
+            {onCancelOrder ? (
+              disabledCancelMarketOrderMessage ? (
+                <TooltipWithPortal handle={cancelButton} content={disabledCancelMarketOrderMessage} />
+              ) : (
+                cancelButton
+              )
+            ) : null}
+          </div>
+        </AppCardSection>
+      )}
+    </AppCard>
+  );
+}
+
+function getSwapRatioText(order: OrderInfo) {
+  if (!isLimitOrderType(order.orderType) && !isMarketOrderType(order.orderType)) return {};
+
+  const fromToken = order.initialCollateralToken;
+  const toToken = order.targetCollateralToken;
+
+  const triggerRatio = (order as SwapOrderInfo).triggerRatio as TokensRatioAndSlippage;
+
+  const markRatio =
+    fromToken && toToken
+      ? getTokensRatioByPrice({
+          fromToken,
+          toToken,
+          fromPrice: fromToken.prices.minPrice,
+          toPrice: toToken.prices.minPrice,
+        })
+      : undefined;
+
+  const ratioDecimals = calculateDisplayDecimals(triggerRatio?.ratio);
+
+  const sign = triggerRatio?.smallestToken.address === fromToken.address ? "<" : ">";
+
+  const swapRatioText = `${sign} ${formatAmount(
+    triggerRatio?.ratio,
+    USD_DECIMALS,
+    ratioDecimals,
+    true
+  )} ${triggerRatio?.smallestToken.symbol} per ${triggerRatio?.largestToken.symbol}`;
+
+  const markRatioDecimals = calculateDisplayDecimals(markRatio?.ratio);
+  const markSwapRatioText = markRatio
+    ? `${formatAmount(markRatio.ratio, USD_DECIMALS, markRatioDecimals, true)} ${markRatio.smallestToken.symbol} per ${markRatio.largestToken.symbol}`
+    : "...";
+
+  const acceptablePriceText = `${sign} ${formatAmount(triggerRatio?.acceptablePrice, USD_DECIMALS, 2, true)} ${triggerRatio?.smallestToken.symbol} / ${triggerRatio?.largestToken.symbol}`;
+
+  return { swapRatioText, markSwapRatioText, acceptablePriceText };
+}
+
+function OrderItemTypeLabel({ order, className }: { order: OrderInfo; className?: string }) {
+  const { errors, level } = useOrderErrors(order.key);
+
+  const typeLabel = isMarginDepositOrder(order) ? t`Deposit margin` : getNameByOrderType(order.orderType, order.isTwap);
+
+  const handle = <span className={className}>{typeLabel}</span>;
+
+  if (errors.length === 0) {
+    return <>{handle}</>;
+  }
+
+  return (
+    <TooltipWithPortal
+      variant="none"
+      handle={
+        <span
+          className={cx("cursor-help underline decoration-dashed decoration-1 underline-offset-2", {
+            "text-red-500 decoration-red-500/50": level === "error",
+            "text-yellow-300 decoration-yellow-300/50": level === "warning",
+          })}
+        >
+          {handle}
+        </span>
+      }
+      content={
+        errors.length ? (
+          <div className="flex flex-col gap-20">
+            {errors.map((error) => (
+              <div key={error.key}>
+                <span
+                  className={cx({
+                    "text-red-500": error!.level === "error",
+                    "text-yellow-300": error!.level === "warning",
+                  })}
+                >
+                  {error.msg}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null
+      }
+    />
+  );
+}

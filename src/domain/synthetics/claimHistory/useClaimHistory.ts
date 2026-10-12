@@ -1,0 +1,380 @@
+import { gql } from "@apollo/client";
+import { useMemo } from "react";
+import useSWRInfinite, { SWRInfiniteResponse } from "swr/infinite";
+import { getAddress } from "viem";
+
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useMarketsInfoData, useTokensData } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import { selectAccount } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { MarketsInfoData } from "domain/synthetics/markets";
+import { getSubsquidGraphClient } from "lib/indexers";
+import { BN_ZERO, toBigInt } from "lib/numbers";
+import { getByKey } from "lib/objects";
+import { getToken } from "sdk/configs/tokens";
+import { buildFiltersBody } from "sdk/utils/indexers";
+
+import { ClaimAction, ClaimCollateralAction, ClaimFundingFeeAction, ClaimMarketItem, ClaimType } from "./types";
+
+export type ClaimCollateralHistoryResult = {
+  claimActions?: ClaimAction[];
+  isLoading: boolean;
+  hasMorePages: boolean;
+  pageIndex: number;
+  setPageIndex: (...args: Parameters<SWRInfiniteResponse["setSize"]>) => void;
+};
+
+export type RawClaimAction = {
+  id: string;
+  eventName: ClaimType;
+  account: string;
+  marketAddresses: string[];
+  tokenAddresses: string[];
+  amounts: string[];
+  tokenPrices: string[];
+  isLongOrders?: boolean[];
+  transactionHash: string;
+  timestamp: number;
+};
+
+export type RawClaimActionsResult = {
+  claimActions: RawClaimAction[];
+  totalCount?: number;
+};
+
+export function useClaimCollateralHistory(
+  chainId: number,
+  p: {
+    pageSize: number;
+    fromTxTimestamp?: number;
+    toTxTimestamp?: number;
+    eventName?: string[];
+    marketAddresses?: string[];
+  }
+): ClaimCollateralHistoryResult {
+  const { pageSize, fromTxTimestamp, toTxTimestamp, eventName, marketAddresses } = p;
+  const marketsInfoData = useMarketsInfoData();
+  const tokensData = useTokensData();
+  const { showDebugValues } = useSettings();
+
+  const account = useSelector(selectAccount);
+  const client = getSubsquidGraphClient(chainId);
+
+  const queryDisabled = !chainId || !client || !account;
+
+  const key = (pageIndex: number) => {
+    if (queryDisabled) {
+      return null;
+    }
+
+    return [
+      chainId,
+      "useClaimHistory",
+      account,
+      pageIndex,
+      pageSize,
+      fromTxTimestamp,
+      toTxTimestamp,
+      structuredClone(eventName)?.sort().join(","),
+      structuredClone(marketAddresses)?.sort().join(","),
+      showDebugValues,
+    ];
+  };
+
+  const {
+    data,
+    error,
+    size: pageIndex,
+    setSize: setPageIndex,
+  } = useSWRInfinite<RawClaimActionsResult>(key, {
+    fetcher: async (key) => {
+      const pageIndex = key[3];
+      return fetchRawClaimActions({
+        chainId,
+        account: account!,
+        pageIndex,
+        pageSize,
+        fromTxTimestamp,
+        toTxTimestamp,
+        eventName,
+        marketAddresses,
+        showDebugValues,
+      });
+    },
+  });
+
+  const isLoading = (!error && !data) || !marketsInfoData || !tokensData;
+
+  const claimActions = useMemo(() => {
+    if (!data || !tokensData || !marketsInfoData) {
+      return undefined;
+    }
+
+    return data
+      .flatMap((page) => page.claimActions)
+      .reduce((acc, rawAction) => {
+        let tokens: ClaimAction["tokens"];
+        try {
+          // getToken also supports legacy token addresses.
+          tokens = rawAction.tokenAddresses.map((address) => getToken(chainId, getAddress(address)));
+        } catch {
+          return acc;
+        }
+
+        const eventName = rawAction.eventName;
+
+        switch (eventName) {
+          case ClaimType.ClaimFunding:
+          case ClaimType.ClaimPriceImpact: {
+            const claimCollateralAction = createClaimCollateralAction(tokens, eventName, rawAction, marketsInfoData);
+
+            return claimCollateralAction ? [...acc, claimCollateralAction] : acc;
+          }
+
+          case ClaimType.SettleFundingFeeCreated:
+          case ClaimType.SettleFundingFeeExecuted:
+          case ClaimType.SettleFundingFeeCancelled: {
+            const settleAction = createSettleFundingFeeAction(tokens, eventName, rawAction, marketsInfoData);
+            return settleAction ? [...acc, settleAction] : acc;
+          }
+          default:
+            return acc;
+        }
+      }, [] as ClaimAction[]);
+  }, [chainId, data, marketsInfoData, tokensData]);
+
+  const hasMorePages = data?.length === pageIndex && data?.at(-1)?.claimActions.length === pageSize;
+
+  return {
+    claimActions,
+    isLoading,
+    hasMorePages,
+    pageIndex,
+    setPageIndex,
+  };
+}
+
+export async function fetchRawClaimActions({
+  chainId,
+  account,
+  pageIndex,
+  pageSize,
+  fromTxTimestamp,
+  toTxTimestamp,
+  eventName,
+  marketAddresses,
+  showDebugValues,
+  includeTotalCount = false,
+  abortSignal,
+}: {
+  chainId: number;
+  account: string;
+  pageIndex: number;
+  pageSize: number;
+  fromTxTimestamp?: number;
+  toTxTimestamp?: number;
+  eventName?: string[];
+  marketAddresses?: string[];
+  showDebugValues?: boolean;
+  includeTotalCount?: boolean;
+  abortSignal?: AbortSignal;
+}): Promise<RawClaimActionsResult> {
+  const client = getSubsquidGraphClient(chainId);
+  if (!client) {
+    throw new Error("Claims history source is unavailable");
+  }
+
+  const offset = pageIndex * pageSize;
+  const filterStr = buildFiltersBody(
+    {
+      AND: [
+        {
+          account_eq: account,
+          timestamp_gte: fromTxTimestamp,
+          timestamp_lte: toTxTimestamp,
+          eventName_in: eventName,
+        },
+        {
+          OR: marketAddresses?.map((tokenAddress) => ({
+            marketAddresses_containsAll: [tokenAddress],
+          })),
+        },
+        ...(showDebugValues
+          ? []
+          : [
+              {
+                OR: [{ eventName_not_eq: ClaimType.SettleFundingFeeCreated }],
+              },
+            ]),
+      ],
+    },
+    {
+      enums: ClaimType,
+    }
+  );
+  const whereClause = `where: ${filterStr}`;
+  const connectionQuery = includeTotalCount
+    ? `claimActionsConnection(orderBy: [timestamp_DESC, id_DESC], ${whereClause}) {
+          totalCount
+        }`
+    : "";
+  const query = gql(`{
+    ${connectionQuery}
+    claimActions(
+      offset: ${offset},
+      limit: ${pageSize},
+      orderBy: [timestamp_DESC, id_DESC],
+      ${whereClause}
+    ) {
+      id
+      account
+      eventName
+      marketAddresses
+      tokenAddresses
+      amounts
+      tokenPrices
+      isLongOrders
+      timestamp
+      transactionHash
+    }
+  }`);
+
+  const { data } = await client.query({
+    query,
+    fetchPolicy: "no-cache",
+    context: abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+  });
+
+  return {
+    claimActions: (data.claimActions ?? []) as RawClaimAction[],
+    totalCount: data.claimActionsConnection?.totalCount,
+  };
+}
+
+function createClaimCollateralAction(
+  tokens: ClaimCollateralAction["tokens"],
+  eventName: ClaimCollateralAction["eventName"],
+  rawAction: RawClaimAction,
+  marketsInfoData: MarketsInfoData | undefined
+): ClaimCollateralAction | null {
+  const claimItemsMap: { [marketAddress: string]: ClaimMarketItem } = {};
+  const claimAction: ClaimCollateralAction = {
+    id: rawAction.id,
+    type: "collateral",
+    eventName,
+    account: rawAction.account,
+    claimItems: [],
+    timestamp: rawAction.timestamp,
+    transactionHash: rawAction.transactionHash,
+    tokens,
+    amounts: rawAction.amounts.map((amount) => toBigInt(amount)!),
+    tokenPrices: rawAction.tokenPrices.map((price) => toBigInt(price)!),
+  };
+
+  for (let i = 0; i < rawAction.marketAddresses.length; i++) {
+    const marketAddress = rawAction.marketAddresses[i];
+    const tokenAddress = rawAction.tokenAddresses[i];
+    const amount = toBigInt(rawAction.amounts[i])!;
+    const price = toBigInt(rawAction.tokenPrices[i])!;
+    const marketInfo = getByKey(marketsInfoData, marketAddress);
+
+    if (amount === 0n) {
+      continue;
+    }
+
+    if (!marketInfo) {
+      return null;
+    }
+
+    if (!claimItemsMap[marketInfo.marketTokenAddress]) {
+      claimItemsMap[marketInfo.marketTokenAddress] = {
+        marketInfo: marketInfo,
+        longTokenAmount: BN_ZERO,
+        longTokenAmountUsd: BN_ZERO,
+        shortTokenAmount: BN_ZERO,
+        shortTokenAmountUsd: BN_ZERO,
+      };
+    }
+
+    if (tokenAddress === marketInfo.longTokenAddress) {
+      claimItemsMap[marketAddress].longTokenAmount = claimItemsMap[marketAddress].longTokenAmount + amount;
+      claimItemsMap[marketAddress].longTokenAmountUsd =
+        claimItemsMap[marketAddress].longTokenAmountUsd + amount * price;
+    } else {
+      claimItemsMap[marketAddress].shortTokenAmount = claimItemsMap[marketAddress].shortTokenAmount + amount;
+      claimItemsMap[marketAddress].shortTokenAmountUsd =
+        claimItemsMap[marketAddress].shortTokenAmountUsd + amount * price;
+    }
+  }
+
+  claimAction.claimItems = Object.values(claimItemsMap);
+
+  return claimAction;
+}
+
+function createSettleFundingFeeAction(
+  tokens: ClaimFundingFeeAction["tokens"],
+  eventName: ClaimFundingFeeAction["eventName"],
+  rawAction: RawClaimAction,
+  marketsInfoData: MarketsInfoData | null
+): ClaimFundingFeeAction | null {
+  if (!marketsInfoData) return null;
+
+  const markets = rawAction.marketAddresses
+    .map((address) => getByKey(marketsInfoData, getAddress(address))!)
+    .filter(Boolean);
+
+  if (!markets.length) return null;
+
+  const claimItemsMap: { [marketAddress: string]: ClaimMarketItem } = {};
+  if (rawAction.eventName === ClaimType.SettleFundingFeeExecuted) {
+    for (let i = 0; i < rawAction.marketAddresses.length; i++) {
+      const marketAddress = rawAction.marketAddresses[i];
+      const tokenAddress = rawAction.tokenAddresses[i];
+
+      const amount = toBigInt(rawAction.amounts[i])!;
+      const price = toBigInt(rawAction.tokenPrices[i])!;
+
+      const marketInfo = getByKey(marketsInfoData, marketAddress);
+
+      if (!marketInfo) {
+        return null;
+      }
+
+      if (!claimItemsMap[marketInfo.marketTokenAddress]) {
+        claimItemsMap[marketInfo.marketTokenAddress] = {
+          marketInfo: marketInfo,
+          longTokenAmount: BN_ZERO,
+          shortTokenAmount: BN_ZERO,
+          longTokenAmountUsd: BN_ZERO,
+          shortTokenAmountUsd: BN_ZERO,
+        };
+      }
+
+      if (tokenAddress === marketInfo.longTokenAddress) {
+        claimItemsMap[marketAddress].longTokenAmount = claimItemsMap[marketAddress].longTokenAmount + amount;
+        claimItemsMap[marketAddress].longTokenAmountUsd =
+          claimItemsMap[marketAddress].longTokenAmountUsd + amount * price;
+      } else {
+        claimItemsMap[marketAddress].shortTokenAmount = claimItemsMap[marketAddress].shortTokenAmount + amount;
+        claimItemsMap[marketAddress].shortTokenAmountUsd =
+          claimItemsMap[marketAddress].shortTokenAmountUsd + amount * price;
+      }
+    }
+  }
+
+  return {
+    id: rawAction.id,
+    type: "fundingFee",
+    account: rawAction.account,
+    amounts: rawAction.amounts.map((amount) => toBigInt(amount)!),
+    tokenPrices: rawAction.tokenPrices.map((price) => toBigInt(price)!),
+    markets,
+    tokens,
+    isLongOrders: rawAction.isLongOrders ?? [],
+    transactionHash: rawAction.transactionHash,
+    eventName,
+    timestamp: rawAction.timestamp,
+    claimItems: Object.values(claimItemsMap),
+  };
+}

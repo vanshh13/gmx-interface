@@ -1,0 +1,283 @@
+import { t, Trans } from "@lingui/macro";
+import { AnimatePresence, motion } from "framer-motion";
+
+import { getNetworkFeeSource } from "domain/synthetics/fees/networkFeeSource";
+import { CLAIM_AFFILIATE_FIXED_SLIPPAGE_BPS } from "domain/synthetics/referrals/useClaimAffiliateSwapRoutes";
+import { useChainId } from "lib/chains";
+
+import { AlertInfoCard } from "components/AlertInfo/AlertInfoCard";
+import { AmountWithUsdBalance } from "components/AmountWithUsd/AmountWithUsd";
+import Button from "components/Button/Button";
+import Checkbox from "components/Checkbox/Checkbox";
+import { InsufficientGmxAccountGasTokenBalanceMessage } from "components/Errors/gasErrors";
+import ModalWithPortal from "components/Modal/ModalWithPortal";
+import { NetworkFeeValue } from "components/NetworkFeeRow/NetworkFeeValue";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import PercentageInput from "components/PercentageInput/PercentageInput";
+import { SyntheticsInfoRow } from "components/SyntheticsInfoRow";
+import { Table, TableTh, TableTheadTr } from "components/Table/Table";
+import ToggleSwitch from "components/ToggleSwitch/ToggleSwitch";
+import { ButtonTooltipWrapper } from "components/Tooltip/ButtonTooltipWrapper";
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+import { AnimatedRewardsTable, COLLAPSE_ANIMATION } from "./AnimatedRewardsTable";
+import { ClaimRewardRow } from "./ClaimRewardRow";
+import { ClaimSwapTargetTokenSelector } from "./ClaimSwapTargetTokenSelector";
+import { OutOfTokenErrorAlert } from "./OutOfTokenErrorAlert";
+import { useClaimAffiliatesModalState } from "./useClaimAffiliatesModalState";
+
+type Props = {
+  onClose: () => void;
+};
+
+export function ClaimAffiliatesModal({ onClose }: Props) {
+  const state = useClaimAffiliatesModalState({ onClose });
+  const { chainId, srcChainId } = useChainId();
+
+  return (
+    <ModalWithPortal
+      contentClassName="w-[400px] overflow-y-auto"
+      isVisible={true}
+      setIsVisible={onClose}
+      label={t`Confirm claim`}
+      withMobileBottomPosition
+    >
+      <div className="flex flex-col gap-12">
+        <div className="text-center text-20 font-medium">
+          <Trans>
+            Claim <UsdValue usd={state.totalClaimableFundingUsd} />
+          </Trans>
+        </div>
+
+        <Table>
+          <thead>
+            <TableTheadTr>
+              <TableTh className="w-[20px] !pl-0">
+                {!state.isSelectionLimitedBySwapMultichain && (
+                  <Checkbox
+                    isChecked={state.isAllChecked}
+                    setIsChecked={state.handleToggleSelectAll}
+                    isPartialChecked={state.selectedMarketAddressesSet.size > 0 && !state.isAllChecked}
+                  />
+                )}
+              </TableTh>
+              <TableTh>
+                <Trans>MARKET</Trans>
+              </TableTh>
+              <TableTh className="!pr-0">
+                <Trans>REWARDS</Trans>
+              </TableTh>
+            </TableTheadTr>
+          </thead>
+          <tbody>
+            {state.previewMainRewards.map(({ reward, usd }) => (
+              <ClaimRewardRow
+                key={reward.marketAddress}
+                reward={reward}
+                rewardUsd={usd}
+                marketsInfoData={state.marketsInfoData}
+                isSelected={state.selectedMarketAddressesSet.has(reward.marketAddress)}
+                onToggleSelect={state.handleToggleSelect}
+                isSelectionDisabled={
+                  state.isSelectionLimitedBySwapMultichain &&
+                  !state.selectedMarketAddressesSet.has(reward.marketAddress) &&
+                  !state.canSelectMore
+                }
+              />
+            ))}
+          </tbody>
+        </Table>
+
+        {state.hiddenMainRewards.length > 0 && (
+          <Button
+            variant="ghost"
+            className="w-full text-13 text-typography-secondary"
+            onClick={() => state.setShowOtherMainRewards((v) => !v)}
+          >
+            {state.showOtherMainRewards ? (
+              <Trans>Hide other assets</Trans>
+            ) : (
+              <Trans>Show other assets ({state.hiddenMainRewards.length})</Trans>
+            )}
+          </Button>
+        )}
+
+        {state.hiddenMainRewards.length > 0 && (
+          <AnimatedRewardsTable
+            isVisible={state.showOtherMainRewards}
+            rewards={state.hiddenMainRewards}
+            marketsInfoData={state.marketsInfoData}
+            selectedMarketAddressesSet={state.selectedMarketAddressesSet}
+            onToggleSelect={state.handleToggleSelect}
+            canSelectMore={state.canSelectMore}
+            isSelectionLimited={state.isSelectionLimitedBySwapMultichain}
+          />
+        )}
+
+        {state.smallRewardsWithUsd.length > 0 && state.shouldShowSmallRewardsToggle && (
+          <Button
+            variant="ghost"
+            className="w-full text-13 text-typography-secondary"
+            onClick={() => state.setShowSmallRewards((v) => !v)}
+          >
+            {state.showSmallRewards ? (
+              <Trans>Hide assets with small value</Trans>
+            ) : (
+              <Trans>Show assets with small value ({state.smallRewardsWithUsd.length})</Trans>
+            )}
+          </Button>
+        )}
+
+        {state.smallRewardsWithUsd.length > 0 && state.shouldShowSmallRewardsToggle && (
+          <AnimatedRewardsTable
+            isVisible={state.showSmallRewards}
+            rewards={state.smallRewardsWithUsd}
+            marketsInfoData={state.marketsInfoData}
+            selectedMarketAddressesSet={state.selectedMarketAddressesSet}
+            onToggleSelect={state.handleToggleSelect}
+            canSelectMore={state.canSelectMore}
+            isSelectionLimited={state.isSelectionLimitedBySwapMultichain}
+          />
+        )}
+
+        {state.swapTargetTokenOptions.length > 0 && (
+          <div>
+            <ToggleSwitch
+              isChecked={state.isSwapEnabled}
+              setIsChecked={state.setIsSwapEnabled}
+              textClassName="text-body-medium font-medium text-typography-secondary"
+            >
+              <Trans>Swap all rewards into one asset</Trans>
+            </ToggleSwitch>
+
+            <AnimatePresence initial={false}>
+              {state.isSwapEnabled && (
+                <motion.div
+                  key="swap-options"
+                  className="mt-12 flex flex-col gap-8 overflow-hidden"
+                  {...COLLAPSE_ANIMATION}
+                >
+                  <SyntheticsInfoRow
+                    label={<Trans>Swap to</Trans>}
+                    value={
+                      <ClaimSwapTargetTokenSelector
+                        options={state.swapTargetTokenOptions}
+                        value={state.swapTargetTokenAddress}
+                        onSelect={state.setSwapTargetTokenAddress}
+                      />
+                    }
+                  />
+                  <SyntheticsInfoRow
+                    label={<Trans>Total value of assets</Trans>}
+                    value={<UsdValue usd={state.selectedClaimTokensUsd} />}
+                  />
+                  <SyntheticsInfoRow
+                    label={
+                      <TooltipWithPortal
+                        handle={t`Allowed slippage`}
+                        position="top-start"
+                        variant="iconStroke"
+                        content={
+                          <Trans>
+                            This is an external swap routed through KyberSwap. Allowed slippage includes price impact
+                            and fees, unlike GMX native swaps where these are separate.
+                          </Trans>
+                        }
+                      />
+                    }
+                    valueClassName="-my-5"
+                  >
+                    <PercentageInput
+                      onChange={state.setAllowedSlippage}
+                      defaultValue={CLAIM_AFFILIATE_FIXED_SLIPPAGE_BPS}
+                      value={state.allowedSlippage}
+                      highValue={500}
+                      highValueWarningText={t`Slippage is too high`}
+                      negativeSign
+                    />
+                  </SyntheticsInfoRow>
+                  <SyntheticsInfoRow
+                    label={<Trans>Receive</Trans>}
+                    value={
+                      !state.swapTargetToken || state.toReceiveAmount === 0n || state.hasSwapRouteErrorForSubmit ? (
+                        "-"
+                      ) : state.isSwapRouteLoadingForSubmit ? (
+                        "..."
+                      ) : (
+                        <AmountWithUsdBalance
+                          amount={state.toReceiveAmount}
+                          decimals={state.swapTargetToken.decimals}
+                          usd={state.toReceiveUsd}
+                          symbol={state.swapTargetToken.symbol}
+                          isStable={state.swapTargetToken.isStable}
+                        />
+                      )
+                    }
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        )}
+
+        <SyntheticsInfoRow
+          label={<Trans>Network fee</Trans>}
+          labelClassName="whitespace-nowrap"
+          value={
+            state.networkFeeInfo.isLoading ? (
+              "..."
+            ) : state.networkFeeInfo.amount === undefined ? (
+              "-"
+            ) : (
+              <NetworkFeeValue
+                amount={state.networkFeeInfo.amount}
+                decimals={state.networkFeeInfo.decimals}
+                usd={state.networkFeeInfo.amountUsd}
+                symbol={state.networkFeeInfo.symbol}
+                isStable={state.networkFeeInfo.isStable}
+                source={getNetworkFeeSource({ isGmxAccount: srcChainId !== undefined })}
+                isExpress={srcChainId !== undefined}
+              />
+            )
+          }
+        />
+
+        {state.hasSwapRouteErrorForSubmit && (
+          <AlertInfoCard type="error" hideClose>
+            {state.failedSwapTokenSymbols ? (
+              <Trans>Swap route unavailable for: {state.failedSwapTokenSymbols}</Trans>
+            ) : (
+              <Trans>Unable to fetch swap route. Please try again.</Trans>
+            )}
+          </AlertInfoCard>
+        )}
+
+        {state.errors?.isOutOfTokenError?.isGasPaymentToken ? (
+          <AlertInfoCard type="error" hideClose>
+            <InsufficientGmxAccountGasTokenBalanceMessage
+              chainId={chainId}
+              gasPaymentTokenAddress={state.errors.isOutOfTokenError.tokenAddress}
+              onBeforeNavigation={onClose}
+            />
+          </AlertInfoCard>
+        ) : (
+          <OutOfTokenErrorAlert errors={state.errors} token={state.isOutOfTokenErrorToken} onClose={onClose} />
+        )}
+
+        <ButtonTooltipWrapper content={state.submitButtonState.errorDescription}>
+          <Button
+            className="w-full"
+            variant="primary-action"
+            onClick={state.handleSubmit}
+            disabled={state.submitButtonState.disabled}
+          >
+            {state.submitButtonState.text}
+            {state.submitButtonState.showSpinner && <SpinnerIcon className="ml-4 animate-spin" />}
+          </Button>
+        </ButtonTooltipWrapper>
+      </div>
+    </ModalWithPortal>
+  );
+}

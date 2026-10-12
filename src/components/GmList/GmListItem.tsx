@@ -1,0 +1,467 @@
+import { Trans } from "@lingui/macro";
+import React, { useCallback, useMemo } from "react";
+import Skeleton from "react-loading-skeleton";
+import { useHistory } from "react-router-dom";
+import { Area, AreaChart } from "recharts";
+
+import { ARBITRUM } from "config/chains";
+import { ARBITRUM_USDG_GLV_ADDRESS } from "config/usdgPools";
+import { selectMultichainMarketTokenBalances } from "context/PoolsDetailsContext/selectors/selectMultichainMarketTokenBalances";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useTokensData } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import {
+  selectAccountWhitelistsResult,
+  selectChainId,
+  selectGlvAndMarketsInfoData,
+  selectMultichainMarketTokensBalancesIsLoading,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { getHasBalanceOutsideWallet } from "domain/multichain/getHasBalanceOutsideWallet";
+import {
+  MarketTokensAPRData,
+  UserEarningsData,
+  getGlvDisplayName,
+  getGlvOrMarketAddress,
+  getMarketBadge,
+  getMarketIndexName,
+  getMarketPoolName,
+} from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { useDaysConsideredInMarketsApr } from "domain/synthetics/markets/useDaysConsideredInMarketsApr";
+import { PerformanceData } from "domain/synthetics/markets/usePerformanceAnnualized";
+import { PerformanceSnapshot, PerformanceSnapshotsData } from "domain/synthetics/markets/usePerformanceSnapshots";
+import { convertToUsd, getTokenData } from "domain/synthetics/tokens";
+import { useUsdgLaunchBoost } from "domain/synthetics/usdgLaunchBoost/useUsdgLaunchBoost";
+import { getDirectDepositAccess } from "domain/synthetics/whitelists/utils";
+import { ProgressiveTokenData } from "domain/tokens";
+import { PRECISION_DECIMALS, bigintToNumber, formatPercentage } from "lib/numbers";
+import { EMPTY_ARRAY, getByKey } from "lib/objects";
+import { usePoolsIsMobilePage } from "pages/Pools/usePoolsIsMobilePage";
+import { getNormalizedTokenSymbol } from "sdk/configs/tokens";
+
+import { AmountWithUsdHuman } from "components/AmountWithUsd/AmountWithUsd";
+import { AprInfo } from "components/AprInfo/AprInfo";
+import Button from "components/Button/Button";
+import FavoriteStar from "components/FavoriteStar/FavoriteStar";
+import { RecentlyListedBadge } from "components/FavoriteTabs/RecentlyListedBadge";
+import { RecentlyListedFavoriteSlot } from "components/FavoriteTabs/RecentlyListedFavoriteSlot";
+import { TableTdActionable, TableTrActionable } from "components/Table/Table";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+
+import MenuDotsIcon from "img/ic_menu_dots.svg?react";
+
+import GmAssetDropdown from "../GmAssetDropdown/GmAssetDropdown";
+import { SyntheticsInfoRow } from "../SyntheticsInfoRow";
+import { FeeApyLabel } from "./FeeApyLabel";
+import { GmTokensBalanceInfo } from "./GmTokensTotalBalanceInfo";
+import { PerformanceLabel } from "./PerformanceLabel";
+import { LaunchBoostBadge, WhitelistOnlyBadge } from "./UsdgPoolBadges";
+
+const tokenAddressStyle = { fontSize: 5 };
+
+export function GmListItem({
+  token,
+  marketsTokensApyData,
+  marketsTokensIncentiveAprData,
+  glvTokensIncentiveAprData,
+  marketsTokensLidoAprData,
+  glvTokensApyData,
+  apyLoading,
+  isFavorite,
+  onFavoriteClick,
+  isRecentlyListed,
+  performance,
+  performanceLoading,
+  performanceSnapshots,
+  userEarnings = null,
+  isUserEarningsLoading = false,
+  isUserEarningsUnavailable = false,
+  isEstimated365dFeesLoading = false,
+  isEstimated365dFeesUnavailable = false,
+}: {
+  token: ProgressiveTokenData;
+  marketsTokensApyData: MarketTokensAPRData | undefined;
+  marketsTokensIncentiveAprData: MarketTokensAPRData | undefined;
+  glvTokensIncentiveAprData: MarketTokensAPRData | undefined;
+  marketsTokensLidoAprData: MarketTokensAPRData | undefined;
+  glvTokensApyData: MarketTokensAPRData | undefined;
+  apyLoading: boolean;
+  isFavorite: boolean | undefined;
+  onFavoriteClick: ((address: string) => void) | undefined;
+  isRecentlyListed?: boolean;
+  performanceLoading: boolean;
+  performance: PerformanceData | undefined;
+  performanceSnapshots: PerformanceSnapshotsData | undefined;
+  userEarnings?: UserEarningsData | null;
+  isUserEarningsLoading?: boolean;
+  isUserEarningsUnavailable?: boolean;
+  isEstimated365dFeesLoading?: boolean;
+  isEstimated365dFeesUnavailable?: boolean;
+}) {
+  const chainId = useSelector(selectChainId);
+  const marketsInfoData = useSelector(selectGlvAndMarketsInfoData);
+  const tokensData = useTokensData();
+  const daysConsidered = useDaysConsideredInMarketsApr();
+  const { showDebugValues } = useSettings();
+  const multichainMarketTokensBalances = useSelector(selectMultichainMarketTokenBalances);
+  const multichainMarketTokenBalances = multichainMarketTokensBalances[token.address];
+  const isMultichainBalancesLoading = useSelector(selectMultichainMarketTokensBalancesIsLoading);
+  const whitelistsResult = useSelector(selectAccountWhitelistsResult);
+  const hasBalanceOutsideWallet = getHasBalanceOutsideWallet(multichainMarketTokenBalances, chainId);
+
+  const marketOrGlv = getByKey(marketsInfoData, token?.address);
+
+  const isGlv = isGlvInfo(marketOrGlv);
+
+  const indexToken = isGlv ? marketOrGlv.glvToken : getTokenData(tokensData, marketOrGlv?.indexTokenAddress, "native");
+  const longToken = getTokenData(tokensData, marketOrGlv?.longTokenAddress);
+  const shortToken = getTokenData(tokensData, marketOrGlv?.shortTokenAddress);
+
+  const marketOrGlvTokenAddress = marketOrGlv && getGlvOrMarketAddress(marketOrGlv);
+  const directDepositAccess =
+    marketOrGlv && getDirectDepositAccess({ chainId, glvOrMarket: marketOrGlv, whitelistsResult });
+  const isUsdgGlv = chainId === ARBITRUM && marketOrGlvTokenAddress === ARBITRUM_USDG_GLV_ADDRESS;
+  const isWhitelistOnly = directDepositAccess === "denied";
+
+  const apy = isGlv
+    ? getByKey(glvTokensApyData, marketOrGlvTokenAddress)
+    : getByKey(marketsTokensApyData, token?.address);
+  const incentiveApr = isGlv
+    ? getByKey(glvTokensIncentiveAprData, token?.address)
+    : getByKey(marketsTokensIncentiveAprData, token?.address);
+  const lidoApr = getByKey(marketsTokensLidoAprData, token?.address);
+  const launchBoost = useUsdgLaunchBoost(marketOrGlv);
+  const marketEarnings = getByKey(userEarnings?.byMarketAddress, token?.address);
+
+  const isMobile = usePoolsIsMobilePage();
+
+  const history = useHistory();
+
+  const handleItemClick = useCallback(
+    (event: React.MouseEvent) => {
+      history.push(`/pools/details?market=${marketOrGlvTokenAddress}`);
+      event.stopPropagation();
+    },
+    [history, marketOrGlvTokenAddress]
+  );
+
+  if (!token || !indexToken || !longToken || !shortToken || !marketOrGlv) {
+    return null;
+  }
+
+  const totalSupply = token?.totalSupply;
+  const totalSupplyUsd = convertToUsd(totalSupply, token?.decimals, token?.prices?.minPrice);
+  const tokenIconName = marketOrGlv?.isSpotOnly
+    ? getNormalizedTokenSymbol(longToken.symbol) + getNormalizedTokenSymbol(shortToken.symbol)
+    : getNormalizedTokenSymbol(indexToken.symbol);
+
+  const tokenIconBadge = getMarketBadge(chainId, marketOrGlv);
+  const showRecentlyListedBadge = Boolean(
+    isRecentlyListed && !isGlv && !marketOrGlv.isSpotOnly && !marketOrGlv.isDisabled
+  );
+
+  const handleFavoriteClick = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    if (!marketOrGlvTokenAddress) return;
+    onFavoriteClick?.(marketOrGlvTokenAddress);
+  };
+
+  const marketPerformance = performance?.[token.address];
+  const marketPerformanceSnapshots = performanceSnapshots?.[token.address];
+
+  if (isMobile) {
+    return (
+      <div className="flex flex-col gap-4 rounded-8 bg-fill-surfaceElevated50 p-12">
+        <div className="flex flex-wrap items-center pb-8" onClick={handleItemClick}>
+          <div className="flex items-center">
+            <div className="mr-12 flex shrink-0 items-center">
+              <TokenIcon
+                symbol={tokenIconName}
+                displaySize={40}
+                badge={tokenIconBadge}
+                className="min-h-40 min-w-40"
+                badgeClassName={isGlv ? "left-[50%] -translate-x-1/2 right-[unset] bottom-0" : undefined}
+              />
+            </div>
+            <div className="flex flex-col">
+              <div className="text-body-medium flex flex-wrap items-center gap-x-6">
+                <span className="font-medium">
+                  {isGlv
+                    ? getGlvDisplayName(marketOrGlv)
+                    : getMarketIndexName({ indexToken, isSpotOnly: marketOrGlv.isSpotOnly })}
+                </span>
+                {showRecentlyListedBadge && <RecentlyListedBadge />}
+                {isUsdgGlv && <LaunchBoostBadge />}
+                {isWhitelistOnly && <WhitelistOnlyBadge isGlv={isGlv} isSpotOnly={marketOrGlv.isSpotOnly} />}
+
+                <div className="inline-block">
+                  <GmAssetDropdown token={token} marketsInfoData={marketsInfoData} tokensData={tokensData} />
+                </div>
+              </div>
+              <div className="text-12 tracking-normal text-typography-secondary">
+                [{getMarketPoolName({ longToken, shortToken })}]
+              </div>
+            </div>
+          </div>
+          <div className="ml-auto flex items-center gap-8">
+            <SnapshotGraph
+              performanceSnapshots={marketPerformanceSnapshots ?? EMPTY_ARRAY}
+              performance={marketPerformance ?? 0n}
+            />
+
+            {onFavoriteClick ? (
+              <div>
+                <Button variant="secondary" className="shrink-0" onClick={handleFavoriteClick}>
+                  <FavoriteStar isFavorite={isFavorite} />
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-10 border-t border-slate-600 pt-8">
+          <SyntheticsInfoRow
+            label={<Trans>TVL (supply)</Trans>}
+            value={
+              <AmountWithUsdHuman
+                amount={totalSupply}
+                decimals={token.decimals}
+                usd={totalSupplyUsd}
+                symbol={token.symbol}
+                usdOnTop
+              />
+            }
+          />
+          <SyntheticsInfoRow
+            label={<Trans>Balance</Trans>}
+            value={
+              <GmTokensBalanceInfo
+                token={token}
+                daysConsidered={daysConsidered}
+                earnedRecently={marketEarnings?.recent}
+                earnedTotal={marketEarnings?.total}
+                earnedExpected365d={marketEarnings?.expected365d}
+                isGlv={isGlv}
+                singleLine={true}
+                multichainBalances={multichainMarketTokenBalances}
+                isMultichainBalancesLoading={isMultichainBalancesLoading}
+                isUserEarningsLoading={isUserEarningsLoading}
+                isUserEarningsUnavailable={isUserEarningsUnavailable}
+                isEstimated365dFeesLoading={isEstimated365dFeesLoading}
+                isEstimated365dFeesUnavailable={isEstimated365dFeesUnavailable}
+                hasBalanceOutsideWallet={hasBalanceOutsideWallet}
+              />
+            }
+          />
+          <SyntheticsInfoRow
+            label={<FeeApyLabel />}
+            value={
+              <AprInfo
+                apy={apy}
+                incentiveApr={incentiveApr}
+                lidoApr={lidoApr}
+                launchBoost={launchBoost}
+                isApyLoading={apyLoading}
+                marketAddress={token.address}
+              />
+            }
+          />
+          <SyntheticsInfoRow
+            label={<PerformanceLabel />}
+            value={
+              marketPerformance
+                ? formatPercentage(marketPerformance, { bps: false, signed: true, showPlus: false })
+                : "N/A"
+            }
+            valueClassName={marketPerformance ? "numbers" : undefined}
+          />
+        </div>
+
+        <Button variant="secondary" className="mt-12" to={`/pools/details?market=${marketOrGlvTokenAddress}`}>
+          <Trans>View details</Trans>
+        </Button>
+      </div>
+    );
+  }
+
+  const performanceValue = marketPerformance
+    ? formatPercentage(marketPerformance, { bps: false, signed: true, showPlus: false })
+    : "N/A";
+
+  const shouldShowApy = (apy !== undefined && apy !== 0n) || launchBoost !== undefined;
+
+  const apyValue = shouldShowApy ? (
+    <AprInfo
+      apy={apy}
+      incentiveApr={incentiveApr}
+      lidoApr={lidoApr}
+      launchBoost={launchBoost}
+      marketAddress={token.address}
+    />
+  ) : (
+    "N/A"
+  );
+
+  return (
+    <TableTrActionable key={token.address} className="cursor-pointer" onClick={handleItemClick}>
+      <TableTdActionable className="w-[220px] pl-16">
+        <div className="flex items-center gap-8">
+          {onFavoriteClick && (
+            <Button variant="ghost" className="!h-32 !min-h-32 !w-40 !p-0" onClick={handleFavoriteClick}>
+              <RecentlyListedFavoriteSlot isRecentlyListed={showRecentlyListedBadge} isFavorite={isFavorite} />
+            </Button>
+          )}
+
+          <div className="mr-12 flex shrink-0 items-center">
+            <TokenIcon
+              symbol={tokenIconName}
+              displaySize={40}
+              badge={tokenIconBadge}
+              className="min-h-40 min-w-40"
+              badgeClassName={isGlv ? "left-[50%] -translate-x-1/2 right-[unset] bottom-0" : undefined}
+            />
+          </div>
+          <div>
+            <div className="flex items-center text-16">
+              <span className="font-medium">
+                {isGlv
+                  ? getGlvDisplayName(marketOrGlv)
+                  : getMarketIndexName({ indexToken, isSpotOnly: Boolean(marketOrGlv?.isSpotOnly) })}
+              </span>
+
+              {isUsdgGlv && <LaunchBoostBadge className="ml-6" />}
+              {isWhitelistOnly && (
+                <WhitelistOnlyBadge className="ml-6" isGlv={isGlv} isSpotOnly={marketOrGlv?.isSpotOnly} />
+              )}
+
+              <div className="inline-block">
+                <GmAssetDropdown token={token} marketsInfoData={marketsInfoData} tokensData={tokensData} />
+              </div>
+            </div>
+            <div className="text-12 tracking-normal text-typography-secondary">
+              [{getMarketPoolName({ longToken, shortToken })}]
+            </div>
+          </div>
+        </div>
+        {showDebugValues && <span style={tokenAddressStyle}>{marketOrGlvTokenAddress}</span>}
+      </TableTdActionable>
+      <TableTdActionable className="w-[13%]">
+        {totalSupplyUsd ? (
+          <AmountWithUsdHuman
+            multiline
+            amount={totalSupply}
+            decimals={token.decimals}
+            usd={totalSupplyUsd}
+            symbol={token.symbol}
+            usdOnTop
+          />
+        ) : (
+          <Skeleton width={60} count={1} baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" />
+        )}
+      </TableTdActionable>
+      <TableTdActionable className="w-[11%]">
+        <GmTokensBalanceInfo
+          token={token}
+          daysConsidered={daysConsidered}
+          earnedRecently={marketEarnings?.recent}
+          earnedTotal={marketEarnings?.total}
+          earnedExpected365d={marketEarnings?.expected365d}
+          multichainBalances={multichainMarketTokenBalances}
+          isGlv={isGlv}
+          isMultichainBalancesLoading={isMultichainBalancesLoading}
+          isUserEarningsLoading={isUserEarningsLoading}
+          isUserEarningsUnavailable={isUserEarningsUnavailable}
+          isEstimated365dFeesLoading={isEstimated365dFeesLoading}
+          isEstimated365dFeesUnavailable={isEstimated365dFeesUnavailable}
+          hasBalanceOutsideWallet={hasBalanceOutsideWallet}
+        />
+      </TableTdActionable>
+
+      <TableTdActionable className="w-[11%]">
+        {!apyLoading ? apyValue : <Skeleton width={60} count={1} baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" />}
+      </TableTdActionable>
+
+      <TableTdActionable className="w-[18%]">
+        {!performanceLoading ? (
+          <div className="numbers">{performanceValue}</div>
+        ) : (
+          <Skeleton width={60} count={1} baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" />
+        )}
+      </TableTdActionable>
+
+      <TableTdActionable className="w-[14%]">
+        <SnapshotGraph
+          performanceSnapshots={marketPerformanceSnapshots ?? EMPTY_ARRAY}
+          performance={marketPerformance ?? 0n}
+        />
+      </TableTdActionable>
+
+      <TableTdActionable className="w-[10%] pr-16">
+        <Button
+          className="flex flex-grow items-center gap-4"
+          variant="ghost"
+          to={`/pools/details?market=${marketOrGlvTokenAddress}`}
+        >
+          <Trans>Details</Trans>
+          <MenuDotsIcon className="size-14" />
+        </Button>
+      </TableTdActionable>
+    </TableTrActionable>
+  );
+}
+
+const MOBILE_SNAPSHOT_GRAPH_SIZE = {
+  width: 80,
+  height: 32,
+};
+
+const DESKTOP_SNAPSHOT_GRAPH_SIZE = {
+  width: 160,
+  height: 32,
+};
+
+const SnapshotGraph = ({
+  performanceSnapshots,
+  performance,
+}: {
+  performanceSnapshots: PerformanceSnapshot[];
+  performance: bigint;
+}) => {
+  const isNegative = performance < 0n;
+
+  const isMobile = usePoolsIsMobilePage();
+  const size = isMobile ? MOBILE_SNAPSHOT_GRAPH_SIZE : DESKTOP_SNAPSHOT_GRAPH_SIZE;
+
+  const chartData = useMemo(
+    () =>
+      performanceSnapshots.map((snapshot) => ({
+        ...snapshot,
+        performance: bigintToNumber(snapshot.performance, PRECISION_DECIMALS),
+      })),
+    [performanceSnapshots]
+  );
+
+  return (
+    <div style={isMobile ? MOBILE_SNAPSHOT_GRAPH_SIZE : DESKTOP_SNAPSHOT_GRAPH_SIZE}>
+      <AreaChart width={size.width} height={size.height} data={chartData}>
+        <defs>
+          <linearGradient id={`snapshot-graph-gradient-green`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="-45%" stopColor="var(--color-green-500)" stopOpacity={0.5}></stop>
+            <stop offset="100%" stopColor="var(--color-green-500)" stopOpacity={0}></stop>
+          </linearGradient>
+          <linearGradient id={`snapshot-graph-gradient-red`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="-45%" stopColor="var(--color-red-500)" stopOpacity={0.5}></stop>
+            <stop offset="100%" stopColor="var(--color-red-500)" stopOpacity={0}></stop>
+          </linearGradient>
+        </defs>
+        <Area
+          dataKey="performance"
+          stroke={isNegative ? "var(--color-red-500)" : "var(--color-green-500)"}
+          dot={false}
+          fill={isNegative ? "url(#snapshot-graph-gradient-red)" : "url(#snapshot-graph-gradient-green)"}
+          baseValue="dataMin"
+        />
+      </AreaChart>
+    </div>
+  );
+};

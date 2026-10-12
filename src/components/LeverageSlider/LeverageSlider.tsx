@@ -1,0 +1,162 @@
+import cx from "classnames";
+import range from "lodash/range";
+import { Handle, SliderTooltip } from "rc-slider";
+import { forwardRef, ReactNode, useCallback, useMemo } from "react";
+
+import { multiplierPart, numberParts } from "lib/numbers";
+
+import { DEFAULT_LEVERAGE, DEFAULT_LEVERAGE_MARKS } from "components/LeverageField/LeverageField";
+import { NumericValue } from "components/NumericValue/NumericValue";
+import { Slider } from "components/Slider";
+
+type Props = {
+  isPositive?: boolean;
+  value?: number;
+  onChange: (value: number) => void;
+  marks: number[];
+  className?: string;
+};
+
+type HandleProps = {
+  value: number;
+  dragging: boolean;
+  index: number;
+  displayValue: number;
+};
+
+function getMarksWithLabel(marks: number[]) {
+  return marks.reduce(
+    (marks, value, index) => {
+      marks[index * 10] = <NumericValue parts={numberParts(String(value), multiplierPart("x"))} />;
+      return marks;
+    },
+    {} as { [key: number]: ReactNode }
+  );
+}
+
+export function LeverageSlider(p: Props) {
+  const { onChange, value, marks } = p;
+  const finalMarks = marks ?? DEFAULT_LEVERAGE_MARKS;
+
+  const { keyValueMap, valueKeyMap } = useMemo(() => generateKeyValueMap(finalMarks), [finalMarks]);
+
+  const firstValue = finalMarks[0];
+  const firstKey = valueKeyMap[firstValue];
+  const sliderKey = value === undefined ? firstKey : valueKeyMap[value] ?? sliderValueToSliderKey(keyValueMap, value);
+
+  const max = (finalMarks.length - 1) * 10;
+
+  const handleChange = useCallback(
+    (newKey: number) => {
+      const truncatedKey = Math.trunc(newKey ?? DEFAULT_LEVERAGE);
+      onChange(keyValueMap[truncatedKey] ?? keyValueMap[DEFAULT_LEVERAGE]);
+    },
+    [onChange, keyValueMap]
+  );
+
+  const customHandle = useMemo(() => {
+    return (props: any) => <LeverageSliderHandle {...props} displayValue={value} />;
+  }, [value]);
+
+  const leverageSliderMarks = useMemo(() => {
+    return Object.fromEntries(
+      Object.entries(getMarksWithLabel(finalMarks)).sort((a, b) => Number(a[0]) - Number(b[0]))
+    );
+  }, [finalMarks]);
+
+  return (
+    <div className={cx("mb-20 mt-16 px-4", p.className)} data-qa="leverage-slider">
+      <Slider
+        min={0}
+        max={max}
+        step={0.1}
+        handle={customHandle}
+        onChange={handleChange}
+        value={sliderKey}
+        marks={leverageSliderMarks}
+      />
+    </div>
+  );
+}
+
+const LeverageSliderHandle = forwardRef<Handle, HandleProps>(function LeverageSliderHandle(
+  { value, dragging, index, displayValue, ...restProps },
+  ref
+) {
+  return (
+    <SliderTooltip
+      prefixCls="rc-slider-tooltip"
+      overlay={
+        <NumericValue parts={numberParts(parseFloat(displayValue.toString()).toFixed(2), multiplierPart("x"))} />
+      }
+      visible={dragging}
+      placement="top"
+      key={index}
+      data-qa={"leverage-slider-tooltip"}
+    >
+      <Handle data-qa={"leverage-slider-handle"} value={value} {...restProps} ref={ref} />
+    </SliderTooltip>
+  );
+});
+
+function generateEquallySpacedArray(min: number, max: number, shouldIncludeMax?: boolean): number[] {
+  const step = (max - min) / 10;
+  let array = range(min, max, step).map((num) => parseFloat(num.toFixed(1)));
+
+  if (shouldIncludeMax && array[array.length - 1] !== max) {
+    array.push(max);
+  }
+
+  return array;
+}
+
+function generateKeyValueMap(marks: number[]) {
+  const values = marks.slice(0, -1).flatMap((mark, index) => {
+    const shouldIncludeMax = index === marks.length - 2;
+    return generateEquallySpacedArray(mark, marks[index + 1], shouldIncludeMax);
+  });
+
+  const keyValueMap = Object.fromEntries(values.map((value, index) => [index, value]));
+  const valueKeyMap = Object.fromEntries(values.map((value, index) => [value, index]));
+
+  return { keyValueMap, valueKeyMap };
+}
+
+function sliderValueToSliderKey(keyValueMap: { [key: number]: number }, value: number): number {
+  const sortedValues = Array.from({
+    length: Object.keys(keyValueMap).length,
+  }).map((_, index) => keyValueMap[index]);
+
+  let leftIndex = sortedValues.findIndex((val) => val >= value);
+  if (leftIndex !== -1) {
+    if (sortedValues[leftIndex] === value) {
+      return leftIndex;
+    }
+    leftIndex -= 1;
+  } else {
+    leftIndex = 0;
+  }
+
+  const leftValue = sortedValues[leftIndex - 1];
+  if (leftValue === undefined) {
+    return sortedValues[0];
+  }
+
+  let rightIndex = sortedValues.findLastIndex((val) => val <= value);
+  if (rightIndex !== -1) {
+    if (sortedValues[rightIndex] === value) {
+      return rightIndex;
+    }
+    rightIndex += 1;
+  } else {
+    rightIndex = sortedValues.length - 1;
+  }
+
+  const rightValue = sortedValues[rightIndex];
+
+  if (rightValue === undefined) {
+    return sortedValues[sortedValues.length - 1];
+  }
+
+  return (value - leftValue) / (rightValue - leftValue) + leftIndex;
+}

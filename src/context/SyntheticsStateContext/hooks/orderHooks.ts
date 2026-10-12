@@ -1,0 +1,130 @@
+import uniq from "lodash/uniq";
+import { useCallback, useMemo } from "react";
+
+import { estimateBatchExpressParams } from "domain/synthetics/express/expressOrderUtils";
+import {
+  getExpressParamsForSubmit,
+  reportMultichainExpressSubmitError,
+} from "domain/synthetics/express/validateMultichainExpressSubmit";
+import { sendBatchOrderTxn } from "domain/synthetics/orders/sendBatchOrderTxn";
+import { useOrderTxnCallbacks } from "domain/synthetics/orders/useOrderTxnCallbacks";
+import { helperToast } from "lib/helperToast";
+import { useJsonRpcProvider } from "lib/rpc";
+import { getPageOutdatedError, useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { useEthersSigner } from "lib/wallets/useEthersSigner";
+import { getOrderKeys } from "sdk/utils/orders";
+import { OrderInfo } from "sdk/utils/orders/types";
+
+import { useCancellingOrdersKeysState } from "./orderEditorHooks";
+import { selectExpressGlobalParams } from "../selectors/expressSelectors";
+import { selectChainId, selectSrcChainId, selectSubaccountForChainAction } from "../selectors/globalSelectors";
+import {
+  makeSelectOrderErrorByOrderKey,
+  makeSelectOrdersWithErrorsByPositionKey,
+  selectOrderErrorsCount,
+} from "../selectors/orderSelectors";
+import { useSelector } from "../utils";
+
+export const useOrderErrors = (orderKey: string) => {
+  const selector = useMemo(() => makeSelectOrderErrorByOrderKey(orderKey), [orderKey]);
+  return useSelector(selector);
+};
+
+export const usePositionOrdersWithErrors = (positionKey: string | undefined) => {
+  const selector = useMemo(() => makeSelectOrdersWithErrorsByPositionKey(positionKey), [positionKey]);
+  return useSelector(selector);
+};
+
+export const useOrderErrorsCount = () => useSelector(selectOrderErrorsCount);
+
+export function useCancelOrder(order: OrderInfo) {
+  const chainId = useSelector(selectChainId);
+  const srcChainId = useSelector(selectSrcChainId);
+  const signer = useEthersSigner();
+  const { provider } = useJsonRpcProvider(chainId);
+  const [cancellingOrdersKeys, setCancellingOrdersKeys] = useCancellingOrdersKeysState();
+  const { makeOrderTxnCallback } = useOrderTxnCallbacks();
+  const globalExpressParams = useSelector(selectExpressGlobalParams);
+  const subaccount = useSelector(selectSubaccountForChainAction);
+  const hasOutdatedUi = useHasOutdatedUi();
+
+  const isCancelOrderProcessing = cancellingOrdersKeys.includes(order.key);
+
+  const onCancelOrder = useCallback(
+    async function cancelOrder() {
+      if (hasOutdatedUi) {
+        helperToast.error(getPageOutdatedError());
+        return;
+      }
+      if (!signer || !provider) return;
+
+      setCancellingOrdersKeys((p) => uniq(p.concat(order.key)));
+
+      const orderKeys = getOrderKeys(order);
+
+      const batchParams = {
+        createOrderParams: [],
+        updateOrderParams: [],
+        cancelOrderParams: orderKeys.map((k) => ({ orderKey: k })),
+      };
+
+      try {
+        const expressParams = globalExpressParams
+          ? await estimateBatchExpressParams({
+              signer,
+              chainId,
+              batchParams,
+              globalExpressParams,
+              requireValidations: false,
+              estimationMethod: "approximate",
+              provider,
+              isGmxAccount: srcChainId !== undefined,
+              subaccount,
+            })
+          : undefined;
+
+        if (
+          reportMultichainExpressSubmitError({
+            isGmxAccount: srcChainId !== undefined,
+            expressParams,
+            tokensData: undefined,
+            actionName: "Cancel Order",
+            collateral: order.initialCollateralToken.symbol,
+          })
+        ) {
+          return;
+        }
+
+        await sendBatchOrderTxn({
+          chainId,
+          signer,
+          batchParams,
+          expressParams: getExpressParamsForSubmit(expressParams),
+          simulationParams: undefined,
+          callback: makeOrderTxnCallback({
+            actionName: "Cancel Order",
+            collateralSymbol: order.initialCollateralToken.symbol,
+          }),
+          provider,
+          isGmxAccount: srcChainId !== undefined,
+        });
+      } finally {
+        setCancellingOrdersKeys((prev) => prev.filter((k) => k !== order.key));
+      }
+    },
+    [
+      chainId,
+      globalExpressParams,
+      hasOutdatedUi,
+      makeOrderTxnCallback,
+      order,
+      provider,
+      setCancellingOrdersKeys,
+      signer,
+      srcChainId,
+      subaccount,
+    ]
+  );
+
+  return [isCancelOrderProcessing, onCancelOrder] as const;
+}

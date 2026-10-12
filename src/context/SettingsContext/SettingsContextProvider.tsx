@@ -1,0 +1,492 @@
+import noop from "lodash/noop";
+import { ReactNode, createContext, useContext, useEffect, useMemo, useState } from "react";
+
+import { ARBITRUM, getExecutionFeeConfig } from "config/chains";
+import { isDevelopment } from "config/env";
+import { DEFAULT_ACCEPTABLE_PRICE_IMPACT_BUFFER, DEFAULT_SLIPPAGE_AMOUNT } from "config/factors";
+import { getIsExpressSupported } from "config/features";
+import {
+  BREAKDOWN_NET_PRICE_IMPACT_ENABLED_KEY,
+  BUY_SELL_ICONS_MODE_KEY,
+  CHART_LINES_SIZE_DENOMINATION_KEY,
+  CLOSE_SIZE_DENOMINATION_KEY,
+  DEBUG_ERROR_BOUNDARY_KEY,
+  DEBUG_SWAP_MARKETS_CONFIG_KEY,
+  DISABLE_ORDER_VALIDATION_KEY,
+  DISABLE_SHARE_MODAL_PNL_CHECK_KEY,
+  EXTERNAL_SWAPS_ENABLED_KEY,
+  IS_AUTO_CANCEL_TPSL_KEY,
+  IS_PNL_IN_LEVERAGE_KEY,
+  SETTINGS_WARNING_DOT_VISIBLE_KEY,
+  SET_ACCEPTABLE_PRICE_IMPACT_ENABLED_KEY,
+  SHOULD_SHOW_POSITION_LINES_KEY,
+  SHOW_DEBUG_VALUES_KEY,
+  SHOW_PNL_AFTER_FEES_KEY,
+  TWAP_NUMBER_OF_PARTS_KEY,
+  getAllowedSlippageKey,
+  getCollateralCloseDestinationKey,
+  getExecutionFeeBufferBpsKey,
+  getExpressOrdersEnabledKey,
+  getGasPaymentTokenAddressKey,
+  getGmxAccountGasPaymentTokenAddressKey,
+  getHasOverriddenDefaultArb30ExecutionFeeBufferBpsKey,
+  getLeverageEnabledKey as getLeverageSliderEnabledKey,
+  getSyntheticsAcceptablePriceImpactBufferKey,
+} from "config/localStorage";
+import { useChainId } from "lib/chains";
+import { hasStoredLocalStorageValue, useLocalStorageByChainId, useLocalStorageSerializeKey } from "lib/localStorage";
+import { tenderlyLsKeys } from "lib/tenderly";
+import useWallet from "lib/wallets/useWallet";
+import { useWalletCanSignTypedData } from "lib/wallets/useWalletSessionChains";
+import { getDefaultGasPaymentToken } from "sdk/configs/express";
+import { isValidTokenSafe } from "sdk/configs/tokens";
+import { DEFAULT_TWAP_NUMBER_OF_PARTS } from "sdk/configs/twap";
+
+export type BuySellIconsMode = "off" | "current" | "all";
+
+const DEFAULT_BUY_SELL_ICONS_MODE: BuySellIconsMode = "current";
+
+function getBuySellIconsMode(savedValue: BuySellIconsMode | boolean | undefined): BuySellIconsMode {
+  if (savedValue === false) return "off";
+  if (savedValue === true) return "all";
+  return savedValue ?? DEFAULT_BUY_SELL_ICONS_MODE;
+}
+
+export type SettingsContextType = {
+  showDebugValues: boolean;
+  setShowDebugValues: (val: boolean) => void;
+  isErrorBoundaryDebugEnabled: boolean;
+  setIsErrorBoundaryDebugEnabled: (val: boolean) => void;
+  savedAllowedSlippage: number;
+  setSavedAllowedSlippage: (val: number) => void;
+  setExecutionFeeBufferBps: (val: number) => void;
+  savedAcceptablePriceImpactBuffer: number;
+  setSavedAcceptablePriceImpactBuffer: (val: number) => void;
+  executionFeeBufferBps: number | undefined;
+  shouldUseExecutionFeeBuffer: boolean;
+  showPnlAfterFees: boolean;
+  setShowPnlAfterFees: (val: boolean) => void;
+  isPnlInLeverage: boolean;
+  setIsPnlInLeverage: (val: boolean) => void;
+  shouldDisableValidationForTesting: boolean;
+  setShouldDisableValidationForTesting: (val: boolean) => void;
+  shouldDisableShareModalPnlCheck: boolean;
+  setShouldDisableShareModalPnlCheck: (val: boolean) => void;
+  shouldShowPositionLines: boolean;
+  setShouldShowPositionLines: (val: boolean) => void;
+  buySellIconsMode: BuySellIconsMode;
+  setBuySellIconsMode: (val: BuySellIconsMode) => void;
+  isAutoCancelTPSL: boolean;
+  setIsAutoCancelTPSL: (val: boolean) => void;
+  isLeverageSliderEnabled: boolean;
+  setIsLeverageSliderEnabled: (val: boolean) => void;
+
+  tenderlyAccountSlug: string | undefined;
+  setTenderlyAccountSlug: (val: string | undefined) => void;
+  tenderlyProjectSlug: string | undefined;
+  setTenderlyProjectSlug: (val: string | undefined) => void;
+  tenderlyAccessKey: string | undefined;
+  setTenderlyAccessKey: (val: string | undefined) => void;
+  tenderlySimulationEnabled: boolean | undefined;
+  setTenderlySimulationEnabled: (val: boolean | undefined) => void;
+
+  breakdownNetPriceImpactEnabled: boolean;
+  setBreakdownNetPriceImpactEnabled: (val: boolean) => void;
+
+  isSettingsVisible: boolean;
+  setIsSettingsVisible: (val: boolean) => void;
+
+  expressOrdersEnabled: boolean;
+  setExpressOrdersEnabled: (val: boolean) => void;
+
+  gasPaymentTokenAddress: string;
+  setGasPaymentTokenAddress: (val: string) => void;
+  gmxAccountGasPaymentTokenAddress: string;
+  setGmxAccountGasPaymentTokenAddress: (val: string) => void;
+
+  externalSwapsEnabled: boolean;
+  setExternalSwapsEnabled: (val: boolean) => void;
+
+  settingsWarningDotVisible: boolean;
+  setSettingsWarningDotVisible: (val: boolean) => void;
+
+  debugSwapMarketsConfig:
+    | {
+        disabledSwapMarkets?: string[];
+        manualPath?: string[];
+      }
+    | undefined;
+  setDebugSwapMarketsConfig: (val: { disabledSwapMarkets?: string[]; manualPath?: string[] }) => void;
+
+  savedTwapNumberOfParts: number;
+  setSavedTWAPNumberOfParts: (val: number) => void;
+
+  isSetAcceptablePriceImpactEnabled: boolean;
+  setIsSetAcceptablePriceImpactEnabled: (val: boolean) => void;
+
+  receiveToGmxAccount: boolean | null;
+  setReceiveToGmxAccount: (val: boolean) => void;
+
+  showCloseSizeInTokens: boolean;
+  setShowCloseSizeInTokens: (val: boolean) => void;
+
+  chartLinesSizeInTokens: boolean;
+  setChartLinesSizeInTokens: (val: boolean) => void;
+};
+
+const SettingsContext = createContext({});
+
+export function useSettings() {
+  return useContext(SettingsContext) as SettingsContextType;
+}
+
+export function SettingsContextProvider({ children }: { children: ReactNode }) {
+  const { chainId, srcChainId } = useChainId();
+  const { account } = useWallet();
+
+  const [isSettingsVisible, setIsSettingsVisible] = useState(false);
+  const [showDebugValues, setShowDebugValues] = useLocalStorageSerializeKey(SHOW_DEBUG_VALUES_KEY, false);
+  const [isErrorBoundaryDebugEnabled, setIsErrorBoundaryDebugEnabled] = useLocalStorageSerializeKey(
+    DEBUG_ERROR_BOUNDARY_KEY,
+    false
+  );
+  const [savedAllowedSlippage, setSavedAllowedSlippage] = useLocalStorageSerializeKey(
+    getAllowedSlippageKey(chainId),
+    DEFAULT_SLIPPAGE_AMOUNT
+  );
+
+  const [savedAcceptablePriceImpactBuffer, setSavedAcceptablePriceImpactBuffer] = useLocalStorageSerializeKey(
+    getSyntheticsAcceptablePriceImpactBufferKey(chainId),
+    DEFAULT_ACCEPTABLE_PRICE_IMPACT_BUFFER
+  );
+
+  const [hasOverriddenDefaultArb30ExecutionFeeBufferBpsKey, setHasOverriddenDefaultArb30ExecutionFeeBufferBpsKey] =
+    useLocalStorageSerializeKey(getHasOverriddenDefaultArb30ExecutionFeeBufferBpsKey(chainId), false);
+
+  const [settingsWarningDotVisible, setSettingsWarningDotVisible] = useLocalStorageSerializeKey(
+    SETTINGS_WARNING_DOT_VISIBLE_KEY,
+    false
+  );
+
+  const defaultExecutionFeeBufferBps = getExecutionFeeConfig(chainId)?.defaultBufferBps;
+  const shouldUseExecutionFeeBuffer = Boolean(defaultExecutionFeeBufferBps);
+
+  // useLocalStorage captures the initial value once; set defaults per-chain via effect instead.
+  let [executionFeeBufferBps, setExecutionFeeBufferBps] = useLocalStorageSerializeKey<number | undefined>(
+    getExecutionFeeBufferBpsKey(chainId),
+    undefined
+  );
+
+  const [savedShowPnlAfterFees, setSavedShowPnlAfterFees] = useLocalStorageSerializeKey(
+    [chainId, SHOW_PNL_AFTER_FEES_KEY],
+    false
+  );
+
+  const [savedIsPnlInLeverage, setSavedIsPnlInLeverage] = useLocalStorageSerializeKey(
+    [chainId, IS_PNL_IN_LEVERAGE_KEY],
+    false
+  );
+
+  const [savedIsAutoCancelTPSL, setIsAutoCancelTPSL] = useLocalStorageSerializeKey(
+    [chainId, IS_AUTO_CANCEL_TPSL_KEY],
+    true
+  );
+
+  const [isLeverageSliderEnabled, setIsLeverageSliderEnabled] = useLocalStorageSerializeKey(
+    getLeverageSliderEnabledKey(chainId),
+    true
+  );
+
+  const [tenderlyAccountSlug, setTenderlyAccountSlug] = useLocalStorageSerializeKey(tenderlyLsKeys.accountSlug, "");
+  const [tenderlyProjectSlug, setTenderlyProjectSlug] = useLocalStorageSerializeKey(tenderlyLsKeys.projectSlug, "");
+  const [tenderlyAccessKey, setTenderlyAccessKey] = useLocalStorageSerializeKey(tenderlyLsKeys.accessKey, "");
+  const [tenderlySimulationEnabled, setTenderlySimulationEnabled] = useLocalStorageSerializeKey(
+    tenderlyLsKeys.enabled,
+    false
+  );
+
+  const [externalSwapsEnabled, setExternalSwapsEnabled] = useLocalStorageByChainId(
+    chainId,
+    EXTERNAL_SWAPS_ENABLED_KEY,
+    true
+  );
+  const [debugSwapMarketsConfig, setDebugSwapMarketsConfig] = useLocalStorageSerializeKey<
+    undefined | { disabledSwapMarkets?: string[]; manualPath?: string[] }
+  >([chainId, DEBUG_SWAP_MARKETS_CONFIG_KEY], undefined);
+
+  const { canSignTypedData } = useWalletCanSignTypedData();
+  const expressOrdersEnabledKey = getExpressOrdersEnabledKey(chainId, account);
+  const [expressOrdersEnabled, setExpressOrdersEnabled] = useLocalStorageSerializeKey(expressOrdersEnabledKey, false);
+
+  const [receiveToGmxAccount, setReceiveToGmxAccount] = useLocalStorageSerializeKey<boolean | null>(
+    getCollateralCloseDestinationKey(chainId, account),
+    null
+  );
+
+  const [savedBreakdownNetPriceImpactEnabled, setSavedBreakdownNetPriceImpactEnabled] = useLocalStorageSerializeKey(
+    [chainId, BREAKDOWN_NET_PRICE_IMPACT_ENABLED_KEY],
+    false
+  );
+
+  const [savedSetAcceptablePriceImpactEnabled, setSavedSetAcceptablePriceImpactEnabled] = useLocalStorageSerializeKey(
+    [chainId, SET_ACCEPTABLE_PRICE_IMPACT_ENABLED_KEY],
+    false
+  );
+
+  let [gasPaymentTokenAddress, setGasPaymentTokenAddress] = useLocalStorageSerializeKey(
+    getGasPaymentTokenAddressKey(chainId, account),
+    getDefaultGasPaymentToken(chainId)
+  );
+  // Reason: useLocalStorageSerializeKey leaks previous value to the next render even if key is changed
+  if (gasPaymentTokenAddress && !isValidTokenSafe(chainId, gasPaymentTokenAddress)) {
+    gasPaymentTokenAddress = getDefaultGasPaymentToken(chainId);
+  }
+
+  let [gmxAccountGasPaymentTokenAddress, setGmxAccountGasPaymentTokenAddress] = useLocalStorageSerializeKey(
+    getGmxAccountGasPaymentTokenAddressKey(chainId, account),
+    getDefaultGasPaymentToken(chainId)
+  );
+  // Reason: useLocalStorageSerializeKey leaks previous value to the next render even if key is changed
+  if (gmxAccountGasPaymentTokenAddress && !isValidTokenSafe(chainId, gmxAccountGasPaymentTokenAddress)) {
+    gmxAccountGasPaymentTokenAddress = getDefaultGasPaymentToken(chainId);
+  }
+
+  let [savedShouldDisableValidationForTesting, setSavedShouldDisableValidationForTesting] = useLocalStorageSerializeKey(
+    [chainId, DISABLE_ORDER_VALIDATION_KEY],
+    false
+  );
+  if (!isDevelopment()) {
+    savedShouldDisableValidationForTesting = false;
+    setSavedShouldDisableValidationForTesting = noop;
+  }
+
+  let [savedShouldDisableShareModalPnlCheck, setSavedShouldDisableShareModalPnlCheck] = useLocalStorageSerializeKey(
+    [chainId, DISABLE_SHARE_MODAL_PNL_CHECK_KEY],
+    false
+  );
+  if (!isDevelopment()) {
+    savedShouldDisableShareModalPnlCheck = false;
+    setSavedShouldDisableShareModalPnlCheck = noop;
+  }
+
+  const [savedShouldShowPositionLines, setSavedShouldShowPositionLines] = useLocalStorageSerializeKey(
+    [chainId, SHOULD_SHOW_POSITION_LINES_KEY],
+    true
+  );
+
+  const [savedBuySellIconsModeRaw, setSavedBuySellIconsModeRaw] = useLocalStorageSerializeKey<
+    BuySellIconsMode | boolean
+  >([chainId, BUY_SELL_ICONS_MODE_KEY], DEFAULT_BUY_SELL_ICONS_MODE);
+
+  const savedBuySellIconsMode = useMemo(
+    () => getBuySellIconsMode(savedBuySellIconsModeRaw),
+    [savedBuySellIconsModeRaw]
+  );
+
+  const [savedTwapNumberOfParts, setSavedTWAPNumberOfParts] = useLocalStorageSerializeKey(
+    [chainId, TWAP_NUMBER_OF_PARTS_KEY],
+    DEFAULT_TWAP_NUMBER_OF_PARTS
+  );
+
+  const [showCloseSizeInTokens, setShowCloseSizeInTokens] = useLocalStorageSerializeKey(
+    CLOSE_SIZE_DENOMINATION_KEY,
+    false
+  );
+
+  const [chartLinesSizeInTokens, setChartLinesSizeInTokens] = useLocalStorageSerializeKey(
+    CHART_LINES_SIZE_DENOMINATION_KEY,
+    false
+  );
+
+  useEffect(() => {
+    if (shouldUseExecutionFeeBuffer && executionFeeBufferBps === undefined) {
+      setExecutionFeeBufferBps(defaultExecutionFeeBufferBps ?? 0);
+    }
+  }, [
+    chainId,
+    defaultExecutionFeeBufferBps,
+    executionFeeBufferBps,
+    setExecutionFeeBufferBps,
+    shouldUseExecutionFeeBuffer,
+  ]);
+
+  useEffect(() => {
+    if (!hasOverriddenDefaultArb30ExecutionFeeBufferBpsKey && chainId === ARBITRUM) {
+      setExecutionFeeBufferBps(defaultExecutionFeeBufferBps ?? 0);
+      setHasOverriddenDefaultArb30ExecutionFeeBufferBpsKey(true);
+    }
+  }, [
+    chainId,
+    defaultExecutionFeeBufferBps,
+    hasOverriddenDefaultArb30ExecutionFeeBufferBpsKey,
+    setExecutionFeeBufferBps,
+    setHasOverriddenDefaultArb30ExecutionFeeBufferBpsKey,
+  ]);
+
+  useEffect(
+    function defaultExpressForSupportedWallets() {
+      if (
+        !account ||
+        expressOrdersEnabled ||
+        !getIsExpressSupported(chainId) ||
+        hasStoredLocalStorageValue(expressOrdersEnabledKey)
+      ) {
+        return;
+      }
+
+      setExpressOrdersEnabled(true);
+    },
+    [account, chainId, expressOrdersEnabled, expressOrdersEnabledKey, setExpressOrdersEnabled]
+  );
+
+  useEffect(
+    function fallbackMultichain() {
+      if (srcChainId && !expressOrdersEnabled) {
+        setExpressOrdersEnabled(true);
+      }
+    },
+    [expressOrdersEnabled, setExpressOrdersEnabled, srcChainId]
+  );
+
+  const contextState: SettingsContextType = useMemo(() => {
+    return {
+      showDebugValues: isDevelopment() ? showDebugValues! : false,
+      setShowDebugValues,
+      isErrorBoundaryDebugEnabled: isDevelopment() ? isErrorBoundaryDebugEnabled! : false,
+      setIsErrorBoundaryDebugEnabled,
+      savedAllowedSlippage: savedAllowedSlippage!,
+      setSavedAllowedSlippage,
+      executionFeeBufferBps,
+      setExecutionFeeBufferBps,
+      shouldUseExecutionFeeBuffer,
+      savedAcceptablePriceImpactBuffer: savedAcceptablePriceImpactBuffer!,
+      setSavedAcceptablePriceImpactBuffer,
+      showPnlAfterFees: savedShowPnlAfterFees!,
+      setShowPnlAfterFees: setSavedShowPnlAfterFees,
+      isPnlInLeverage: savedIsPnlInLeverage!,
+      setIsPnlInLeverage: setSavedIsPnlInLeverage,
+      shouldDisableValidationForTesting: savedShouldDisableValidationForTesting!,
+      setShouldDisableValidationForTesting: setSavedShouldDisableValidationForTesting,
+      shouldDisableShareModalPnlCheck: savedShouldDisableShareModalPnlCheck!,
+      setShouldDisableShareModalPnlCheck: setSavedShouldDisableShareModalPnlCheck,
+      shouldShowPositionLines: savedShouldShowPositionLines!,
+      setShouldShowPositionLines: setSavedShouldShowPositionLines,
+      buySellIconsMode: savedBuySellIconsMode!,
+      setBuySellIconsMode: setSavedBuySellIconsModeRaw,
+      isAutoCancelTPSL: savedIsAutoCancelTPSL!,
+      setIsAutoCancelTPSL: setIsAutoCancelTPSL,
+      isLeverageSliderEnabled: isLeverageSliderEnabled!,
+      setIsLeverageSliderEnabled: setIsLeverageSliderEnabled,
+
+      breakdownNetPriceImpactEnabled: savedBreakdownNetPriceImpactEnabled!,
+      setBreakdownNetPriceImpactEnabled: setSavedBreakdownNetPriceImpactEnabled,
+
+      isSetAcceptablePriceImpactEnabled: savedSetAcceptablePriceImpactEnabled!,
+      setIsSetAcceptablePriceImpactEnabled: setSavedSetAcceptablePriceImpactEnabled,
+
+      setTenderlyAccessKey,
+      setTenderlyAccountSlug,
+      setTenderlyProjectSlug,
+      setTenderlySimulationEnabled,
+      tenderlyAccessKey,
+      tenderlyAccountSlug,
+      tenderlyProjectSlug,
+      tenderlySimulationEnabled,
+
+      isSettingsVisible,
+      setIsSettingsVisible,
+
+      expressOrdersEnabled: expressOrdersEnabled! && canSignTypedData,
+      setExpressOrdersEnabled,
+      gasPaymentTokenAddress: gasPaymentTokenAddress!,
+      setGasPaymentTokenAddress,
+      gmxAccountGasPaymentTokenAddress: gmxAccountGasPaymentTokenAddress!,
+      setGmxAccountGasPaymentTokenAddress,
+
+      externalSwapsEnabled: externalSwapsEnabled!,
+      setExternalSwapsEnabled,
+
+      debugSwapMarketsConfig: debugSwapMarketsConfig!,
+      setDebugSwapMarketsConfig,
+
+      settingsWarningDotVisible: settingsWarningDotVisible!,
+      setSettingsWarningDotVisible,
+
+      savedTwapNumberOfParts: savedTwapNumberOfParts!,
+      setSavedTWAPNumberOfParts,
+
+      receiveToGmxAccount: receiveToGmxAccount ?? null,
+      setReceiveToGmxAccount,
+
+      showCloseSizeInTokens: showCloseSizeInTokens!,
+      setShowCloseSizeInTokens,
+
+      chartLinesSizeInTokens: chartLinesSizeInTokens!,
+      setChartLinesSizeInTokens,
+    };
+  }, [
+    showDebugValues,
+    setShowDebugValues,
+    isErrorBoundaryDebugEnabled,
+    setIsErrorBoundaryDebugEnabled,
+    savedAllowedSlippage,
+    setSavedAllowedSlippage,
+    executionFeeBufferBps,
+    setExecutionFeeBufferBps,
+    shouldUseExecutionFeeBuffer,
+    savedAcceptablePriceImpactBuffer,
+    setSavedAcceptablePriceImpactBuffer,
+    savedShowPnlAfterFees,
+    setSavedShowPnlAfterFees,
+    savedIsPnlInLeverage,
+    setSavedIsPnlInLeverage,
+    savedShouldDisableValidationForTesting,
+    setSavedShouldDisableValidationForTesting,
+    savedShouldDisableShareModalPnlCheck,
+    setSavedShouldDisableShareModalPnlCheck,
+    savedShouldShowPositionLines,
+    setSavedShouldShowPositionLines,
+    savedBuySellIconsMode,
+    setSavedBuySellIconsModeRaw,
+    savedIsAutoCancelTPSL,
+    setIsAutoCancelTPSL,
+    isLeverageSliderEnabled,
+    setIsLeverageSliderEnabled,
+    savedBreakdownNetPriceImpactEnabled,
+    setSavedBreakdownNetPriceImpactEnabled,
+    savedSetAcceptablePriceImpactEnabled,
+    setSavedSetAcceptablePriceImpactEnabled,
+    setTenderlyAccessKey,
+    setTenderlyAccountSlug,
+    setTenderlyProjectSlug,
+    setTenderlySimulationEnabled,
+    tenderlyAccessKey,
+    tenderlyAccountSlug,
+    tenderlyProjectSlug,
+    tenderlySimulationEnabled,
+    isSettingsVisible,
+    expressOrdersEnabled,
+    canSignTypedData,
+    setExpressOrdersEnabled,
+    gasPaymentTokenAddress,
+    setGasPaymentTokenAddress,
+    gmxAccountGasPaymentTokenAddress,
+    setGmxAccountGasPaymentTokenAddress,
+    externalSwapsEnabled,
+    setExternalSwapsEnabled,
+    debugSwapMarketsConfig,
+    setDebugSwapMarketsConfig,
+    settingsWarningDotVisible,
+    setSettingsWarningDotVisible,
+    savedTwapNumberOfParts,
+    setSavedTWAPNumberOfParts,
+    receiveToGmxAccount,
+    setReceiveToGmxAccount,
+    showCloseSizeInTokens,
+    setShowCloseSizeInTokens,
+    chartLinesSizeInTokens,
+    setChartLinesSizeInTokens,
+  ]);
+
+  return <SettingsContext.Provider value={contextState}>{children}</SettingsContext.Provider>;
+}

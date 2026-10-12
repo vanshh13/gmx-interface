@@ -1,0 +1,65 @@
+import { usePrivy, useWallets } from "@privy-io/react-auth";
+import { useEffect, useState } from "react";
+import { useAccount } from "wagmi";
+
+import { useConnectModal } from "context/ConnectModalContext/ConnectModalContext";
+import { useAccountStats } from "domain/synthetics/accountStats/useAccountStats";
+import { useChainId } from "lib/chains";
+import useWallet from "lib/wallets/useWallet";
+
+import { userAnalytics } from ".";
+import { ConnectWalletResultEvent } from "./types";
+import { getWalletAnalyticsProvenance } from "./walletProvenance";
+
+export function useWalletConnectedUserAnalyticsEvent() {
+  const [wasConnected, setWasConnected] = useState(false);
+  const [wasSent, setWasSent] = useState(false);
+  const { chainId } = useChainId();
+  const { connectModalOpen } = useConnectModal();
+  const { account } = useWallet();
+  const { connector } = useAccount();
+  const { user } = usePrivy();
+  const { wallets } = useWallets();
+
+  const { data: accountStats } = useAccountStats(chainId, {
+    account,
+    enabled: true,
+  });
+
+  const ordersCount = accountStats?.closedCount;
+
+  useEffect(() => {
+    if (!wasSent && !wasConnected && account && connectModalOpen) {
+      setWasConnected(true);
+    }
+  }, [account, connector, connectModalOpen, wasConnected, wasSent]);
+
+  useEffect(() => {
+    let timeoutId: number;
+
+    if (wasConnected && !wasSent && connector) {
+      const sendEvent = () => {
+        setWasSent(true);
+        userAnalytics.pushEvent<ConnectWalletResultEvent>({
+          event: "ConnectWalletAction",
+          data: {
+            action: "ConnectedSuccessfully",
+            provider: connector.name,
+            ordersCount,
+            ...getWalletAnalyticsProvenance({ account, connectedWallets: wallets, user }),
+          },
+        });
+      };
+
+      if (ordersCount !== undefined) {
+        sendEvent();
+      } else {
+        timeoutId = window.setTimeout(sendEvent, 2000);
+      }
+    }
+
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [account, connector, connectModalOpen, ordersCount, user, wallets, wasConnected, wasSent]);
+}

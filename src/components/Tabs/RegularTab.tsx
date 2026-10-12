@@ -1,0 +1,157 @@
+import cx from "classnames";
+
+import Button from "components/Button/Button";
+import { NoopWrapper } from "components/NoopWrapper/NoopWrapper";
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import { RegularOption } from "./types";
+
+type Props<V extends string | number> = {
+  option: RegularOption<V>;
+  selectedValue: V | undefined;
+  onOptionClick: ((value: V) => void) | undefined;
+  regularOptionClassname?: string;
+  qa?: string;
+  type: "inline" | "block" | "inline-primary" | "underline" | "pill";
+};
+
+export default function RegularTab<V extends string | number>({
+  option,
+  selectedValue,
+  onOptionClick,
+  regularOptionClassname,
+  qa,
+  type,
+}: Props<V>) {
+  const isActive = option.value === selectedValue;
+  const isDisabled = option.disabled;
+  const label = option.label || option.value;
+  const Wrap = isDisabled && option.disabledMessage ? TooltipWithPortal : NoopWrapper;
+
+  const optionClassName = isActive ? option.className?.active : option.className?.regular;
+
+  if (type === "inline-primary") {
+    return (
+      <Wrap content={option.disabledMessage} variant="none">
+        <Button
+          type="button"
+          variant={isActive ? "primary" : "secondary"}
+          onClick={() => !isDisabled && onOptionClick?.(option.value)}
+          key={option.value}
+          data-qa={qa ? `${qa}-tab-${option.value}` : undefined}
+          className={cx(optionClassName, regularOptionClassname, {
+            "cursor-not-allowed opacity-50": isDisabled,
+          })}
+          disabled={isDisabled}
+        >
+          {option.icon}
+          {label}
+        </Button>
+      </Wrap>
+    );
+  }
+
+  if (type === "pill") {
+    return (
+      <Wrap content={option.disabledMessage} variant="none">
+        <button
+          type="button"
+          onClick={() => !isDisabled && onOptionClick?.(option.value)}
+          key={option.value}
+          data-qa={qa ? `${qa}-tab-${option.value}` : undefined}
+          disabled={isDisabled}
+          className={cx(
+            "text-body-medium flex items-center justify-center gap-6 rounded-full border-1/2 px-12 py-6 font-medium transition-colors",
+            optionClassName,
+            regularOptionClassname,
+            {
+              "border-[transparent] bg-button-secondary text-typography-primary": isActive,
+              "border-slate-600 text-typography-secondary hover:border-slate-500 hover:text-typography-primary":
+                !isActive,
+              "cursor-not-allowed opacity-50": isDisabled,
+            }
+          )}
+        >
+          {option.icon}
+          {label}
+        </button>
+      </Wrap>
+    );
+  }
+
+  if (type === "underline") {
+    return (
+      <Wrap content={option.disabledMessage} variant="none">
+        <button
+          type="button"
+          onClick={() => !isDisabled && onOptionClick?.(option.value)}
+          key={option.value}
+          data-qa={qa ? `${qa}-tab-${option.value}` : undefined}
+          disabled={isDisabled}
+          className={cx(
+            `text-body-medium -mb-[0.5px] flex items-center justify-center gap-4 border-b-2 border-b-[transparent] px-6 py-10
+            font-medium hover:text-typography-primary`,
+            optionClassName,
+            regularOptionClassname,
+            {
+              "border-b-blue-300 text-typography-primary": isActive,
+              "text-typography-secondary": !isActive,
+              "cursor-not-allowed opacity-50": isDisabled,
+            }
+          )}
+        >
+          {option.icon}
+          {label}
+        </button>
+      </Wrap>
+    );
+  }
+
+  if (type === "inline") {
+    return (
+      <Wrap content={option.disabledMessage} variant="none">
+        <Button
+          type="button"
+          variant={isActive ? "secondary" : "ghost"}
+          onClick={() => !isDisabled && onOptionClick?.(option.value)}
+          key={option.value}
+          data-qa={qa ? `${qa}-tab-${option.value}` : undefined}
+          className={cx(optionClassName, regularOptionClassname, {
+            "!text-typography-primary": isActive,
+            "cursor-not-allowed opacity-50": isDisabled,
+          })}
+          disabled={isDisabled}
+        >
+          {option.icon}
+          {label}
+        </Button>
+      </Wrap>
+    );
+  }
+
+  return (
+    <Wrap content={option.disabledMessage} variant="none">
+      <button
+        type="button"
+        className={cx(
+          `-mb-[0.5px] flex items-baseline justify-center gap-8 border-b-[2.5px] border-b-[transparent] px-20 pb-9 pt-11 font-medium
+        first:rounded-tl-8 last:rounded-tr-8 hover:text-typography-primary max-smallMobile:px-12`,
+          optionClassName,
+          regularOptionClassname,
+          {
+            "border-b-blue-300 !text-typography-primary": isActive,
+            "text-typography-secondary": !isActive,
+            "cursor-not-allowed opacity-50": isDisabled,
+          }
+        )}
+        onClick={() => !isDisabled && onOptionClick?.(option.value)}
+        key={option.value}
+        data-qa={qa ? `${qa}-tab-${option.value}` : undefined}
+        disabled={isDisabled}
+      >
+        {option.icon}
+        {label}
+      </button>
+    </Wrap>
+  );
+}

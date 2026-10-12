@@ -1,0 +1,68 @@
+.CryptoPriceTicker {
+  border: 1px solid var(--color-slate-700);
+  border-radius: 8px;
+  margin: 1rem 0.75rem 0;
+  padding: 0.75rem;
+}
+
+.CryptoPriceTicker-heading,
+.CryptoPriceTicker-row,
+.CryptoPriceTicker-value {
+  align-items: center;
+  display: flex;
+}
+
+.CryptoPriceTicker-heading {
+  color: var(--color-slate-300);
+  font-size: var(--font-size-body-small);
+  gap: 0.4rem;
+  justify-content: space-between;
+  margin-bottom: 0.55rem;
+  text-transform: uppercase;
+}
+
+.CryptoPriceTicker-dot {
+  background: var(--color-green-500);
+  border-radius: 50%;
+  height: 0.4rem;
+  width: 0.4rem;
+}
+
+.CryptoPriceTicker-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.CryptoPriceTicker-row {
+  font-size: var(--font-size-body-small);
+  justify-content: space-between;
+}
+
+.CryptoPriceTicker-symbol {
+  color: var(--color-slate-300);
+  font-weight: 600;
+}
+
+.CryptoPriceTicker-value {
+  align-items: flex-end;
+  color: var(--color-typography-primary);
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.CryptoPriceTicker-change {
+  font-size: 0.65rem;
+}
+
+.CryptoPriceTicker-change.is-positive {
+  color: var(--color-green-400);
+}
+
+.CryptoPriceTicker-change.is-negative {
+  color: var(--color-red-400);
+}
+
+.CryptoPriceTicker-state {
+  color: var(--color-slate-400);
+  font-size: var(--font-size-body-small);
+}

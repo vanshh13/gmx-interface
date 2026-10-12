@@ -1,0 +1,325 @@
+/// <reference types="vitest" />
+
+import { lingui } from "@lingui/vite-plugin";
+import react from "@vitejs/plugin-react";
+import { execFileSync } from "node:child_process";
+import path from "path";
+import { visualizer } from "rollup-plugin-visualizer";
+import { defineConfig, loadEnv, type ConfigEnv, type PluginOption, type UserConfig } from "vite";
+import { analyzer } from "vite-bundle-analyzer";
+import svgr from "vite-plugin-svgr";
+import tsconfigPaths from "vite-tsconfig-paths";
+import { BREAKPOINTS } from "./src/lib/breakpoints";
+
+const REACT_VENDOR_PACKAGES = new Set([
+  "react",
+  "react-dom",
+  "react-router",
+  "react-router-dom",
+  "scheduler",
+  "use-sync-external-store",
+]);
+
+const WEB3_PACKAGES = new Set([
+  "abitype",
+  "ethers",
+  "isows",
+  "ox",
+  "viem",
+  "@layerzerolabs/lz-v2-utilities",
+  "@stargatefinance/stg-evm-sdk-v2",
+  "@uniswap/sdk-core",
+  "@uniswap/v3-sdk",
+]);
+
+const UI_PACKAGES = new Set([
+  "@floating-ui/dom",
+  "@floating-ui/react",
+  "@floating-ui/utils",
+  "@headlessui/react",
+  "framer-motion",
+  "react-select",
+]);
+
+const UTILITY_VENDOR_PACKAGES = new Set(["@date-fns/tz", "date-fns", "lodash"]);
+const WEB3_SHARED_SCOPES = new Set(["@noble", "@scure"]);
+const UI_SHARED_SCOPES = new Set(["@floating-ui"]);
+
+const APP_SRC_DIR = path.resolve(__dirname, "src");
+const SDK_SRC_DIR = path.resolve(__dirname, "sdk/src");
+const SOLANA_SYSTEM_MODULE_ID = "@solana-program/system";
+const SOLANA_SYSTEM_STUB_ID = "\0gmx:solana-system-stub";
+const PWA_METADATA_PLACEHOLDER = "<!-- gmx-pwa-metadata -->";
+const APP_REDIRECTS = "/ /trade 302\n";
+
+function appRedirects(): PluginOption {
+  return {
+    name: "gmx-app-redirects",
+    apply: "build",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "_redirects",
+        source: APP_REDIRECTS,
+      });
+    },
+  };
+}
+
+function getPwaBuildId(configuredBuildId: string | undefined) {
+  if (configuredBuildId) {
+    return configuredBuildId;
+  }
+
+  const commitTimestamp = execFileSync("git", ["show", "-s", "--format=%ct", "HEAD"], { encoding: "utf8" }).trim();
+
+  // Preserve ordering with the millisecond build IDs used by existing installs.
+  return `${commitTimestamp}000`;
+}
+
+function pwaMetadata(buildId: string, isEnabled: boolean): PluginOption {
+  return {
+    name: "gmx-pwa-metadata",
+    transformIndexHtml(html) {
+      const metadata = [
+        `<meta name="gmx-pwa-build-id" content="${buildId}" />`,
+        isEnabled ? '<meta name="gmx-pwa-enabled" content="true" />' : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n    ");
+
+      return html.replace(PWA_METADATA_PLACEHOLDER, metadata);
+    },
+  };
+}
+
+function normalizePath(id: string) {
+  return id.replace(/\\/g, "/");
+}
+
+function getPackageNameFromPath(pathAfterNodeModules: string) {
+  const [firstPart, secondPart] = pathAfterNodeModules.split("/");
+
+  if (!firstPart) {
+    return undefined;
+  }
+
+  return firstPart.startsWith("@") ? `${firstPart}/${secondPart}` : firstPart;
+}
+
+function getPackageNames(normalizedId: string) {
+  return normalizedId
+    .split("/node_modules/")
+    .slice(1)
+    .map(getPackageNameFromPath)
+    .filter((packageName): packageName is string => Boolean(packageName));
+}
+
+function getPackageScope(packageName: string) {
+  return packageName.startsWith("@") ? packageName.split("/")[0] : undefined;
+}
+
+function isSharedWeb3Package(packageName: string) {
+  const packageScope = getPackageScope(packageName);
+  return Boolean(packageScope && WEB3_SHARED_SCOPES.has(packageScope));
+}
+
+function isUiPackage(packageName: string) {
+  const packageScope = getPackageScope(packageName);
+  return UI_PACKAGES.has(packageName) || Boolean(packageScope && UI_SHARED_SCOPES.has(packageScope));
+}
+
+function manualChunks(id: string) {
+  const normalizedId = normalizePath(id);
+  // Keep startup recovery independent of vendor chunks that can fail to load.
+  if (normalizedId === "\0vite/preload-helper.js") {
+    return "preload-helper";
+  }
+
+  const packageNames = getPackageNames(normalizedId);
+  const packageName = packageNames.at(-1);
+
+  if (!packageName) {
+    return undefined;
+  }
+
+  if (isSharedWeb3Package(packageName)) {
+    return "web3";
+  }
+
+  if (isUiPackage(packageName)) {
+    return "ui";
+  }
+
+  if (REACT_VENDOR_PACKAGES.has(packageName)) {
+    return "react-vendor";
+  }
+
+  if (WEB3_PACKAGES.has(packageName)) {
+    return "web3";
+  }
+
+  if (UTILITY_VENDOR_PACKAGES.has(packageName)) {
+    return "utility-vendor";
+  }
+
+  if (packageName === "recharts") {
+    return "charts";
+  }
+
+  if (isUiPackage(packageName)) {
+    return "ui";
+  }
+
+  return undefined;
+}
+
+// sdk/node_modules has its own copies of these; bundling both breaks instanceof checks (e.g. ContractFunctionRevertedError)
+const SDK_DEDUPED_PACKAGES = ["viem"];
+
+function isSdkDedupedSource(source: string) {
+  return SDK_DEDUPED_PACKAGES.some((packageName) => source === packageName || source.startsWith(`${packageName}/`));
+}
+
+function sdkDedupe(): PluginOption {
+  const normalizedSdkSrcDir = normalizePath(SDK_SRC_DIR);
+  const appResolverImporter = path.join(APP_SRC_DIR, "__sdk-dedupe.ts");
+
+  return {
+    name: "gmx-sdk-dedupe",
+    enforce: "pre",
+    async resolveId(source, importer, options) {
+      if (!importer || !isSdkDedupedSource(source)) {
+        return null;
+      }
+
+      const normalizedImporter = normalizePath(importer);
+
+      if (!normalizedImporter.includes(`${normalizedSdkSrcDir}/`)) {
+        return null;
+      }
+
+      return this.resolve(source, appResolverImporter, {
+        ...options,
+        skipSelf: true,
+      });
+    },
+  };
+}
+
+function optionalSolanaSystemStub(): PluginOption {
+  return {
+    name: "gmx-optional-solana-system-stub",
+    enforce: "pre",
+    resolveId(source) {
+      if (source === SOLANA_SYSTEM_MODULE_ID) {
+        return SOLANA_SYSTEM_STUB_ID;
+      }
+
+      return null;
+    },
+    load(id) {
+      if (id !== SOLANA_SYSTEM_STUB_ID) {
+        return null;
+      }
+
+      return `
+        export function getTransferSolInstruction() {
+          throw new Error("${SOLANA_SYSTEM_MODULE_ID} is not bundled in the GMX ethereum-only build.");
+        }
+      `;
+    },
+  };
+}
+
+export function createViteConfig(
+  { mode }: ConfigEnv,
+  { emitAppRedirects = true }: { emitAppRedirects?: boolean } = {}
+): UserConfig {
+  const env = loadEnv(mode, process.cwd(), "");
+  const pwaBuildId = getPwaBuildId(env.VITE_APP_PWA_GENERATION);
+
+  const pwaGeneration = Number(pwaBuildId);
+  if (!/^\d+$/.test(pwaBuildId) || !Number.isSafeInteger(pwaGeneration) || pwaGeneration <= 0) {
+    throw new Error("VITE_APP_PWA_GENERATION must be a positive integer");
+  }
+
+  return {
+    worker: {
+      format: "es",
+    },
+    optimizeDeps: {
+      esbuildOptions: {
+        target: "es2020",
+      },
+    },
+    css: {
+      preprocessorOptions: {
+        scss: {
+          additionalData: `
+            $screen-md: ${BREAKPOINTS.mobile}px;
+            $screen-lg: ${BREAKPOINTS.tablet}px;
+            $screen-xl: ${BREAKPOINTS.desktop}px;
+            $screen-sm: ${BREAKPOINTS.smallMobile}px;
+          `,
+        },
+      },
+    },
+    plugins: [
+      emitAppRedirects && appRedirects(),
+      pwaMetadata(pwaBuildId, env.VITE_APP_DISABLE_PWA !== "true"),
+      svgr({
+        include: "**/*.svg?react",
+      }),
+      optionalSolanaSystemStub(),
+      sdkDedupe(),
+      tsconfigPaths(),
+      react({
+        babel: {
+          plugins: ["macros"],
+        },
+      }),
+      lingui(),
+      visualizer() as PluginOption,
+      mode === "analyze" && analyzer(),
+    ],
+    resolve: {
+      alias: {
+        App: path.resolve(__dirname, "src/App"),
+        components: path.resolve(__dirname, "src/components"),
+        config: path.resolve(__dirname, "src/config"),
+        context: path.resolve(__dirname, "src/context"),
+        domain: path.resolve(__dirname, "src/domain"),
+        fonts: path.resolve(__dirname, "src/fonts"),
+        img: path.resolve(__dirname, "src/img"),
+        lib: path.resolve(__dirname, "src/lib"),
+        ab: path.resolve(__dirname, "src/ab"),
+        locales: path.resolve(__dirname, "src/locales"),
+        pages: path.resolve(__dirname, "src/pages"),
+        styles: path.resolve(__dirname, "src/styles"),
+        prebuilt: path.resolve(__dirname, "src/prebuilt"),
+        sdk: path.resolve(__dirname, "sdk/src"),
+      },
+    },
+    build: {
+      assetsInlineLimit: 0,
+      outDir: "build",
+      sourcemap: true,
+      // WebKit can retain failed modulepreloads across reloads: https://bugs.webkit.org/show_bug.cgi?id=270357
+      modulePreload: false,
+      rollupOptions: {
+        output: {
+          manualChunks,
+        },
+      },
+    },
+    test: {
+      environment: "happy-dom",
+      globalSetup: "./vitest.global-setup.js",
+      exclude: ["./autotests", "node_modules", "./sdk", "./.claude", "**/*.ct.spec.tsx"],
+      setupFiles: ["./src/lib/polyfills.ts", "@vitest/web-worker"],
+    },
+  };
+}
+
+export default defineConfig((props) => createViteConfig(props));

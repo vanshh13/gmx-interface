@@ -1,0 +1,202 @@
+import cx from "classnames";
+import { AnimatePresence, Variants, motion } from "framer-motion";
+import React, { PropsWithChildren, ReactNode, useCallback, useEffect, useMemo, useRef } from "react";
+import { RemoveScroll } from "react-remove-scroll";
+
+import { useBlockAutoReload } from "lib/pwa/blockAutoReload";
+import { PRIVY_DIALOG_SCROLL_SHARDS } from "lib/wallets/privyUiCompat";
+
+import { ActiveFormScope } from "components/ActiveFormScope/ActiveFormScope";
+import Button from "components/Button/Button";
+import ErrorBoundary from "components/Errors/ErrorBoundary";
+
+import ChevronLeftIcon from "img/ic_chevron_left.svg?react";
+import CloseIcon from "img/ic_close.svg?react";
+
+import "./Modal.css";
+
+const FADE_VARIANTS: Variants = {
+  hidden: { opacity: 0, pointerEvents: "none" },
+  visible: { opacity: 1, pointerEvents: "auto" },
+};
+
+const VISIBLE_STYLES: React.CSSProperties = {
+  overflow: "hidden",
+  position: "fixed",
+};
+
+const HIDDEN_STYLES: React.CSSProperties = {
+  overflow: "visible",
+  position: "fixed",
+};
+
+export const MODAL_ANIMATION_DURATION_MS = 200;
+
+const TRANSITION = { duration: MODAL_ANIMATION_DURATION_MS / 1000 };
+
+export type ModalProps = PropsWithChildren<{
+  className?: string;
+  isVisible?: boolean;
+  setIsVisible: (isVisible: boolean) => void;
+  zIndex?: number;
+  label?: React.ReactNode;
+  onBack?: () => void;
+  headerContent?: React.ReactNode;
+  footerContent?: ReactNode;
+  onAfterOpen?: () => void;
+  /**
+   * If false, you need to add padding and spacing to the children yourself.
+   */
+  contentPadding?: boolean;
+  qa?: string;
+  contentClassName?: string;
+  disableOverflowHandling?: boolean;
+  withMobileBottomPosition?: boolean;
+  takeFullHeight?: boolean;
+  hideHeaderBorder?: boolean;
+  activeFormId?: string;
+}>;
+
+export default function Modal({
+  className,
+  isVisible,
+  label,
+  onBack,
+  zIndex,
+  children,
+  headerContent,
+  footerContent,
+  contentPadding = true,
+  onAfterOpen,
+  setIsVisible,
+  qa,
+  contentClassName,
+  disableOverflowHandling = false,
+  withMobileBottomPosition = false,
+  takeFullHeight = false,
+  hideHeaderBorder = false,
+  activeFormId,
+}: ModalProps) {
+  const modalRef = useRef<HTMLDivElement | null>(null);
+
+  useBlockAutoReload(Boolean(isVisible));
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    function close(e: KeyboardEvent) {
+      if (e.keyCode === 27 && setIsVisible) {
+        setIsVisible(false);
+      }
+    }
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [isVisible, setIsVisible]);
+
+  useEffect(() => {
+    if (typeof onAfterOpen === "function") onAfterOpen();
+  }, [onAfterOpen]);
+
+  useEffect(
+    function blurOutsideOnVisible() {
+      if (isVisible) {
+        const focusedElement = document.activeElement;
+        const isNotBody = !document.body.isSameNode(focusedElement);
+        const isOutside = !modalRef.current?.contains(focusedElement);
+
+        if (focusedElement && isNotBody && isOutside) {
+          (focusedElement as HTMLElement).blur();
+        }
+      }
+    },
+    [isVisible]
+  );
+
+  const modalStyle = useMemo(() => ({ zIndex }), [zIndex]);
+
+  const stopPropagation = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+  }, []);
+
+  const body = (
+    <ErrorBoundary id="Modal" variant="block" wrapperClassName="rounded-t-8">
+      {disableOverflowHandling ? (
+        children
+      ) : (
+        <div className={cx("overflow-auto", { "flex grow flex-col": takeFullHeight })}>
+          <div
+            className={cx("Modal-body", {
+              "px-adaptive": contentPadding,
+              "pb-adaptive": contentPadding && !footerContent,
+              "flex grow flex-col": takeFullHeight,
+            })}
+          >
+            {children}
+          </div>
+        </div>
+      )}
+      {footerContent && <div className="border-t-1/2 border-slate-600 px-adaptive py-16">{footerContent}</div>}
+    </ErrorBoundary>
+  );
+
+  return (
+    <AnimatePresence>
+      {isVisible && (
+        <RemoveScroll shards={PRIVY_DIALOG_SCROLL_SHARDS}>
+          <motion.div
+            className={cx("Modal", className, { "max-md:!items-end": withMobileBottomPosition })}
+            ref={modalRef}
+            style={modalStyle}
+            initial="hidden"
+            animate="visible"
+            exit="hidden"
+            variants={FADE_VARIANTS}
+            transition={TRANSITION}
+          >
+            <div
+              className="Modal-backdrop"
+              style={isVisible ? VISIBLE_STYLES : HIDDEN_STYLES}
+              onClick={() => setIsVisible(false)}
+            />
+
+            <div
+              className={cx(
+                "Modal-content flex flex-col",
+                {
+                  "gap-16": contentPadding,
+                  "max-md:w-full max-md:!rounded-t-0": withMobileBottomPosition,
+                },
+                contentClassName
+              )}
+              onClick={stopPropagation}
+              data-qa={qa}
+            >
+              <div
+                className={cx(
+                  "Modal-header-wrapper flex flex-col gap-8 px-adaptive pb-12 pt-adaptive",
+                  hideHeaderBorder ? "" : "border-b-1/2 border-slate-600"
+                )}
+              >
+                <div className="Modal-title-bar h-28">
+                  <div className="Modal-title-group">
+                    {onBack && (
+                      <Button variant="ghost" size="small" className="px-8" onClick={onBack} aria-label="Back">
+                        <ChevronLeftIcon className="size-16" />
+                      </Button>
+                    )}
+                    <div className="Modal-title font-medium text-typography-primary">{label}</div>
+                  </div>
+                  <div className="Modal-close-button" onClick={() => setIsVisible(false)}>
+                    <CloseIcon className="Modal-close-icon size-20" />
+                  </div>
+                </div>
+                {headerContent}
+              </div>
+              {activeFormId ? <ActiveFormScope formId={activeFormId}>{body}</ActiveFormScope> : body}
+            </div>
+          </motion.div>
+        </RemoveScroll>
+      )}
+    </AnimatePresence>
+  );
+}

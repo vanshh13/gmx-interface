@@ -1,0 +1,381 @@
+import { Chain, createPublicClient, http } from "viem";
+
+import { type AnyChainId, getViemChain, type ContractsChainId } from "config/chains";
+import { isWebWorker } from "config/env";
+import { getProviderNameFromUrl } from "config/rpc";
+import { emitReportEndpointFailure } from "lib/FallbackTracker/events";
+import { withFallback } from "lib/FallbackTracker/withFallback";
+import type {
+  MulticallErrorEvent,
+  MulticallRequestCounter,
+  MulticallRequestTiming,
+  MulticallTimeoutEvent,
+} from "lib/metrics";
+import { emitMetricCounter, emitMetricEvent, emitMetricTiming } from "lib/metrics/emitMetricEvent";
+import type { MulticallError, MulticallRequestConfig, MulticallResult } from "lib/multicall/types";
+import { CurrentRpcEndpoints } from "lib/rpc/RpcTracker";
+import { sleepWithSignal } from "lib/sleep";
+import { AbiId, abis as allAbis } from "sdk/abis";
+import { BATCH_CONFIGS } from "sdk/configs/batch";
+
+import { _debugMulticall, type MulticallDebugEventType, type MulticallDebugState } from "./_debug";
+
+export const MAX_PRIMARY_TIMEOUT = 20_000;
+
+export class Multicall {
+  static instances: {
+    [chainId: number]: Multicall | undefined;
+  } = {};
+
+  static async getInstance(chainId: AnyChainId, abFlags: Record<string, boolean>) {
+    let instance = Multicall.instances[chainId];
+
+    if (!instance || instance.chainId !== chainId) {
+      instance = new Multicall(chainId, abFlags);
+
+      Multicall.instances[chainId] = instance;
+    }
+
+    return instance;
+  }
+
+  static getViemClient(chainId: number, rpcUrl: string) {
+    return createPublicClient({
+      transport: http(rpcUrl, {
+        // retries works strangely in viem, so we disable them
+        retryCount: 0,
+        retryDelay: 10000000,
+        batch: BATCH_CONFIGS[chainId as ContractsChainId].http,
+        timeout: MAX_PRIMARY_TIMEOUT,
+      }),
+      pollingInterval: undefined,
+      batch: BATCH_CONFIGS[chainId as ContractsChainId].client,
+      chain: getViemChain(chainId) as Chain,
+    });
+  }
+
+  getClient: (options?: { forceFallback?: boolean }) => ReturnType<typeof Multicall.getViemClient>;
+
+  constructor(
+    public chainId: AnyChainId,
+    private abFlags: Record<string, boolean>
+  ) {}
+
+  async call(
+    providerUrls: CurrentRpcEndpoints,
+    request: MulticallRequestConfig<any>,
+    isLargeAccount: boolean,
+    debugState?: MulticallDebugState
+  ) {
+    const originalKeys: {
+      contractKey: string;
+      callKey: string;
+    }[] = [];
+
+    const abiWithErrorsMap: Partial<Record<AbiId, any>> = {};
+
+    const encodedPayload: { address: string; abi: any; functionName: string; args: any }[] = [];
+
+    const batchedIndexes: number[] = [];
+    const standaloneIndexes: number[] = [];
+
+    const contractKeys = Object.keys(request);
+
+    contractKeys.forEach((contractKey) => {
+      const contractCallConfig = request[contractKey];
+
+      if (!contractCallConfig) {
+        return;
+      }
+
+      Object.keys(contractCallConfig.calls).forEach((callKey) => {
+        const call = contractCallConfig.calls[callKey];
+
+        if (!call) {
+          return;
+        }
+
+        // Add Errors ABI to each contract ABI to correctly parse errors
+        if (!abiWithErrorsMap[contractCallConfig.abiId]) {
+          abiWithErrorsMap[contractCallConfig.abiId] = [
+            ...(allAbis[contractCallConfig.abiId] as any),
+            ...(allAbis.CustomErrors as any),
+          ];
+        }
+
+        const abi = abiWithErrorsMap[contractCallConfig.abiId];
+
+        originalKeys.push({
+          contractKey,
+          callKey,
+        });
+
+        (call.standalone ? standaloneIndexes : batchedIndexes).push(encodedPayload.length);
+
+        encodedPayload.push({
+          address: contractCallConfig.contractAddress,
+          functionName: call.methodName,
+          args: call.params,
+          abi,
+        });
+      });
+    });
+
+    const providerUrl = providerUrls.primary;
+
+    const sendCounterEvent = (
+      event: "call" | "timeout" | "error",
+      { requestType, rpcProvider }: { requestType: "initial" | "retry"; rpcProvider: string }
+    ) => {
+      emitMetricCounter<MulticallRequestCounter>({
+        event: `multicall.request.${event}`,
+        data: {
+          chainId: this.chainId,
+          isInMainThread: !isWebWorker,
+          requestType,
+          rpcProvider,
+          isLargeAccount,
+        },
+      });
+    };
+
+    const sendTiming = ({
+      time,
+      requestType,
+      rpcProvider,
+    }: {
+      time: number;
+      requestType: "initial" | "retry";
+      rpcProvider: string;
+    }) => {
+      emitMetricTiming<MulticallRequestTiming>({
+        event: "multicall.request.timing",
+        time,
+        data: {
+          chainId: this.chainId,
+          requestType,
+          rpcProvider,
+          isLargeAccount,
+        },
+      });
+    };
+
+    const sendDebugEvent = (type: MulticallDebugEventType, options: { providerUrl: string; error?: Error }) => {
+      _debugMulticall?.dispatchEvent({
+        type,
+        isInWorker: isWebWorker,
+        chainId: this.chainId,
+        providerUrl: options.providerUrl,
+        error: options.error,
+      });
+    };
+
+    type MulticallResponseItem =
+      | { status: "success"; result: unknown; error?: undefined }
+      | { status: "failure"; error: Error; result?: undefined };
+
+    const processResponse = (response: readonly MulticallResponseItem[]) => {
+      const multicallResult: MulticallResult<any> = {
+        success: true,
+        errors: {},
+        data: {},
+      };
+
+      response.forEach((item, i) => {
+        const { contractKey, callKey } = originalKeys[i];
+
+        if (item.status === "success") {
+          const { result } = item;
+          const values = Array.isArray(result) || (typeof result === "object" && result !== null) ? result : [result];
+
+          multicallResult.data[contractKey] = multicallResult.data[contractKey] || {};
+          multicallResult.data[contractKey][callKey] = {
+            contractKey,
+            callKey,
+            returnValues: values,
+            success: true,
+          };
+        } else {
+          multicallResult.success = false;
+          const { error } = item;
+
+          multicallResult.errors[contractKey] = multicallResult.errors[contractKey] || {};
+          multicallResult.errors[contractKey][callKey] = error as unknown as MulticallError;
+
+          multicallResult.data[contractKey] = multicallResult.data[contractKey] || {};
+          multicallResult.data[contractKey][callKey] = {
+            contractKey,
+            callKey,
+            returnValues: [],
+            success: false,
+            error: error.message,
+          };
+        }
+      });
+
+      return multicallResult;
+    };
+
+    return withFallback({
+      endpoints: [providerUrl, ...providerUrls.fallbacks],
+      fn: async (providerUrl: string, { isLastAttempt }) => {
+        const isFallback = providerUrl !== providerUrls.primary;
+
+        const rpcProviderName = getProviderNameFromUrl(providerUrl);
+
+        sendDebugEvent(isFallback ? "fallback-start" : "primary-start", { providerUrl });
+
+        sendCounterEvent("call", {
+          requestType: isFallback ? "retry" : "initial",
+          rpcProvider: rpcProviderName,
+        });
+
+        const client = Multicall.getViemClient(this.chainId, providerUrl);
+
+        const durationStart = performance.now();
+
+        const debugShouldTimeout = !isFallback && isWebWorker && debugState?.triggerPrimaryTimeoutInWorker;
+
+        const timeoutController = new AbortController();
+
+        const batchSize =
+          typeof BATCH_CONFIGS[this.chainId]?.client?.multicall === "object"
+            ? (BATCH_CONFIGS[this.chainId].client!.multicall as { batchSize?: number }).batchSize
+            : undefined;
+
+        const executeCalls = async () => {
+          const response: MulticallResponseItem[] = new Array(encodedPayload.length);
+
+          await Promise.all([
+            batchedIndexes.length
+              ? client
+                  .multicall({
+                    contracts: batchedIndexes.map((index) => encodedPayload[index]) as any,
+                    batchSize,
+                  })
+                  .then((results) => {
+                    results.forEach((item, i) => {
+                      response[batchedIndexes[i]] = item as MulticallResponseItem;
+                    });
+                  })
+              : undefined,
+            ...standaloneIndexes.map((index) =>
+              client
+                .multicall({
+                  contracts: [encodedPayload[index]] as any,
+                  batchSize,
+                })
+                .then(([item]) => {
+                  response[index] = item as MulticallResponseItem;
+                })
+            ),
+          ]);
+
+          return response;
+        };
+
+        return await Promise.race([
+          sleepWithSignal(debugShouldTimeout ? 100 : MAX_PRIMARY_TIMEOUT, timeoutController.signal).then(() => {
+            sendDebugEvent("primary-timeout", { providerUrl });
+
+            emitReportEndpointFailure({
+              endpoint: providerUrl,
+              trackerKey: providerUrls.trackerKey,
+            });
+
+            sendCounterEvent("timeout", {
+              requestType: isFallback ? "retry" : "initial",
+              rpcProvider: rpcProviderName,
+            });
+
+            if (isLastAttempt) {
+              emitMetricEvent<MulticallTimeoutEvent>({
+                event: "multicall.timeout",
+                isError: true,
+                data: {
+                  metricType: "rpcTimeout",
+                  isInMainThread: !isWebWorker,
+                  requestType: isFallback ? "retry" : "initial",
+                  rpcProvider: rpcProviderName,
+                  errorMessage: "multicall timeout",
+                },
+              });
+            }
+
+            return Promise.reject(new Error("multicall timeout"));
+          }),
+          executeCalls(),
+        ])
+          .then((response) => {
+            timeoutController.abort();
+
+            sendTiming({
+              time: Math.round(performance.now() - durationStart),
+              requestType: isFallback ? "retry" : "initial",
+              rpcProvider: rpcProviderName,
+            });
+
+            const debugShouldFail = Boolean(
+              !isFallback &&
+                ((isWebWorker && debugState?.triggerPrimaryAsFailedInWorker) ||
+                  (!isWebWorker && debugState?.triggerPrimaryAsFailedInMainThread))
+            );
+
+            if (debugShouldFail) {
+              throw new Error("Debug trigger: primary failed");
+            }
+
+            sendDebugEvent(isFallback ? "fallback-success" : "primary-success", { providerUrl });
+
+            const processed = processResponse(response);
+
+            if (processed.success) {
+              return processed;
+            } else {
+              throw new Error("Multicall failed");
+            }
+          })
+          .catch((_viemError) => {
+            const e = new Error(_viemError.message.slice(0, 150));
+            // eslint-disable-next-line no-console
+            console.groupCollapsed("multicall error:");
+            // eslint-disable-next-line no-console
+            console.error(e);
+            // eslint-disable-next-line no-console
+            console.groupEnd();
+
+            const isTimeoutError = _viemError.message === "multicall timeout";
+
+            if (!isTimeoutError) {
+              if (isLastAttempt) {
+                emitMetricEvent<MulticallErrorEvent>({
+                  event: "multicall.error",
+                  isError: true,
+                  data: {
+                    requestType: isFallback ? "retry" : "initial",
+                    rpcProvider: rpcProviderName,
+                    isInMainThread: !isWebWorker,
+                    errorMessage: _viemError.message,
+                  },
+                });
+              }
+
+              sendCounterEvent("error", {
+                requestType: isFallback ? "retry" : "initial",
+                rpcProvider: rpcProviderName,
+              });
+            }
+
+            sendDebugEvent(isFallback ? "fallback-failed" : "primary-failed", { providerUrl });
+
+            emitReportEndpointFailure({
+              endpoint: providerUrl,
+              trackerKey: providerUrls.trackerKey,
+            });
+
+            throw e;
+          });
+      },
+    });
+  }
+}

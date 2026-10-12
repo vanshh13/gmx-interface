@@ -1,0 +1,906 @@
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { useCallback, useMemo, useRef, useState } from "react";
+import Skeleton from "react-loading-skeleton";
+import { useIntersection } from "react-use";
+
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { usePositionsConstants } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import { selectChainId, selectUserReferralInfo } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import {
+  selectBreakdownNetPriceImpactEnabled,
+  selectShowPnlAfterFees,
+} from "context/SyntheticsStateContext/selectors/settingsSelectors";
+import { makeSelectMarketPriceDecimals } from "context/SyntheticsStateContext/selectors/statsSelectors";
+import { selectTradeboxSelectedPositionKey } from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { getBorrowingFeeRateUsd, getFundingFeeRateUsd } from "domain/synthetics/fees";
+import { OFF_HOURS_DOCS_URL } from "domain/synthetics/markets";
+import {
+  PositionInfo,
+  formatEstimatedLiquidationTime,
+  getEstimatedLiquidationTimeInHours,
+  getPositionOffHoursLiqRisk,
+} from "domain/synthetics/positions";
+import { TradeMode } from "domain/synthetics/trade";
+import { CHART_PERIODS } from "lib/legacy";
+import { formatBalanceAmount, formatPriceImpactBps } from "lib/numbers";
+import { getPositiveOrNegativeClass } from "lib/utils";
+import { getTokenVisualMultiplier } from "sdk/configs/tokens";
+import { getMarketIndexName } from "sdk/utils/markets";
+
+import { AmountWithUsdBalance } from "components/AmountWithUsd/AmountWithUsd";
+import { AppCard, AppCardSection } from "components/AppCard/AppCard";
+import Button from "components/Button/Button";
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import { DeltaUsdValue } from "components/NumericValue/DeltaUsdValue";
+import { LeverageValue } from "components/NumericValue/LeverageValue";
+import { LiquidationPriceValue } from "components/NumericValue/LiquidationPriceValue";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import PositionDropdown from "components/PositionDropdown/PositionDropdown";
+import StatsTooltipRow from "components/StatsTooltip/StatsTooltipRow";
+import { TableTd, TableTr } from "components/Table/Table";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import EditIcon from "img/ic_edit.svg?react";
+import NewLinkThinIcon from "img/ic_new_link_thin.svg?react";
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+import { PositionItemOrdersLarge, PositionItemOrdersSmall } from "./PositionItemOrders";
+import { PositionItemTPSLCell } from "./PositionItemTPSLCell";
+import { OrdersModal } from "../OrdersModal/OrdersModal";
+
+import "./PositionItem.scss";
+
+export type Props = {
+  position: PositionInfo;
+  hideActions?: boolean;
+  showPnlAfterFees: boolean;
+  onClosePositionClick?: () => void;
+  onEditCollateralClick?: () => void;
+  onShareClick?: () => void;
+  onSelectPositionClick?: (tradeMode?: TradeMode, showCurtain?: boolean) => void;
+  isLarge: boolean;
+  onOrdersClick?: (key?: string) => void;
+  onViewPositionHistory?: () => void;
+  onCancelOrder?: (orderKey: string) => void;
+  hideOrderActions?: boolean;
+};
+
+export function PositionItem(p: Props) {
+  const { showDebugValues } = useSettings();
+  const savedShowPnlAfterFees = useSelector(selectShowPnlAfterFees);
+  const breakdownNetPriceImpactEnabled = useSelector(selectBreakdownNetPriceImpactEnabled);
+  const displayedNetValue = savedShowPnlAfterFees ? p.position.netValueAfterAllFees : p.position.netValue;
+  const displayedPnl = savedShowPnlAfterFees ? p.position.pnlAfterAllFees : p.position.pnl;
+  const displayedPnlPercentage = savedShowPnlAfterFees
+    ? p.position.pnlAfterAllFeesPercentage
+    : p.position.pnlPercentage;
+  const { minCollateralUsd } = usePositionsConstants();
+  const tradeboxSelectedPositionKey = useSelector(selectTradeboxSelectedPositionKey);
+  const isCurrentMarket = tradeboxSelectedPositionKey === p.position.key;
+  const chainId = useSelector(selectChainId);
+  const userReferralInfo = useSelector(selectUserReferralInfo);
+  const [showSizeInTokens, setShowSizeInTokens] = useState(false);
+  const [isTPSLModalVisible, setIsTPSLModalVisible] = useState(false);
+  const [tpslInitialView, setTpslInitialView] = useState<"list" | "add">("list");
+  const isActionsDisabled = p.position.isOpening;
+  const isCloseDisabled = isActionsDisabled || p.position.sizeInUsd == 0n;
+
+  const topSentinelRef = useRef<HTMLDivElement>(null);
+  const closeSentinelRef = useRef<HTMLDivElement>(null);
+
+  const topEntry = useIntersection(topSentinelRef, { threshold: 0, rootMargin: "0px 0px -104px 0px" });
+  const closeEntry = useIntersection(closeSentinelRef, { threshold: 0 });
+
+  const isCardTopVisible = topEntry ? topEntry.isIntersecting || topEntry.boundingClientRect.top < 0 : false;
+  const isCloseStuck = closeEntry ? !closeEntry.isIntersecting : false;
+
+  const marketDecimals = useSelector(makeSelectMarketPriceDecimals(p.position.market.indexTokenAddress));
+  const indexTokenVisualMultiplier = BigInt(p.position.indexToken.visualMultiplier ?? 1);
+  const indexTokenDisplaySymbol = `${getTokenVisualMultiplier(p.position.indexToken)}${p.position.indexToken.symbol}`;
+
+  const handleSizeClick = useCallback(() => {
+    setShowSizeInTokens((prev) => !prev);
+  }, []);
+
+  const handleOpenTPSLModal = useCallback(() => {
+    setTpslInitialView("list");
+    setIsTPSLModalVisible(true);
+  }, []);
+
+  const handleOpenAddTPSLModal = useCallback(() => {
+    setTpslInitialView("add");
+    setIsTPSLModalVisible(true);
+  }, []);
+
+  function renderPriceImpactRow(label: string, priceImpactUsd: bigint) {
+    const priceImpactBps = formatPriceImpactBps(priceImpactUsd, p.position.sizeInUsd);
+
+    return (
+      <StatsTooltipRow
+        label={label}
+        labelClassName="text-balance text-typography-secondary"
+        value={
+          <>
+            <DeltaUsdValue deltaUsd={priceImpactUsd} fallback="..." />
+            {priceImpactBps ? ` (${priceImpactBps})` : null}
+          </>
+        }
+        valueClassName="numbers"
+        showDollar={false}
+        textClassName={getPositiveOrNegativeClass(priceImpactUsd)}
+      />
+    );
+  }
+
+  function renderNetValue() {
+    return (
+      <TooltipWithPortal
+        handle={<UsdValue usd={displayedNetValue} />}
+        handleClassName="numbers"
+        position={p.isLarge ? "bottom-start" : "bottom-end"}
+        renderContent={() => (
+          <div>
+            {savedShowPnlAfterFees ? (
+              <Trans>Position value after PnL and all fees</Trans>
+            ) : (
+              <Trans>Position value after PnL and accrued fees</Trans>
+            )}
+            <br />
+            <br />
+            <StatsTooltipRow
+              label={t`Margin before borrow/funding`}
+              value={<UsdValue usd={p.position.collateralUsd} fallback="..." />}
+              valueClassName="numbers"
+              showDollar={false}
+            />
+            <StatsTooltipRow
+              label={t`PnL`}
+              value={<DeltaUsdValue deltaUsd={p.position?.pnl} fallback="..." />}
+              valueClassName="numbers"
+              showDollar={false}
+              textClassName={getPositiveOrNegativeClass(p.position.pnl)}
+            />
+            <StatsTooltipRow
+              label={t`Borrow fee`}
+              value={<UsdValue usd={-p.position.pendingBorrowingFeesUsd} fallback="..." />}
+              valueClassName="numbers"
+              showDollar={false}
+              textClassName={cx({
+                "text-red-500": p.position.pendingBorrowingFeesUsd !== 0n,
+              })}
+            />
+            <StatsTooltipRow
+              label={t`Negative funding fee`}
+              value={<UsdValue usd={-p.position.pendingFundingFeesUsd} fallback="..." />}
+              valueClassName="numbers"
+              showDollar={false}
+              textClassName={cx({
+                "text-red-500": p.position.pendingFundingFeesUsd !== 0n,
+              })}
+            />
+            {savedShowPnlAfterFees && (
+              <>
+                {breakdownNetPriceImpactEnabled && (
+                  <>
+                    {renderPriceImpactRow(t`Stored price impact`, p.position.pendingImpactUsd)}
+                    {renderPriceImpactRow(t`Close price impact`, p.position.closePriceImpactDeltaUsd)}
+                  </>
+                )}
+                {renderPriceImpactRow(t`Net price impact (open + close)`, p.position.netPriceImapctDeltaUsd)}
+                <StatsTooltipRow
+                  label={t`Close fee`}
+                  value={<UsdValue usd={-p.position.closingFeeUsd} fallback="..." />}
+                  valueClassName="numbers"
+                  showDollar={false}
+                  textClassName={cx({
+                    "text-red-500": p.position.closingFeeUsd !== 0n,
+                  })}
+                />
+              </>
+            )}
+          </div>
+        )}
+      />
+    );
+  }
+
+  const { fundingFeeRateUsd, borrowingFeeRateUsd } = useMemo(() => {
+    if (!p.position.marketInfo) {
+      return {
+        fundingFeeRateUsd: undefined,
+        borrowingFeeRateUsd: undefined,
+      };
+    }
+
+    return {
+      fundingFeeRateUsd: getFundingFeeRateUsd(
+        p.position.marketInfo,
+        p.position.isLong,
+        p.position.sizeInUsd,
+        BigInt(CHART_PERIODS["1d"])
+      ),
+      borrowingFeeRateUsd: getBorrowingFeeRateUsd(
+        p.position.marketInfo,
+        p.position.isLong,
+        p.position.sizeInUsd,
+        BigInt(CHART_PERIODS["1d"])
+      ),
+    };
+  }, [p.position.marketInfo, p.position.isLong, p.position.sizeInUsd]);
+
+  function renderCollateral() {
+    const isStableCollateral = p.position.collateralToken.isStable;
+    const renderMarginValue = (amount: bigint, usd: bigint) =>
+      isStableCollateral ? (
+        <UsdValue usd={usd} fallback="..." />
+      ) : (
+        <AmountWithUsdBalance
+          amount={amount}
+          decimals={p.position.collateralToken.decimals}
+          usd={usd}
+          symbol={p.position.collateralToken.symbol}
+          isStable={isStableCollateral}
+          usdAsPrimary
+        />
+      );
+
+    return (
+      <div className="flex flex-col gap-4">
+        <div className={cx("position-list-collateral", { isSmall: !p.isLarge })}>
+          <TooltipWithPortal
+            handle={<UsdValue usd={p.position.remainingCollateralUsd} />}
+            handleClassName={cx("numbers", { negative: p.position.hasLowCollateral })}
+            position={p.isLarge ? "bottom-start" : "bottom-end"}
+            className="PositionItem-collateral-tooltip"
+            content={
+              <>
+                {p.position.hasLowCollateral && (
+                  <div>
+                    <Trans>Low margin after fees. Deposit more to reduce liquidation risk.</Trans>
+                    <br />
+                    <br />
+                  </div>
+                )}
+                <StatsTooltipRow
+                  label={t`Current margin`}
+                  showDollar={false}
+                  value={renderMarginValue(p.position.remainingCollateralAmount, p.position.remainingCollateralUsd)}
+                  valueClassName="numbers"
+                />
+                <br />
+                <StatsTooltipRow
+                  label={t`Margin before borrow/funding`}
+                  showDollar={false}
+                  value={renderMarginValue(p.position.collateralAmount, p.position.collateralUsd)}
+                  valueClassName="numbers"
+                />
+                <StatsTooltipRow
+                  label={t`Borrow fee`}
+                  showDollar={false}
+                  value={<UsdValue usd={-p.position.pendingBorrowingFeesUsd} fallback="..." />}
+                  valueClassName="numbers"
+                  textClassName={cx({
+                    "text-red-500": p.position.pendingBorrowingFeesUsd !== 0n,
+                  })}
+                />
+                <StatsTooltipRow
+                  label={t`Negative funding fee`}
+                  showDollar={false}
+                  value={<DeltaUsdValue deltaUsd={-p.position.pendingFundingFeesUsd} fallback="..." />}
+                  valueClassName="numbers"
+                  textClassName={cx({
+                    "text-red-500": p.position.pendingFundingFeesUsd !== 0n,
+                  })}
+                />
+                <br />
+                <div className="mb-4 text-typography-primary">
+                  <Trans>Claimable</Trans>
+                </div>
+                <StatsTooltipRow
+                  label={t`Positive funding fee`}
+                  showDollar={false}
+                  value={<DeltaUsdValue deltaUsd={p.position.pendingClaimableFundingFeesUsd} fallback="..." />}
+                  valueClassName="numbers"
+                  textClassName={cx({
+                    "text-green-500": p.position.pendingClaimableFundingFeesUsd > 0,
+                  })}
+                />
+                <br />
+                <div className="mb-4 text-typography-primary">
+                  <Trans>Estimated daily fees</Trans>
+                </div>
+                <StatsTooltipRow
+                  showDollar={false}
+                  label={t`Borrow fee / day`}
+                  value={borrowingFeeRateUsd !== undefined ? <UsdValue usd={-borrowingFeeRateUsd} /> : "..."}
+                  valueClassName="numbers"
+                  textClassName={cx({
+                    "text-red-500": borrowingFeeRateUsd !== undefined && borrowingFeeRateUsd > 0,
+                  })}
+                />
+                <StatsTooltipRow
+                  showDollar={false}
+                  label={t`Funding fee / day`}
+                  value={<DeltaUsdValue deltaUsd={fundingFeeRateUsd} />}
+                  valueClassName="numbers"
+                  textClassName={getPositiveOrNegativeClass(fundingFeeRateUsd)}
+                />
+                <br />
+                <Trans>Negative funding fees reduce margin and affect liquidation price.</Trans>
+                <br />
+                <Trans>Positive funding fees are claimable in Claims.</Trans>
+              </>
+            }
+          />
+
+          {!p.position.isOpening && !p.hideActions && p.onEditCollateralClick && (
+            <span className="edit-icon" onClick={p.onEditCollateralClick} data-qa="position-edit-button">
+              <EditIcon className="text-typography-secondary" width={16} height={16} />
+            </span>
+          )}
+        </div>
+
+        <div className="muted text-body-small numbers">
+          (
+          {formatBalanceAmount(
+            p.position.remainingCollateralAmount,
+            p.position.collateralToken.decimals,
+            p.position.collateralToken.symbol,
+            { isStable: p.position.collateralToken.isStable }
+          )}
+          )
+        </div>
+      </div>
+    );
+  }
+
+  function renderLiquidationPrice() {
+    if (!p.position.marketInfo) {
+      return <Skeleton width={60} count={1} baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" />;
+    }
+
+    let liqPriceWarning: string | undefined;
+    const estimatedLiquidationHours = getEstimatedLiquidationTimeInHours(p.position, minCollateralUsd);
+
+    const offHoursLiqRisk = getPositionOffHoursLiqRisk({
+      chainId,
+      position: p.position,
+      minCollateralUsd,
+      userReferralInfo,
+    });
+    const showOffHoursWarning = offHoursLiqRisk.showWarning;
+    const offHoursLiqPrice = offHoursLiqRisk.offHoursLiqPrice;
+
+    if (p.position.liquidationPrice === undefined) {
+      if (!p.position.isLong && p.position.collateralAmount >= p.position.sizeInTokens) {
+        const symbol = p.position.collateralToken.symbol;
+        const indexName = p.position.indexName;
+        liqPriceWarning = t`Your ${symbol} margin exceeds the ${indexName} short position size. Margin value rises with the index, covering any losses—no liquidation price.`;
+      } else if (
+        p.position.isLong &&
+        p.position.collateralToken.isStable &&
+        p.position.collateralUsd >= p.position.sizeInUsd
+      ) {
+        const symbol = p.position.collateralToken.symbol;
+        const indexName = p.position.indexName;
+        liqPriceWarning = t`Your ${symbol} margin exceeds the ${indexName} long position size. Stable margin covers any losses—no liquidation price.`;
+      }
+    }
+
+    const getLiqPriceTooltipContent = () => (
+      <>
+        {liqPriceWarning && <div>{liqPriceWarning}</div>}
+        {estimatedLiquidationHours ? (
+          <div>
+            {!liqPriceWarning && (
+              <>
+                <Trans>Liquidation price changes with fees and margin value.</Trans>
+                <br />
+              </>
+            )}
+            <br />
+            {liqPriceWarning ? (
+              <Trans>
+                Position may still liquidate from fees alone (funding + borrowing), reducing margin over time.
+              </Trans>
+            ) : (
+              <Trans>Position may liquidate from fees alone (funding + borrowing), reducing margin over time.</Trans>
+            )}
+            <br />
+            <br />
+            <StatsTooltipRow
+              label={t`Estimated time to liquidation`}
+              value={formatEstimatedLiquidationTime(estimatedLiquidationHours)}
+              valueClassName="numbers"
+              showDollar={false}
+            />
+          </div>
+        ) : (
+          ""
+        )}
+        {showOffHoursWarning && (
+          <div>
+            {(liqPriceWarning || estimatedLiquidationHours) && <br />}
+            <Trans>
+              This position is currently above liquidation risk, but it may become close to liquidation when the market
+              switches to off-hours risk parameters. Add margin or reduce leverage to increase your buffer.
+            </Trans>
+            <br />
+            <br />
+            <Trans>Off-hours: daily 20:45–22:15 UTC (weekends Fri 20:45 → Sun 22:15 UTC).</Trans>
+            <br />
+            <br />
+            <StatsTooltipRow
+              label={t`Estimated off-hours liquidation price`}
+              value={
+                <LiquidationPriceValue
+                  liquidationPrice={offHoursLiqPrice}
+                  displayDecimals={marketDecimals}
+                  visualMultiplier={p.position.indexToken.visualMultiplier}
+                  fallback="..."
+                />
+              }
+              valueClassName="numbers"
+              showDollar={false}
+            />
+            <br />
+            <ExternalLink href={OFF_HOURS_DOCS_URL}>
+              <Trans>Read more</Trans>
+            </ExternalLink>
+          </div>
+        )}
+      </>
+    );
+
+    if (liqPriceWarning || estimatedLiquidationHours || showOffHoursWarning) {
+      return (
+        <TooltipWithPortal
+          handle={
+            p.position.liquidationPrice ? (
+              <LiquidationPriceValue
+                liquidationPrice={p.position.liquidationPrice}
+                displayDecimals={marketDecimals}
+                visualMultiplier={p.position.indexToken.visualMultiplier}
+              />
+            ) : (
+              "..."
+            )
+          }
+          handleClassName={cx("numbers", {
+            "LiqPrice-soft-warning": estimatedLiquidationHours && estimatedLiquidationHours < 24 * 7,
+            "LiqPrice-hard-warning": estimatedLiquidationHours && estimatedLiquidationHours < 24,
+            "LiqPrice-offhours-warning":
+              showOffHoursWarning && !(estimatedLiquidationHours && estimatedLiquidationHours < 24 * 7),
+          })}
+          position="bottom-end"
+          renderContent={getLiqPriceTooltipContent}
+        />
+      );
+    }
+
+    return (
+      <LiquidationPriceValue
+        liquidationPrice={p.position.liquidationPrice}
+        displayDecimals={marketDecimals}
+        visualMultiplier={p.position.indexToken.visualMultiplier}
+        className="numbers"
+        fallback="..."
+      />
+    );
+  }
+
+  function renderLarge() {
+    const { indexName, poolName } = p.position;
+    const qaAttr = `position-item-${indexName}-${poolName}-${p.position.isLong ? "Long" : "Short"}`;
+
+    return (
+      <TableTr hoverable={true} data-qa={qaAttr}>
+        <TableTd
+          data-qa="position-handle"
+          className={cx("flex", {
+            "shadow-[inset_2px_0_0] shadow-cold-blue-500": isCurrentMarket,
+          })}
+          onClick={() => p.onSelectPositionClick?.()}
+        >
+          {/* title */}
+          <div className={cx("Position-item-info relative")}>
+            <div className="Exchange-list-title">
+              <div className="inline-flex items-center gap-4">
+                <TokenIcon className="PositionList-token-icon" symbol={p.position.indexToken.symbol} displaySize={20} />
+                <TooltipWithPortal
+                  handle={
+                    <span className="font-medium">
+                      {getMarketIndexName({ indexToken: p.position.indexToken, isSpotOnly: false })}
+                    </span>
+                  }
+                  position="bottom-start"
+                  renderContent={() => (
+                    <div>
+                      <StatsTooltipRow
+                        label={t`Pool`}
+                        value={
+                          <div className="flex items-center">
+                            <span>{indexName && indexName}</span>
+                            <span className="subtext leading-1">{poolName && `[${poolName}]`}</span>
+                          </div>
+                        }
+                        showDollar={false}
+                      />
+
+                      <br />
+
+                      <div>
+                        <Trans>Click to select, then use the trade box to increase size.</Trans>
+                        <br />
+                        <br />
+                        <Trans>Use the TP/SL button to set TP/SL orders.</Trans>
+                        <br />
+                        <br />
+                        <Trans>Use the "Close" button to reduce your position via market or TWAP orders.</Trans>
+                      </div>
+
+                      {showDebugValues && (
+                        <>
+                          <br />
+                          <StatsTooltipRow
+                            label={t`Key`}
+                            value={<div className="debug-key muted">{p.position.contractKey}</div>}
+                            showDollar={false}
+                          />
+                        </>
+                      )}
+                    </div>
+                  )}
+                />
+              </div>
+              {p.position.pendingUpdate && (
+                <SpinnerIcon data-qa="position-loading" className="spin position-loading-icon" />
+              )}
+            </div>
+            <div className="Exchange-list-info-label">
+              <LeverageValue
+                leverage={p.position.leverage}
+                className={cx("muted mr-4 rounded-2 px-2 pb-1 numbers")}
+                fallback="..."
+              />
+              <span className={cx({ positive: p.position.isLong, negative: !p.position.isLong })}>
+                {p.position.isLong ? t`Long` : t`Short`}
+              </span>
+            </div>
+          </div>
+        </TableTd>
+        <TableTd>
+          <div className="flex flex-col gap-2">
+            <span className="cursor-pointer select-none numbers" onClick={handleSizeClick}>
+              {showSizeInTokens ? (
+                formatBalanceAmount(
+                  p.position.sizeInTokens / indexTokenVisualMultiplier,
+                  p.position.indexToken.decimals,
+                  indexTokenDisplaySymbol
+                )
+              ) : (
+                <UsdValue usd={p.position.sizeInUsd} />
+              )}
+            </span>
+            <PositionItemOrdersLarge
+              positionKey={p.position.key}
+              onOrdersClick={p.onOrdersClick}
+              hideActions={p.hideOrderActions}
+            />
+          </div>
+        </TableTd>
+        <TableTd>
+          {/* netValue */}
+          {p.position.isOpening ? (
+            t`Opening...`
+          ) : (
+            <div className="flex flex-col gap-4">
+              {renderNetValue()}
+              {displayedPnl !== undefined && (
+                <div
+                  className={cx("text-body-small flex items-center gap-2 numbers", {
+                    positive: displayedPnl > 0,
+                    negative: displayedPnl < 0,
+                    muted: displayedPnl == 0n,
+                    "cursor-pointer": Boolean(p.onShareClick),
+                  })}
+                  onClick={p.onShareClick}
+                >
+                  <DeltaUsdValue deltaUsd={displayedPnl} percentage={displayedPnlPercentage} />
+                  {p.onShareClick && <NewLinkThinIcon className="mt-1 size-14 shrink-0" />}
+                </div>
+              )}
+            </div>
+          )}
+        </TableTd>
+        <TableTd>
+          {/* collateral */}
+          <div>{renderCollateral()}</div>
+        </TableTd>
+        <TableTd>
+          {/* entryPrice */}
+          {p.position.isOpening ? (
+            t`Opening...`
+          ) : (
+            <UsdValue
+              usd={p.position.entryPrice}
+              displayDecimals={marketDecimals}
+              visualMultiplier={p.position.indexToken.visualMultiplier}
+              className="numbers"
+            />
+          )}
+        </TableTd>
+        <TableTd>
+          {/* markPrice */}
+          <UsdValue
+            usd={p.position.markPrice}
+            displayDecimals={marketDecimals}
+            visualMultiplier={p.position.indexToken.visualMultiplier}
+            className="numbers"
+          />
+        </TableTd>
+        <TableTd>
+          {/* liqPrice */}
+          {renderLiquidationPrice()}
+        </TableTd>
+        {!p.hideActions && (
+          <TableTd className="w-[9%]">
+            <PositionItemTPSLCell
+              positionKey={p.position.key}
+              markPrice={p.position.markPrice}
+              marketDecimals={marketDecimals}
+              visualMultiplier={p.position.indexToken.visualMultiplier}
+              isLarge={true}
+              onOpenTPSLModal={handleOpenTPSLModal}
+              isDisabled={isActionsDisabled}
+            />
+          </TableTd>
+        )}
+        {!p.hideActions && (
+          <TableTd className="PositionItem-actions-cell">
+            <div className="flex items-center justify-end gap-4">
+              <Button
+                variant="ghost"
+                onClick={p.onClosePositionClick}
+                disabled={isCloseDisabled}
+                data-qa="position-close-button"
+              >
+                <Trans>Close</Trans>
+              </Button>
+
+              <PositionDropdown
+                handleEditCollateral={p.onEditCollateralClick}
+                handleMarketSelect={() => p.onSelectPositionClick?.()}
+                handleMarketIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Market)}
+                handleShare={p.onShareClick}
+                handleLimitIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Limit)}
+                handleStopMarketIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.StopMarket)}
+                handleTwapIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Twap)}
+                handleTriggerClose={handleOpenAddTPSLModal}
+                handleViewPositionHistory={p.onViewPositionHistory}
+                disabled={isActionsDisabled}
+              />
+            </div>
+          </TableTd>
+        )}
+      </TableTr>
+    );
+  }
+
+  function renderSmall() {
+    const { indexName, poolName } = p.position;
+
+    return (
+      <AppCard dataQa="position-item">
+        <AppCardSection onClick={() => p.onSelectPositionClick?.()}>
+          <div className="text-body-medium flex items-center gap-8">
+            <span
+              className={cx("text-body-medium relative flex items-center gap-4 font-medium", {
+                "after:absolute after:-left-10 after:top-[50%] after:h-16 after:w-2 after:-translate-y-[50%] after:bg-blue-300":
+                  isCurrentMarket,
+              })}
+            >
+              <TokenIcon symbol={p.position.indexToken?.symbol} displaySize={16} />
+              {getMarketIndexName({ indexToken: p.position.indexToken, isSpotOnly: false })}
+            </span>
+            <div className="text-body-small flex items-center gap-4">
+              <LeverageValue leverage={p.position.leverage} className="rounded-4 leading-1" fallback="..." />
+              <span
+                className={cx("Exchange-list-side", {
+                  positive: p.position.isLong,
+                  negative: !p.position.isLong,
+                })}
+              >
+                {p.position.isLong ? t`Long` : t`Short`}
+              </span>
+            </div>
+            {p.position.pendingUpdate && <SpinnerIcon className="spin position-loading-icon" />}
+          </div>
+        </AppCardSection>
+        <div ref={topSentinelRef} />
+        <AppCardSection>
+          {showDebugValues && (
+            <div className="App-card-row">
+              <div className="font-medium text-typography-secondary">
+                <Trans>Key</Trans>
+              </div>
+              <div className="debug-key muted">{p.position.contractKey}</div>
+            </div>
+          )}
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Pool</Trans>
+            </div>
+            <div>
+              <div className="flex items-start">
+                <span>{indexName && indexName}</span>
+                <span className="subtext">{poolName && `[${poolName}]`}</span>
+              </div>
+            </div>
+          </div>
+          <div className="App-card-row">
+            <div className="cursor-pointer select-none font-medium text-typography-secondary" onClick={handleSizeClick}>
+              <Trans>Size</Trans>
+            </div>
+            <div className="cursor-pointer select-none numbers" onClick={handleSizeClick}>
+              {showSizeInTokens ? (
+                formatBalanceAmount(
+                  p.position.sizeInTokens / indexTokenVisualMultiplier,
+                  p.position.indexToken.decimals,
+                  indexTokenDisplaySymbol
+                )
+              ) : (
+                <UsdValue usd={p.position.sizeInUsd} />
+              )}
+            </div>
+          </div>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Net value</Trans>
+            </div>
+            <div>{renderNetValue()}</div>
+          </div>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              {savedShowPnlAfterFees ? t`PnL after all fees` : t`PnL`}
+            </div>
+            <div>
+              <span
+                className={cx("flex items-center gap-2 numbers", {
+                  positive: displayedPnl > 0,
+                  negative: displayedPnl < 0,
+                  muted: displayedPnl == 0n,
+                  "cursor-pointer": Boolean(p.onShareClick),
+                })}
+                onClick={p.onShareClick}
+              >
+                <DeltaUsdValue deltaUsd={displayedPnl} percentage={displayedPnlPercentage} />
+                {p.onShareClick && <NewLinkThinIcon className="mt-2 size-16 shrink-0" />}
+              </span>
+            </div>
+          </div>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Margin</Trans>
+            </div>
+            <div>{renderCollateral()}</div>
+          </div>
+        </AppCardSection>
+        <AppCardSection>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Entry price</Trans>
+            </div>
+            <div className="numbers">
+              <UsdValue
+                usd={p.position.entryPrice}
+                displayDecimals={marketDecimals}
+                visualMultiplier={p.position.indexToken.visualMultiplier}
+              />
+            </div>
+          </div>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Mark price</Trans>
+            </div>
+            <div className="numbers">
+              <UsdValue
+                usd={p.position.markPrice}
+                displayDecimals={marketDecimals}
+                visualMultiplier={p.position.indexToken.visualMultiplier}
+              />
+            </div>
+          </div>
+          <div className="App-card-row">
+            <div className="font-medium text-typography-secondary">
+              <Trans>Liquidation price</Trans>
+            </div>
+            <div>{renderLiquidationPrice()}</div>
+          </div>
+          {!p.hideActions && (
+            <div className="App-card-row">
+              <div className="font-medium text-typography-secondary">
+                <Trans>TP/SL</Trans>
+              </div>
+              <div>
+                <PositionItemTPSLCell
+                  positionKey={p.position.key}
+                  markPrice={p.position.markPrice}
+                  marketDecimals={marketDecimals}
+                  visualMultiplier={p.position.indexToken.visualMultiplier}
+                  isLarge={false}
+                  onOpenTPSLModal={handleOpenTPSLModal}
+                  isDisabled={isActionsDisabled}
+                />
+              </div>
+            </div>
+          )}
+        </AppCardSection>
+        <AppCardSection className="!border-b-0">
+          <div className="font-medium text-typography-secondary">
+            <Trans>Orders</Trans>
+          </div>
+
+          <PositionItemOrdersSmall
+            positionKey={p.position.key}
+            onOrdersClick={p.onOrdersClick}
+            hideActions={p.hideOrderActions}
+          />
+        </AppCardSection>
+
+        <div ref={closeSentinelRef} />
+        {!p.hideActions && (
+          <div className={cx("z-10", isCardTopVisible && "sticky bottom-14 bg-slate-950")}>
+            <AppCardSection
+              className={cx(
+                "rounded-b-8 border-t-1/2 border-slate-600 bg-slate-900",
+                isCardTopVisible && "after:absolute after:inset-x-0 after:top-full after:h-8 after:bg-slate-950",
+                isCloseStuck && isCardTopVisible && "shadow-[0_-6px_24px_rgba(0,0,0,0.4)]"
+              )}
+            >
+              <div className="flex items-center justify-between">
+                <Button
+                  variant="secondary"
+                  disabled={isCloseDisabled}
+                  onClick={p.onClosePositionClick}
+                  data-qa="position-close-button"
+                >
+                  <Trans>Close</Trans>
+                </Button>
+                <div>
+                  <PositionDropdown
+                    handleEditCollateral={p.onEditCollateralClick}
+                    handleMarketSelect={() => p.onSelectPositionClick?.()}
+                    handleMarketIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Market, true)}
+                    handleShare={p.onShareClick}
+                    handleLimitIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Limit, true)}
+                    handleStopMarketIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.StopMarket, true)}
+                    handleTwapIncreaseSize={() => p.onSelectPositionClick?.(TradeMode.Twap, true)}
+                    handleTriggerClose={handleOpenAddTPSLModal}
+                    handleViewPositionHistory={p.onViewPositionHistory}
+                    disabled={isActionsDisabled}
+                  />
+                </div>
+              </div>
+            </AppCardSection>
+          </div>
+        )}
+      </AppCard>
+    );
+  }
+
+  return (
+    <>
+      {p.isLarge ? renderLarge() : renderSmall()}
+      <OrdersModal
+        isVisible={isTPSLModalVisible}
+        setIsVisible={setIsTPSLModalVisible}
+        position={p.position}
+        initialView={tpslInitialView}
+      />
+    </>
+  );
+}

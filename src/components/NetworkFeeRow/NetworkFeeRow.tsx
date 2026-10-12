@@ -1,0 +1,275 @@
+import { Trans, t } from "@lingui/macro";
+import { ReactNode, useMemo } from "react";
+
+import { BASIS_POINTS_DIVISOR, BASIS_POINTS_DIVISOR_BIGINT } from "config/factors";
+import { useTokensData } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import { useExecutionFeeBufferBps } from "context/SyntheticsStateContext/hooks/settingsHooks";
+import { selectChainId } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { GasPaymentParams } from "domain/synthetics/express";
+import { getExecutionFeeWarning, type ExecutionFee } from "domain/synthetics/fees";
+import {
+  getNetworkFeeSourceExplanation,
+  WALLET_NETWORK_FEE_SOURCE,
+  type NetworkFeeSource,
+} from "domain/synthetics/fees/networkFeeSource";
+import { getPriorityFeeAllowanceAmount } from "domain/synthetics/fees/utils/executionFee";
+import { convertToTokenAmount, convertToUsd } from "domain/synthetics/tokens";
+import { TokenBalanceType, TokenData } from "domain/tokens";
+import { getByKey } from "lib/objects";
+import { convertTokenAddress, getWrappedToken, NATIVE_TOKEN_ADDRESS } from "sdk/configs/tokens";
+import { bigMath } from "sdk/utils/bigmath";
+
+import { AmountWithUsdBalance } from "components/AmountWithUsd/AmountWithUsd";
+import ExchangeInfoRow from "components/ExchangeInfoRow/ExchangeInfoRow";
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import StatsTooltipRow from "components/StatsTooltip/StatsTooltipRow";
+import { LabelWithTooltip } from "components/Tooltip/LabelWithTooltip";
+
+import { SyntheticsInfoRow } from "../SyntheticsInfoRow";
+import { NetworkFeeSourceIcon } from "./NetworkFeeSourceIcon";
+import { NetworkFeeValue } from "./NetworkFeeValue";
+
+type Props = {
+  executionFee?: ExecutionFee;
+  gasPaymentParams?: GasPaymentParams;
+  feeSource: NetworkFeeSource | undefined;
+  feeSourceExplanation?: string;
+  isAdditionOrdersMsg?: boolean;
+  rowPadding?: boolean;
+};
+
+/**
+ * This is not an accurate refund ration, just an estimation based on the recent data.
+ * 10%
+ */
+const ESTIMATED_REFUND_BPS = 10 * 100;
+
+export function NetworkFeeRow({
+  executionFee,
+  gasPaymentParams,
+  feeSource,
+  feeSourceExplanation,
+  isAdditionOrdersMsg,
+  rowPadding = false,
+}: Props) {
+  const executionFeeBufferBps = useExecutionFeeBufferBps();
+  const tokensData = useTokensData();
+  const chainId = useSelector(selectChainId);
+  const gasPaymentToken = getByKey(tokensData, gasPaymentParams?.gasPaymentTokenAddress);
+  const executionFeeToken = executionFee
+    ? getByKey(tokensData, convertTokenAddress(chainId, executionFee.feeToken.address, "native"))
+    : undefined;
+
+  const additionalOrdersMsg = useMemo(
+    () =>
+      isAdditionOrdersMsg && (
+        <Trans>
+          Max network fee includes fees for additional orders. Refunded in full if they don't trigger and are canceled.{" "}
+          <ExternalLink href="https://docs.gmx.io/docs/trading/fees/#network-fee">Read more</ExternalLink>.
+        </Trans>
+      ),
+    [isAdditionOrdersMsg]
+  );
+
+  const networkFee = useMemo(() => {
+    let feeUsd: bigint;
+    let feeAmount: bigint;
+    let feeToken: TokenData;
+    let isExpress: boolean;
+    let allowanceUsd = 0n;
+
+    if (gasPaymentToken && gasPaymentParams?.gasPaymentTokenAmount !== undefined) {
+      feeToken = gasPaymentToken;
+      feeAmount = gasPaymentParams.gasPaymentTokenAmount;
+      feeUsd = convertToUsd(
+        gasPaymentParams.gasPaymentTokenAmount,
+        gasPaymentToken.decimals,
+        gasPaymentToken.prices.minPrice
+      )!;
+      isExpress = true;
+    } else if (executionFee && executionFeeToken) {
+      feeUsd = executionFee.feeUsd;
+      feeAmount = executionFee.feeTokenAmount;
+      feeToken = executionFeeToken;
+      isExpress = false;
+
+      if (feeAmount > 0n) {
+        allowanceUsd = bigMath.mulDiv(feeUsd, getPriorityFeeAllowanceAmount(chainId, executionFee), feeAmount);
+      }
+    } else {
+      return undefined;
+    }
+
+    return {
+      feeUsd,
+      feeAmount,
+      feeToken,
+      isExpress,
+      allowanceUsd,
+    };
+  }, [chainId, executionFee, executionFeeToken, gasPaymentToken, gasPaymentParams]);
+
+  const refundSource = feeSource ?? WALLET_NETWORK_FEE_SOURCE;
+  const refundToken = useMemo(() => {
+    if (!networkFee) {
+      return undefined;
+    }
+
+    if (!networkFee.isExpress) {
+      return networkFee.feeToken;
+    }
+
+    const refundTokenAddress =
+      refundSource.balanceType === TokenBalanceType.GmxAccount
+        ? getWrappedToken(chainId).address
+        : NATIVE_TOKEN_ADDRESS;
+
+    return getByKey(tokensData, refundTokenAddress);
+  }, [chainId, networkFee, refundSource, tokensData]);
+
+  const { estimatedRefundTokenAmount, estimatedRefundUsd } = useMemo(() => {
+    let estimatedRefundUsd: bigint | undefined;
+
+    if (!networkFee || executionFeeBufferBps === undefined) {
+      estimatedRefundUsd = undefined;
+    } else {
+      const feeUsBeforeBuffer = bigMath.mulDiv(
+        networkFee.feeUsd - networkFee.allowanceUsd,
+        BASIS_POINTS_DIVISOR_BIGINT,
+        BigInt(BASIS_POINTS_DIVISOR + executionFeeBufferBps)
+      );
+
+      estimatedRefundUsd =
+        bigMath.mulDiv(feeUsBeforeBuffer, BigInt(ESTIMATED_REFUND_BPS), BASIS_POINTS_DIVISOR_BIGINT) +
+        (networkFee.feeUsd - feeUsBeforeBuffer);
+    }
+
+    const estimatedRefundTokenAmount = convertToTokenAmount(
+      estimatedRefundUsd,
+      refundToken?.decimals,
+      refundToken?.prices.minPrice
+    );
+
+    return {
+      estimatedRefundTokenAmount,
+      estimatedRefundUsd,
+    };
+  }, [executionFeeBufferBps, networkFee, refundToken]);
+
+  const value: ReactNode = useMemo(() => {
+    if (networkFee === undefined) {
+      return "-";
+    }
+
+    const feeUsdAfterRefund = networkFee.feeUsd - (estimatedRefundUsd ?? 0n);
+    const feeAmountAfterRefund =
+      networkFee.feeAmount -
+      (convertToTokenAmount(estimatedRefundUsd, networkFee.feeToken.decimals, networkFee.feeToken.prices.minPrice) ??
+        0n);
+
+    const warning = executionFee ? getExecutionFeeWarning(chainId, executionFee) : undefined;
+
+    const sourceExplanation =
+      feeSourceExplanation ??
+      (feeSource
+        ? getNetworkFeeSourceExplanation({ source: feeSource, isExpress: networkFee.isExpress, chainId })
+        : undefined);
+
+    return (
+      <NetworkFeeValue
+        amount={feeAmountAfterRefund}
+        usd={feeUsdAfterRefund}
+        decimals={networkFee.feeToken.decimals}
+        symbol={networkFee.feeToken.symbol}
+        isStable={networkFee.feeToken.isStable}
+        source={feeSource}
+        tooltipContent={
+          <>
+            <StatsTooltipRow
+              label={t`Max network fee`}
+              showDollar={false}
+              value={
+                <AmountWithUsdBalance
+                  amount={-networkFee.feeAmount}
+                  decimals={networkFee.feeToken.decimals}
+                  usd={-networkFee.feeUsd}
+                  symbol={networkFee.feeToken.symbol}
+                  isStable={networkFee.feeToken.isStable}
+                  allowWrap
+                />
+              }
+              valueClassName="numbers"
+            />
+            <div className="h-8" />
+            <p>
+              <Trans>
+                Max network fee includes a buffer for gas spikes. Unused fees refunded on execution.{" "}
+                <ExternalLink className="inline" href="https://docs.gmx.io/docs/trading/fees/#network-fee">
+                  Read more
+                </ExternalLink>
+                .
+              </Trans>
+            </p>
+            <br />
+            <StatsTooltipRow
+              label={t`Estimated fee refund`}
+              showDollar={false}
+              value={
+                refundToken && estimatedRefundTokenAmount !== undefined && estimatedRefundUsd !== undefined ? (
+                  <AmountWithUsdBalance
+                    amount={estimatedRefundTokenAmount}
+                    decimals={refundToken.decimals}
+                    usd={estimatedRefundUsd}
+                    symbol={refundToken.symbol}
+                    isStable={refundToken.isStable}
+                    signed
+                    allowWrap
+                    suffix={<NetworkFeeSourceIcon source={refundSource} />}
+                  />
+                ) : undefined
+              }
+              valueClassName="numbers"
+              textClassName="text-green-500"
+            />
+            {sourceExplanation && (
+              <>
+                <br />
+                <p>{sourceExplanation}</p>
+              </>
+            )}
+            {warning && <p className="text-yellow-300">{warning}</p>}
+            {additionalOrdersMsg && <p>{additionalOrdersMsg}</p>}
+          </>
+        }
+      />
+    );
+  }, [
+    networkFee,
+    estimatedRefundUsd,
+    estimatedRefundTokenAmount,
+    executionFee,
+    chainId,
+    feeSource,
+    feeSourceExplanation,
+    refundToken,
+    refundSource,
+    additionalOrdersMsg,
+  ]);
+
+  const label = (
+    <LabelWithTooltip
+      label={t`Network fee`}
+      tooltip={<Trans>Blockchain gas fee (not GMX-specific). Doesn't impact your margin.</Trans>}
+      position="left-start"
+      variant="iconStroke"
+      labelClassName="whitespace-nowrap"
+    />
+  );
+
+  if (rowPadding) {
+    return <ExchangeInfoRow qa="network-fee" label={label} value={value} />;
+  }
+
+  return <SyntheticsInfoRow qa="network-fee" label={label} value={value} />;
+}

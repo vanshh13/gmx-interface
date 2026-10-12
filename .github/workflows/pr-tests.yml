@@ -1,0 +1,98 @@
+name: Run Tests
+
+on:
+  pull_request:
+    branches:
+      - master
+      - release
+      - "release-*"
+    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Linting, Type Checking, and Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "22"
+          cache: "yarn"
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build SDK
+        run: |
+          cd sdk
+          yarn build
+
+      - name: Run linting
+        run: yarn lint:ci
+
+      - name: Run type checking
+        run: yarn tscheck:ci
+
+      - name: Run tests
+        run: yarn test:ci
+
+      - name: Run SDK linting
+        run: |
+          cd sdk
+          yarn lint:ci
+
+      - name: Run SDK type checking
+        run: |
+          cd sdk
+          yarn tscheck:ci
+
+      - name: Run SDK tests
+        run: |
+          cd sdk
+          yarn test:ci
+
+      - name: Run SDK multicall tests
+        run: |
+          cd sdk
+          yarn test:multicall
+
+      - name: Run SDK e2e public tests
+        run: |
+          cd sdk
+          yarn test:v2:public
+
+  sdk-standalone:
+    name: SDK standalone build (publish parity)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "yarn"
+          cache-dependency-path: sdk/yarn.lock
+
+      - name: Install dependencies
+        working-directory: ./sdk
+        run: yarn install --immutable
+
+      - name: Build package
+        working-directory: ./sdk
+        run: |
+          yarn prepare
+          yarn prebuild
+          yarn build
+
+      - name: Test package
+        working-directory: ./sdk
+        run: |
+          yarn test:ci
+          yarn tscheck:ci
+          npm pack --dry-run

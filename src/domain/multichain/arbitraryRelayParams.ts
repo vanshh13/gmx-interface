@@ -1,0 +1,568 @@
+import { useMemo } from "react";
+import { encodeAbiParameters, EstimateGasParameters, Hex, keccak256, PublicClient, toHex, zeroHash } from "viem";
+
+import type { ContractsChainId } from "config/chains";
+import { getContract } from "config/contracts";
+import { GMX_SIMULATION_ORIGIN, multichainBalanceKey } from "config/dataStore";
+import { SIMULATED_MULTICHAIN_BALANCE } from "config/multichain";
+import {
+  selectExpressGlobalParams,
+  selectGmxAccountExpressGlobalParams,
+  selectSettlementChainExpressGlobalParams,
+} from "context/SyntheticsStateContext/selectors/expressSelectors";
+import {
+  selectAccount,
+  selectChainId,
+  selectSubaccountForMultichainAction,
+  selectSubaccountForSettlementChainAction,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import {
+  ExpressTransactionBuilder,
+  ExpressTxnParams,
+  GasPaymentParams,
+  GasPaymentValidations,
+  getRawRelayerParams,
+  getRelayerFeeParams,
+  GlobalExpressParams,
+  RawRelayParamsPayload,
+  RelayFeePayload,
+} from "domain/synthetics/express";
+import {
+  estimateExpressParams,
+  ExpressEstimationInsufficientGasPaymentTokenBalanceError,
+  getGasPaymentValidations,
+  getOrderRelayRouterAddress,
+} from "domain/synthetics/express/expressOrderUtils";
+import type { Subaccount, SubaccountValidations } from "domain/synthetics/subaccount";
+import { getSubaccountValidations } from "domain/synthetics/subaccount/utils";
+import { convertToTokenAmount } from "domain/tokens";
+import { CustomError, isCustomError } from "lib/errors";
+import { metrics } from "lib/metrics";
+import { applyFactor, BASIS_POINTS_DIVISOR_BIGINT, expandDecimals, USD_DECIMALS } from "lib/numbers";
+import { EMPTY_ARRAY, EMPTY_OBJECT } from "lib/objects";
+import { usePrevious } from "lib/usePrevious";
+import { AsyncResult, useThrottledAsync } from "lib/useThrottledAsync";
+import { getPublicClientWithRpc } from "lib/wallets/walletConfig";
+import { bigMath } from "sdk/utils/bigmath";
+import { applyGasLimitBuffer } from "sdk/utils/gas/applyBuffer";
+import { OVERRIDE_ERC20_BYTECODE, RANDOM_SLOT } from "sdk/utils/multichain/stateOverrides";
+import { getEmptyExternalCallsPayload, type ExternalCallsPayload } from "sdk/utils/orderTransactions";
+import { createViemRpc, type IRpc, type StateOverrideEntry } from "sdk/utils/rpc";
+
+import { fallbackCustomError } from "./fallbackCustomError";
+
+export function getRawBaseRelayerParams({
+  chainId,
+  account,
+  globalExpressParams,
+  executionFeeAmount,
+  transactionExternalCalls,
+}: {
+  chainId: ContractsChainId;
+  account: string;
+  globalExpressParams: GlobalExpressParams;
+  executionFeeAmount?: bigint;
+  transactionExternalCalls?: ExternalCallsPayload;
+}): Partial<{
+  rawBaseRelayParamsPayload: RawRelayParamsPayload;
+  baseRelayFeeSwapParams: {
+    feeParams: RelayFeePayload;
+    externalCalls: ExternalCallsPayload;
+    feeExternalSwapGasLimit: bigint;
+    gasPaymentParams: GasPaymentParams;
+  };
+}> {
+  const { gasPaymentToken, relayerFeeToken, tokensData, marketsInfoData, gasPrice, findFeeSwapPath } =
+    globalExpressParams;
+  const effectiveTransactionExternalCalls = transactionExternalCalls ?? getEmptyExternalCallsPayload();
+
+  if (!gasPaymentToken || !relayerFeeToken || !account || !tokensData || !marketsInfoData || gasPrice === undefined) {
+    return EMPTY_OBJECT;
+  }
+
+  const baseRelayerFeeAmount = convertToTokenAmount(
+    expandDecimals(3, USD_DECIMALS),
+    relayerFeeToken.decimals,
+    relayerFeeToken.prices.maxPrice
+  )!;
+
+  const baseRelayFeeSwapParams = getRelayerFeeParams({
+    chainId: chainId,
+    account: account,
+
+    gasPaymentToken,
+    relayerFeeToken,
+    relayerFeeAmount: baseRelayerFeeAmount,
+    totalRelayerFeeTokenAmount: baseRelayerFeeAmount + (executionFeeAmount ?? 0n),
+    gasPaymentTokenAsCollateralAmount: 0n,
+    findFeeSwapPath: findFeeSwapPath,
+
+    transactionExternalCalls: effectiveTransactionExternalCalls,
+    feeExternalSwapQuote: undefined,
+  });
+
+  if (baseRelayFeeSwapParams === undefined) {
+    return EMPTY_OBJECT;
+  }
+
+  const rawBaseRelayParamsPayload = getRawRelayerParams({
+    chainId,
+    gasPaymentTokenAddress: baseRelayFeeSwapParams.gasPaymentParams.gasPaymentTokenAddress,
+    relayerFeeTokenAddress: baseRelayFeeSwapParams.gasPaymentParams.relayerFeeTokenAddress,
+    feeParams: baseRelayFeeSwapParams.feeParams,
+    externalCalls: baseRelayFeeSwapParams.externalCalls,
+    tokenPermits: EMPTY_ARRAY,
+  });
+
+  return { rawBaseRelayParamsPayload, baseRelayFeeSwapParams };
+}
+
+export function calculateMappingSlot(key: string, mappingSlotIndex: number): Hex {
+  const encodedKeyAndSlot = encodeAbiParameters(
+    [{ type: "bytes32" }, { type: "uint256" }],
+    [key, BigInt(mappingSlotIndex)]
+  );
+
+  const storageSlot = keccak256(encodedKeyAndSlot);
+  return storageSlot;
+}
+
+export const DATASTORE_SLOT_INDEXES = {
+  uintValues: 0,
+};
+
+async function estimateArbitraryGasLimit({
+  client,
+  rawRelayParamsPayload,
+  gasPaymentParams,
+  expressTransactionBuilder,
+  subaccount,
+  chainId,
+  account,
+  additionalBalanceOverrideTokens,
+  overrideWnt = false,
+}: {
+  chainId: ContractsChainId;
+  client: PublicClient;
+  rawRelayParamsPayload: RawRelayParamsPayload;
+  gasPaymentParams: GasPaymentParams;
+  expressTransactionBuilder: ExpressTransactionBuilder;
+  subaccount: Subaccount | undefined;
+  account: string;
+  additionalBalanceOverrideTokens?: string[];
+  overrideWnt?: boolean;
+}): Promise<bigint> {
+  const { txnData: baseTxnData } = await expressTransactionBuilder({
+    relayParams: rawRelayParamsPayload,
+    gasPaymentParams,
+    subaccount,
+  });
+
+  const tokensToOverride = new Set([gasPaymentParams.gasPaymentTokenAddress]);
+  if (overrideWnt) {
+    tokensToOverride.add(gasPaymentParams.relayerFeeTokenAddress);
+  }
+  if (additionalBalanceOverrideTokens) {
+    for (const token of additionalBalanceOverrideTokens) {
+      if (token) {
+        tokensToOverride.add(token);
+      }
+    }
+  }
+
+  const stateDiff = Array.from(tokensToOverride).map((tokenAddress) => ({
+    slot: calculateMappingSlot(multichainBalanceKey(account, tokenAddress), DATASTORE_SLOT_INDEXES.uintValues),
+    value: toHex(SIMULATED_MULTICHAIN_BALANCE, { size: 32 }),
+  }));
+
+  const params: EstimateGasParameters = {
+    account: GMX_SIMULATION_ORIGIN,
+    to: baseTxnData.to,
+    data: baseTxnData.callData,
+    value: 0n,
+    stateOverride: [
+      {
+        address: getContract(chainId, "DataStore"),
+        stateDiff,
+      },
+    ],
+  };
+
+  if (overrideWnt) {
+    params.stateOverride!.push(
+      {
+        address: gasPaymentParams.gasPaymentTokenAddress,
+        code: OVERRIDE_ERC20_BYTECODE,
+        state: [
+          {
+            slot: RANDOM_SLOT,
+            value: zeroHash,
+          },
+        ],
+      },
+      {
+        address: getContract(chainId, "LayerZeroProvider"),
+        balance: SIMULATED_MULTICHAIN_BALANCE,
+      }
+    );
+
+    if (gasPaymentParams.relayerFeeTokenAddress !== gasPaymentParams.gasPaymentTokenAddress) {
+      params.stateOverride!.push({
+        address: gasPaymentParams.relayerFeeTokenAddress,
+        code: OVERRIDE_ERC20_BYTECODE,
+        state: [
+          {
+            slot: RANDOM_SLOT,
+            value: zeroHash,
+          },
+        ],
+      });
+    }
+  }
+
+  const gasLimit = await fallbackCustomError(
+    async () => client.estimateGas(params).then(applyGasLimitBuffer),
+    "gasLimit"
+  );
+
+  return gasLimit;
+}
+
+export async function estimateArbitraryRelayFee({
+  chainId,
+  client,
+  account,
+  rawRelayParamsPayload,
+  expressTransactionBuilder,
+  gasPaymentParams,
+  subaccount,
+  additionalBalanceOverrideTokens,
+  globalExpressParams,
+}: {
+  chainId: ContractsChainId;
+  client: PublicClient;
+  rawRelayParamsPayload: RawRelayParamsPayload;
+  expressTransactionBuilder: ExpressTransactionBuilder;
+  gasPaymentParams: GasPaymentParams;
+  subaccount: Subaccount | undefined;
+  account: string;
+  additionalBalanceOverrideTokens?: string[];
+  globalExpressParams: GlobalExpressParams;
+}) {
+  const gasLimit = await estimateArbitraryGasLimit({
+    chainId,
+    client,
+    account,
+    rawRelayParamsPayload,
+    gasPaymentParams,
+    expressTransactionBuilder,
+    subaccount,
+    additionalBalanceOverrideTokens,
+  });
+
+  let relayerFeeAmount = applyFactor(
+    gasLimit * globalExpressParams.gasPrice,
+    globalExpressParams.gasLimits.gelatoRelayFeeMultiplierFactor
+  );
+
+  const buffer = bigMath.mulDiv(relayerFeeAmount, BigInt(globalExpressParams.bufferBps), BASIS_POINTS_DIVISOR_BIGINT);
+  relayerFeeAmount += buffer;
+
+  return relayerFeeAmount;
+}
+
+export function getArbitraryRelayParamsAndPayload({
+  chainId,
+  account,
+  isGmxAccount,
+  relayerFeeAmount,
+  globalExpressParams,
+  subaccount,
+}: {
+  chainId: ContractsChainId;
+  isGmxAccount: boolean;
+  account: string;
+  relayerFeeAmount: bigint;
+  globalExpressParams: GlobalExpressParams;
+  subaccount: Subaccount | undefined;
+}): Partial<{
+  relayFeeParams:
+    | {
+        feeParams: RelayFeePayload;
+        externalCalls: ExternalCallsPayload;
+        feeExternalSwapGasLimit: bigint;
+        gasPaymentParams: GasPaymentParams;
+      }
+    | undefined;
+  relayParamsPayload: RawRelayParamsPayload | undefined;
+  gasPaymentValidations: GasPaymentValidations | undefined;
+  subaccountValidations: SubaccountValidations | undefined;
+}> {
+  if (relayerFeeAmount === undefined) {
+    return {
+      relayFeeParams: undefined,
+      relayParamsPayload: undefined,
+      gasPaymentValidations: undefined,
+      subaccountValidations: undefined,
+    };
+  }
+
+  const relayFeeParams = getRelayerFeeParams({
+    chainId: chainId,
+    account: account,
+
+    gasPaymentToken: globalExpressParams.gasPaymentToken,
+    relayerFeeToken: globalExpressParams.relayerFeeToken,
+    relayerFeeAmount: relayerFeeAmount,
+    totalRelayerFeeTokenAmount: relayerFeeAmount,
+    gasPaymentTokenAsCollateralAmount: 0n,
+    findFeeSwapPath: globalExpressParams.findFeeSwapPath,
+
+    transactionExternalCalls: getEmptyExternalCallsPayload(),
+    feeExternalSwapQuote: undefined,
+  });
+
+  if (relayFeeParams === undefined) {
+    return {
+      relayFeeParams: undefined,
+      relayParamsPayload: undefined,
+      gasPaymentValidations: undefined,
+      subaccountValidations: undefined,
+    };
+  }
+
+  const gasPaymentValidations = getGasPaymentValidations({
+    gasPaymentToken: globalExpressParams.gasPaymentToken,
+    gasPaymentTokenAmount: relayFeeParams.gasPaymentParams.gasPaymentTokenAmount,
+    gasPaymentTokenAsCollateralAmount: 0n,
+    gasPaymentAllowanceData: globalExpressParams.gasPaymentAllowanceData ?? EMPTY_OBJECT,
+    tokenPermits: globalExpressParams.tokenPermits,
+    isGmxAccount,
+  });
+
+  const relayParamsPayload = getRawRelayerParams({
+    chainId,
+    gasPaymentTokenAddress: relayFeeParams.gasPaymentParams.gasPaymentTokenAddress,
+    relayerFeeTokenAddress: relayFeeParams.gasPaymentParams.relayerFeeTokenAddress,
+    feeParams: relayFeeParams.feeParams,
+    externalCalls: getEmptyExternalCallsPayload(),
+    tokenPermits: [],
+  });
+
+  const subaccountValidations =
+    subaccount &&
+    getSubaccountValidations({
+      requiredActions: 1,
+      subaccount,
+      subaccountRouterAddress: getOrderRelayRouterAddress(chainId, true, isGmxAccount),
+    });
+
+  return {
+    relayFeeParams,
+    relayParamsPayload,
+    gasPaymentValidations,
+    subaccountValidations,
+  };
+}
+
+export function useArbitraryRelayParamsAndPayload({
+  expressTransactionBuilder,
+  isGmxAccount,
+  enabled = true,
+  executionFeeAmount,
+  gasPaymentTokenAsCollateralAmount,
+  transactionExternalCalls,
+  withLoading = true,
+  requireValidations = true,
+  overrideWnt,
+}: {
+  expressTransactionBuilder: ExpressTransactionBuilder | undefined;
+  isGmxAccount: boolean;
+  enabled?: boolean;
+  executionFeeAmount?: bigint;
+  gasPaymentTokenAsCollateralAmount?: bigint;
+  transactionExternalCalls?: ExternalCallsPayload;
+  withLoading?: boolean;
+  requireValidations?: boolean;
+  overrideWnt?: boolean;
+}): AsyncResult<ExpressTxnParams> {
+  const account = useSelector(selectAccount);
+  const chainId = useSelector(selectChainId);
+  const settlementChainGlobalExpressParams = useSelector(selectSettlementChainExpressGlobalParams);
+  const gmxAccountGlobalExpressParams = useSelector(selectGmxAccountExpressGlobalParams);
+  const globalExpressParams = isGmxAccount ? gmxAccountGlobalExpressParams : settlementChainGlobalExpressParams;
+  const subaccount = useSelector(
+    isGmxAccount ? selectSubaccountForMultichainAction : selectSubaccountForSettlementChainAction
+  );
+
+  const estimationKey = `${globalExpressParams?.gasPaymentTokenAddress}`;
+  const prevEstimationKey = usePrevious(estimationKey);
+
+  const forceRecalculate = estimationKey !== prevEstimationKey;
+
+  const expressTxnParamsAsyncResult = useThrottledAsync(
+    async ({ params: p }): Promise<ExpressTxnParams> => {
+      const client = getPublicClientWithRpc(chainId);
+
+      const { baseRelayFeeSwapParams, rawBaseRelayParamsPayload } = getRawBaseRelayerParams({
+        chainId,
+        account: p.account,
+        globalExpressParams: p.globalExpressParams,
+        executionFeeAmount: p.executionFeeAmount,
+        transactionExternalCalls: p.transactionExternalCalls,
+      });
+
+      if (baseRelayFeeSwapParams === undefined || rawBaseRelayParamsPayload === undefined) {
+        throw new Error("no baseRelayFeeSwapParams or rawBaseRelayParamsPayload");
+      }
+
+      const gasLimit: bigint = await estimateArbitraryGasLimit({
+        chainId,
+        client,
+        account: p.account,
+        expressTransactionBuilder: p.expressTransactionBuilder,
+        rawRelayParamsPayload: rawBaseRelayParamsPayload,
+        gasPaymentParams: baseRelayFeeSwapParams.gasPaymentParams,
+        subaccount: p.subaccount,
+        overrideWnt: p.overrideWnt,
+      }).catch((error) => {
+        metrics.pushError(error, "expressArbitrary.estimateGas");
+        throw error;
+      });
+
+      const viemRpc = createViemRpc(client);
+      const rpc: IRpc = {
+        ...viemRpc,
+        estimateGas: (params) => fallbackCustomError(() => viemRpc.estimateGas(params), "gasLimit"),
+      };
+
+      const stateOverride: StateOverrideEntry[] = [
+        {
+          address: getContract(chainId, "DataStore"),
+          stateDiff: [
+            {
+              slot: calculateMappingSlot(
+                multichainBalanceKey(p.account, p.globalExpressParams.gasPaymentToken.address),
+                DATASTORE_SLOT_INDEXES.uintValues
+              ),
+              value: toHex(SIMULATED_MULTICHAIN_BALANCE, { size: 32 }),
+            },
+          ],
+        },
+      ];
+
+      const expressParams = await estimateExpressParams({
+        chainId,
+        isGmxAccount: p.isGmxAccount,
+        estimationMethod: "estimateGas",
+        globalExpressParams: p.globalExpressParams,
+        rpc,
+        stateOverride,
+        requireValidations: p.requireValidations,
+        subaccount: p.subaccount,
+        transactionParams: {
+          account: p.account,
+          isValid: true,
+          transactionExternalCalls: p.transactionExternalCalls ?? getEmptyExternalCallsPayload(),
+          executionFeeAmount: p.executionFeeAmount ?? 0n,
+          gasPaymentTokenAsCollateralAmount: p.gasPaymentTokenAsCollateralAmount ?? 0n,
+          subaccountActions: 0,
+          transactionPayloadGasLimit: 0n,
+          expressTransactionBuilder: p.expressTransactionBuilder,
+          executionGasLimit: 0n,
+        },
+        throwOnInvalid: true,
+        overrideGasLimit: gasLimit,
+      });
+
+      if (expressParams === undefined) {
+        throw new Error("no expressParams");
+      }
+
+      return expressParams;
+    },
+    {
+      leading: false,
+      trailing: true,
+      throttleMs: 2500,
+      withLoading,
+      params:
+        enabled && account !== undefined && globalExpressParams !== undefined && expressTransactionBuilder !== undefined
+          ? {
+              account,
+              chainId,
+              globalExpressParams,
+              expressTransactionBuilder,
+              isGmxAccount,
+              subaccount,
+              executionFeeAmount,
+              gasPaymentTokenAsCollateralAmount,
+              transactionExternalCalls,
+              requireValidations,
+              overrideWnt,
+            }
+          : undefined,
+      forceRecalculate,
+    }
+  );
+
+  return expressTxnParamsAsyncResult;
+}
+
+export type ArbitraryExpressError = {
+  isOutOfTokenError?: {
+    tokenAddress: string;
+    isGasPaymentToken: boolean;
+    balance?: bigint;
+    requiredAmount?: bigint;
+  };
+};
+
+export function useArbitraryError(
+  error: ExpressEstimationInsufficientGasPaymentTokenBalanceError | CustomError | Error | undefined,
+  opts: { isGmxAccount?: boolean; gasPaymentTokenAddress?: string } = EMPTY_OBJECT
+): ArbitraryExpressError | undefined {
+  const settlementChainGlobalExpressParams = useSelector(selectSettlementChainExpressGlobalParams);
+  const gmxAccountGlobalExpressParams = useSelector(selectGmxAccountExpressGlobalParams);
+  const globalExpressParams = useSelector(selectExpressGlobalParams);
+  const gasPaymentTokenAddress =
+    opts.gasPaymentTokenAddress ??
+    (opts.isGmxAccount === undefined
+      ? globalExpressParams?.gasPaymentTokenAddress
+      : opts.isGmxAccount
+        ? gmxAccountGlobalExpressParams?.gasPaymentTokenAddress
+        : settlementChainGlobalExpressParams?.gasPaymentTokenAddress);
+
+  return useMemo(() => {
+    if (error instanceof ExpressEstimationInsufficientGasPaymentTokenBalanceError && gasPaymentTokenAddress) {
+      return {
+        isOutOfTokenError: {
+          tokenAddress: gasPaymentTokenAddress,
+          isGasPaymentToken: true,
+          balance: error.params?.balance,
+          requiredAmount: error.params?.requiredAmount,
+        },
+      };
+    }
+
+    if (!isCustomError(error)) {
+      return EMPTY_OBJECT;
+    }
+
+    const isInsufficientMultichainBalance = error.name === "InsufficientMultichainBalance";
+
+    if (isInsufficientMultichainBalance) {
+      return {
+        isOutOfTokenError: {
+          tokenAddress: error.args.token,
+          isGasPaymentToken: gasPaymentTokenAddress !== undefined && error.args.token === gasPaymentTokenAddress,
+          balance: error.args.balance,
+          requiredAmount: error.args.amount,
+        },
+      };
+    }
+
+    return undefined;
+  }, [error, gasPaymentTokenAddress]);
+}

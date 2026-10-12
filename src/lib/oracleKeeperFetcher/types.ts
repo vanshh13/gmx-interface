@@ -1,0 +1,193 @@
+import type { Address } from "viem";
+
+import type { UiFlag } from "domain/synthetics/uiFlags/useUiFlagsRequest";
+import { FromNewToOldArray, Bar } from "domain/tradingview/types";
+
+/** Single entry from the OracleKeeper `/markets` endpoint. */
+export type ApiMarket = {
+  name: string;
+  marketToken: string;
+  indexToken: string;
+  longToken: string;
+  shortToken: string;
+  isListed: boolean;
+  /** ISO 8601 timestamp, e.g. "2024-10-24T00:00:00.000Z". May be absent. */
+  listingDate?: string;
+};
+
+export type EventPayload = {
+  isError: boolean;
+  version: string;
+  event: string;
+  message?: string;
+  host: string;
+  url?: string;
+  time?: number;
+  isDev?: boolean;
+  customFields?: any;
+  isMissedGlobalMetricData?: boolean;
+};
+
+export type CounterPayload = {
+  event: string;
+  version: string;
+  isDev: boolean;
+  host: string;
+  url: string;
+  abFlags: { [key: string]: boolean };
+  customFields?: { [key: string]: any };
+};
+
+export type TimingPayload = {
+  event: string;
+  version: string;
+  time: number;
+  isDev: boolean;
+  host: string;
+  url: string;
+  abFlags: { [key: string]: boolean };
+  customFields?: { [key: string]: any };
+};
+
+export type UserAnalyticsEventPayload = {
+  event: string;
+  distinctId: string;
+  customFields: { [key: string]: any };
+};
+
+type UserAnalyticsProfilePayload = {
+  distinctId: string;
+  customFields: { [key: string]: any };
+};
+
+export type UserAnalyticsEventItem = {
+  type: "userAnalyticsEvent";
+  payload: UserAnalyticsEventPayload;
+};
+
+type UserAnalyticsProfileItem = {
+  type: "userAnalyticsProfile";
+  payload: UserAnalyticsProfilePayload;
+};
+
+type EventItem = {
+  type: "event";
+  payload: EventPayload;
+};
+
+type CounterItem = {
+  type: "counter";
+  payload: CounterPayload;
+};
+
+type TimingItem = {
+  type: "timing";
+  payload: TimingPayload;
+};
+
+export type BatchReportItem = UserAnalyticsEventItem | UserAnalyticsProfileItem | EventItem | CounterItem | TimingItem;
+
+export type BatchReportBody = {
+  items: BatchReportItem[];
+};
+
+export type ApyInfoEntry = { address: string; baseApy: number; bonusApy: number; apy: number };
+
+export type ApyInfo = {
+  markets: Record<string, ApyInfoEntry>;
+  glvs: Record<string, ApyInfoEntry>;
+};
+
+export type PerformanceInfo = {
+  address: string;
+  entity: string;
+  longTokenPerformance: string;
+  shortTokenPerformance: string;
+  uniswapV2Performance: string;
+};
+
+export type ApyPeriod = "1d" | "7d" | "30d" | "90d" | "180d" | "total";
+
+export type PerformancePeriod = "1d" | "7d" | "30d" | "90d" | "180d" | "total";
+
+export type PerformanceAnnualizedResponse = {
+  address: string;
+  entity: "Market" | "Glv";
+  longTokenPerformance: string;
+  shortTokenPerformance: string;
+  uniswapV2Performance: string;
+}[];
+
+export type PerformanceSnapshotsResponse = {
+  address: string;
+  entity: "Market" | "Glv";
+  snapshots: {
+    snapshotTimestamp: string;
+    uniswapV2Performance: string;
+  }[];
+}[];
+
+export interface OracleFetcher {
+  readonly url: string;
+  fetchTickers(): Promise<TickersResponse>;
+  fetch24hPrices(): Promise<DayPriceCandle[]>;
+  fetchOracleCandles(tokenSymbol: string, period: string, limit: number): Promise<FromNewToOldArray<Bar>>;
+  fetchIncentivesRewards(): Promise<RawIncentivesStats | null>;
+  fetchPostBatchReport(body: BatchReportBody): Promise<Response>;
+  fetchUiVersion(currentVersion: number, active: boolean): Promise<number>;
+  fetchApys(period: ApyPeriod, debug?: boolean): Promise<ApyInfo>;
+  fetchPerformanceAnnualized(period: PerformancePeriod, address?: string): Promise<PerformanceAnnualizedResponse>;
+  fetchPerformanceSnapshots(period: PerformancePeriod, address?: string): Promise<PerformanceSnapshotsResponse>;
+  fetchUiFlags(): Promise<Record<string, UiFlag>>;
+  fetchMarkets(): Promise<ApiMarket[]>;
+  handleFailure(method: string, endpoint?: string): void;
+}
+
+export type TickersResponse = {
+  minPrice: string;
+  maxPrice: string;
+  oracleDecimals: number;
+  tokenSymbol: string;
+  tokenAddress: string;
+  updatedAt: number;
+}[];
+
+export type DayPriceCandle = {
+  tokenSymbol: string;
+  high: number;
+  low: number;
+  open: number;
+  close: number;
+};
+type OnlyWhenActive<Data> =
+  | ({
+      isActive: true;
+    } & Data)
+  | {
+      isActive: false;
+    };
+
+export type RawIncentivesStats = {
+  lp: OnlyWhenActive<{
+    totalRewards: string;
+    period: number;
+    rewardsPerMarket: Record<string, string>;
+    token: string;
+    excludeHolders: Address[];
+  }>;
+  migration: OnlyWhenActive<{
+    maxRebateBps: number;
+    period: number;
+  }>;
+  trading: OnlyWhenActive<{
+    /**
+     * @deprecated use `maxRebatePercent` or `estimatedRebatePercent` instead
+     */
+    rebatePercent: number;
+    maxRebatePercent: number;
+    estimatedRebatePercent: number;
+    allocation: string;
+    period: number;
+    token: Address;
+  }>;
+};

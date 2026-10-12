@@ -1,0 +1,144 @@
+import { USD_DECIMALS } from "config/factors";
+import {
+  selectChainId,
+  selectOrdersInfoData,
+  selectPositionsInfoData,
+  selectTokensData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { createSelector } from "context/SyntheticsStateContext/utils";
+import {
+  OrderType,
+  PositionOrderInfo,
+  isIncreaseOrderType,
+  isMarketOrderType,
+  isSwapOrderType,
+} from "domain/synthetics/orders";
+import { isMarginDepositOrder } from "domain/synthetics/orders/marginDeposit";
+import { convertToTokenAmount, convertToUsd, getTokenData } from "domain/synthetics/tokens";
+import { isFullPositionCloseSizeDeltaUsd } from "domain/tpsl/utils";
+import { getPositionKey } from "lib/legacy";
+import { calculateDisplayDecimals, formatAmount } from "lib/numbers";
+import { EMPTY_ARRAY } from "lib/objects";
+import { convertTokenAddress, getTokenVisualMultiplier } from "sdk/configs/tokens";
+import { getMarketIndexName } from "sdk/utils/markets";
+
+import { ChartLineSizeData, DynamicChartLine } from "components/TVChartContainer/types";
+
+import { selectChartToken } from ".";
+
+export const selectChartDynamicLines = createSelector<DynamicChartLine[]>((q) => {
+  const chainId = q(selectChainId);
+  const { chartToken } = q(selectChartToken);
+  const ordersInfo = q(selectOrdersInfoData);
+  const positionsInfo = q(selectPositionsInfoData);
+
+  const chartTokenAddress = chartToken?.address;
+
+  if (!chartTokenAddress) {
+    return EMPTY_ARRAY;
+  }
+
+  const orderLines: DynamicChartLine[] = Object.values(ordersInfo || {})
+    .filter((order) => {
+      if (isSwapOrderType(order.orderType) || isMarketOrderType(order.orderType)) {
+        return false;
+      }
+
+      const positionOrder = order as PositionOrderInfo;
+
+      return (
+        positionOrder.marketInfo &&
+        positionOrder.triggerPrice !== undefined &&
+        convertTokenAddress(chainId, positionOrder.marketInfo.indexTokenAddress, "wrapped") ===
+          convertTokenAddress(chainId, chartTokenAddress, "wrapped")
+      );
+    })
+    .map((order) => {
+      const positionOrder = order as PositionOrderInfo;
+      const tokenVisualMultiplier = q(
+        (state) =>
+          getTokenData(selectTokensData(state), positionOrder.marketInfo.indexTokenAddress, "native")?.visualMultiplier
+      );
+
+      const priceDecimal = calculateDisplayDecimals(positionOrder.triggerPrice, USD_DECIMALS, tokenVisualMultiplier);
+
+      const isMarginDeposit = isMarginDepositOrder(positionOrder);
+
+      const sizeData: ChartLineSizeData | undefined = isMarginDeposit
+        ? {
+            sizeInUsd:
+              convertToUsd(
+                positionOrder.initialCollateralDeltaAmount,
+                positionOrder.initialCollateralToken.decimals,
+                positionOrder.initialCollateralToken.prices.minPrice
+              ) ?? 0n,
+            sizeInTokens: positionOrder.initialCollateralDeltaAmount,
+            tokenSymbol: positionOrder.initialCollateralToken.symbol,
+            tokenDecimals: positionOrder.initialCollateralToken.decimals,
+          }
+        : isIncreaseOrderType(positionOrder.orderType)
+          ? {
+              sizeInUsd: positionOrder.sizeDeltaUsd,
+              sizeInTokens:
+                (convertToTokenAmount(
+                  positionOrder.sizeDeltaUsd,
+                  positionOrder.indexToken.decimals,
+                  positionOrder.triggerPrice
+                ) ?? 0n) / BigInt(tokenVisualMultiplier ?? 1),
+              tokenSymbol: `${getTokenVisualMultiplier(positionOrder.indexToken)}${positionOrder.indexToken.symbol}`,
+              tokenDecimals: positionOrder.indexToken.decimals,
+            }
+          : undefined;
+
+      const isTpsl =
+        positionOrder.orderType === OrderType.LimitDecrease || positionOrder.orderType === OrderType.StopLossDecrease;
+
+      let positionEntryPrice: bigint | undefined;
+      let positionSizeInUsd: bigint | undefined;
+      let sizeDeltaUsd: bigint | undefined;
+      let isPartial = false;
+
+      if (isTpsl) {
+        const positionKey = getPositionKey(
+          positionOrder.account,
+          positionOrder.marketAddress,
+          positionOrder.targetCollateralToken.address,
+          positionOrder.isLong
+        );
+        const position = positionsInfo?.[positionKey];
+        if (position && position.entryPrice !== undefined && position.entryPrice > 0n) {
+          positionEntryPrice = position.entryPrice;
+          positionSizeInUsd = position.sizeInUsd;
+          sizeDeltaUsd = positionOrder.sizeDeltaUsd;
+          isPartial = !isFullPositionCloseSizeDeltaUsd(sizeDeltaUsd, positionSizeInUsd);
+        }
+      }
+
+      return {
+        id: positionOrder.key,
+        marketName: getMarketIndexName(positionOrder.marketInfo),
+        orderType: positionOrder.orderType,
+        isLong: order.isLong,
+        price: parseFloat(
+          formatAmount(
+            positionOrder.triggerPrice,
+            USD_DECIMALS,
+            priceDecimal,
+            undefined,
+            undefined,
+            tokenVisualMultiplier
+          )
+        ),
+        updatedAtTime: order.updatedAtTime,
+        sizeData,
+        positionEntryPrice,
+        positionSizeInUsd,
+        sizeDeltaUsd,
+        indexTokenVisualMultiplier: tokenVisualMultiplier ?? 1,
+        isPartial,
+        isMarginDeposit,
+      };
+    });
+
+  return orderLines;
+});

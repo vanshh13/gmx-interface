@@ -1,0 +1,77 @@
+import { InfoTokens, SignedTokenPermit, TokenBalanceType, TokenInfo } from "domain/tokens";
+import { NATIVE_TOKEN_ADDRESS } from "sdk/configs/tokens";
+import { nowInSeconds } from "sdk/utils/time";
+import { getTokenData, TokensAllowanceData } from "sdk/utils/tokens";
+
+import { TokenData, TokensData } from "./types";
+
+export function getNeedTokenApprove(
+  tokenAllowanceData: TokensAllowanceData | undefined,
+  tokenAddress: string | undefined,
+  amountToSpend: bigint | undefined,
+  permits: SignedTokenPermit[]
+): boolean {
+  if (tokenAddress === NATIVE_TOKEN_ADDRESS || amountToSpend === undefined || amountToSpend <= 0n) {
+    return false;
+  }
+
+  if (!tokenAllowanceData || !tokenAddress || tokenAllowanceData?.[tokenAddress] === undefined) {
+    return true;
+  }
+
+  const shouldApprove = amountToSpend > tokenAllowanceData[tokenAddress];
+  const signedPermit = permits.find(
+    (permit) =>
+      permit.token === tokenAddress && BigInt(permit.value) >= amountToSpend && Number(permit.deadline) > nowInSeconds()
+  );
+
+  return shouldApprove && !signedPermit;
+}
+
+/**
+ * Used to adapt Synthetics tokens to InfoTokens where it's possible
+ */
+export function adaptToV1InfoTokens(tokensData: TokensData): InfoTokens {
+  const infoTokens = Object.keys(tokensData).reduce((acc, address) => {
+    const tokenData = getTokenData(tokensData, address)!;
+
+    acc[address] = adaptToV1TokenInfo(tokenData);
+
+    return acc;
+  }, {} as InfoTokens);
+
+  return infoTokens;
+}
+
+/**
+ * Used to adapt Synthetics tokens to InfoTokens where it's possible
+ */
+export function adaptToV1TokenInfo(tokenData: TokenData): TokenInfo {
+  return {
+    ...tokenData,
+    minPrice: tokenData.prices?.minPrice,
+    maxPrice: tokenData.prices?.maxPrice,
+  };
+}
+
+export function getBalanceByBalanceType(
+  tokenData: TokenData | undefined,
+  tokenBalanceType: TokenBalanceType
+): bigint | undefined {
+  if (tokenData === undefined) {
+    return undefined;
+  }
+
+  switch (tokenBalanceType) {
+    case TokenBalanceType.Wallet:
+      return tokenData.walletBalance;
+    case TokenBalanceType.GmxAccount:
+      return tokenData.gmxAccountBalance;
+    case TokenBalanceType.SourceChain:
+      return tokenData.sourceChainBalance;
+  }
+}
+
+export function getHasNoOnChainBalance(tokenData: TokenData | undefined): boolean {
+  return tokenData?.walletBalance === 0n && (tokenData.gmxAccountBalance ?? 0n) === 0n;
+}

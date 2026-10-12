@@ -1,0 +1,113 @@
+import { MarketInfo } from "utils/markets/types";
+import { DecreasePositionSwapType, OrderType } from "utils/orders/types";
+import { TokenData } from "utils/tokens/types";
+
+export enum TradeActionType {
+  OrderCreated = "OrderCreated",
+  OrderExecuted = "OrderExecuted",
+  OrderCancelled = "OrderCancelled",
+  OrderUpdated = "OrderUpdated",
+  OrderFrozen = "OrderFrozen",
+}
+
+/** For market orders this means expired (keeper cancelled after requestExpirationTime). */
+export const USER_INITIATED_CANCEL = "USER_INITIATED_CANCEL";
+
+export type PositionTradeAction = {
+  type: "position";
+  id: string;
+  srcChainId?: number;
+  eventName: TradeActionType;
+  marketInfo: MarketInfo;
+  marketAddress: string;
+  account: string;
+  initialCollateralTokenAddress: string;
+  initialCollateralToken: TokenData;
+  targetCollateralToken: TokenData;
+  indexToken: TokenData;
+  swapPath: string[];
+  positionKey?: string;
+  positionLifecycleId?: string;
+  positionSizeInUsd?: bigint;
+  positionSizeInTokens?: bigint;
+  initialCollateralDeltaAmount: bigint;
+  sizeDeltaUsd: bigint;
+  sizeDeltaInTokens?: bigint;
+  indexTokenPriceMin?: bigint;
+  indexTokenPriceMax?: bigint;
+  triggerPrice?: bigint;
+  acceptablePrice: bigint;
+  executionPrice?: bigint;
+  collateralTokenPriceMin?: bigint;
+  collateralTokenPriceMax?: bigint;
+  minOutputAmount: bigint;
+  priceImpactUsd?: bigint;
+  priceImpactDiffUsd?: bigint;
+  swapImpactUsd?: bigint;
+  swapFeeUsd?: bigint;
+  positionFeeAmount?: bigint;
+  traderDiscountAmount?: bigint;
+  borrowingFeeAmount?: bigint;
+  fundingFeeAmount?: bigint;
+  pnlUsd?: bigint;
+  basePnlUsd?: bigint;
+  orderType: OrderType;
+  decreasePositionSwapType?: DecreasePositionSwapType;
+  orderKey: string;
+  isLong: boolean;
+  reason?: string;
+  reasonBytes?: string;
+  shouldUnwrapNativeToken: boolean;
+  totalImpactUsd?: bigint;
+  liquidationFeeAmount?: bigint;
+  minCollateralFactorForLiquidation?: bigint;
+  twapParams:
+    | {
+        twapGroupId: string;
+        numberOfParts: number;
+      }
+    | undefined;
+  timestamp: number;
+  transactionHash: string;
+};
+
+export type SwapTradeAction = {
+  type: "swap";
+  id: string;
+  srcChainId?: number;
+  account: string;
+  eventName: TradeActionType;
+  initialCollateralTokenAddress: string;
+  initialCollateralToken: TokenData;
+  targetCollateralToken: TokenData;
+  shouldUnwrapNativeToken: boolean;
+  swapPath: string[];
+  initialCollateralDeltaAmount: bigint;
+  minOutputAmount: bigint;
+  executionAmountOut?: bigint;
+  swapFeeUsd?: bigint;
+  swapImpactUsd?: bigint;
+  orderType: OrderType;
+  orderKey: string;
+  reason?: string;
+  reasonBytes?: string;
+  twapParams:
+    | {
+        twapGroupId: string;
+        numberOfParts: number;
+      }
+    | undefined;
+
+  timestamp: number;
+  transactionHash: string;
+};
+
+export type TradeAction = PositionTradeAction | SwapTradeAction;
+
+export function isPositionTradeAction(tradeAction: TradeAction): tradeAction is PositionTradeAction {
+  return tradeAction.type === "position";
+}
+
+export function isSwapTradeAction(tradeAction: TradeAction): tradeAction is SwapTradeAction {
+  return tradeAction.type === "swap";
+}

@@ -1,0 +1,27 @@
+import { ARBITRUM, AVALANCHE } from "./chains";
+
+const BACKEND_URLS: { default: string } & Partial<Record<number, string>> = {
+  default: "https://gmx-server-mainnet.uw.r.appspot.com",
+
+  [ARBITRUM]: "https://gmx-server-mainnet.uw.r.appspot.com",
+  [AVALANCHE]: "https://gmx-avax-server.uc.r.appspot.com",
+};
+
+function getServerBaseUrl(chainId: number) {
+  if (!chainId) {
+    throw new Error("chainId is not provided");
+  }
+
+  if (document.location.hostname.includes("deploy-preview")) {
+    const fromLocalStorage = localStorage.getItem("SERVER_BASE_URL");
+    if (fromLocalStorage) {
+      return fromLocalStorage;
+    }
+  }
+
+  return BACKEND_URLS[chainId] || BACKEND_URLS.default;
+}
+
+export function getServerUrl(chainId: number, path: string) {
+  return `${getServerBaseUrl(chainId)}${path}`;
+}

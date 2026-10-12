@@ -1,0 +1,1860 @@
+import { addressToBytes32 } from "@layerzerolabs/lz-v2-utilities";
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { type Provider } from "ethers";
+import { ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import Skeleton from "react-loading-skeleton";
+import { Address, encodeAbiParameters, encodeEventTopics, isHex, toHex, zeroAddress } from "viem";
+import { useAccount } from "wagmi";
+
+import {
+  AnyChainId,
+  ContractsChainId,
+  getChainName,
+  isTestnetChain,
+  SettlementChainId,
+  SourceChainId,
+} from "config/chains";
+import { CHAIN_ID_TO_NETWORK_ICON } from "config/icons";
+import {
+  CHAIN_ID_PREFERRED_DEPOSIT_TOKEN,
+  getLayerZeroEndpointId,
+  getMappedTokenId,
+  getMultichainTokenId,
+  getStargatePoolAddress,
+  isSettlementChain,
+  MULTICHAIN_FUNDING_SLIPPAGE_BPS,
+  MULTI_CHAIN_TOKEN_MAPPING,
+  MULTI_CHAIN_WITHDRAWAL_TRADE_TOKENS,
+  RANDOM_ACCOUNT,
+} from "config/multichain";
+import {
+  useGmxAccountModalOpen,
+  useGmxAccountSettlementChainId,
+  useGmxAccountWithdrawalViewChain,
+  useGmxAccountWithdrawalViewTokenAddress,
+  useGmxAccountWithdrawalViewTokenInputValue,
+} from "context/GmxAccountContext/hooks";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useSyntheticsEvents } from "context/SyntheticsEvents";
+import { extractRelayTaskError } from "context/SyntheticsEvents/utils";
+import {
+  selectGmxAccountExpressGlobalParams,
+  selectGmxAccountGasPaymentToken,
+} from "context/SyntheticsStateContext/selectors/expressSelectors";
+import {
+  selectExpressOrdersEnabled,
+  selectGmxAccountGasPaymentTokenAddress,
+  selectSetExpressOrdersEnabled,
+} from "context/SyntheticsStateContext/selectors/settingsSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useArbitraryError, useArbitraryRelayParamsAndPayload } from "domain/multichain/arbitraryRelayParams";
+import { fallbackCustomError } from "domain/multichain/fallbackCustomError";
+import { getMultichainTransferSendParams } from "domain/multichain/getSendParams";
+import { isStringEqualInsensitive, matchLogRequest } from "domain/multichain/progress/LongCrossChainTask";
+import {
+  estimateSameChainWithdrawalGas,
+  sendSameChainWithdrawalTxn,
+} from "domain/multichain/sendSameChainWithdrawalTxn";
+import { toastCustomOrStargateError } from "domain/multichain/toastCustomOrStargateError";
+import { toastEnableExpress } from "domain/multichain/toastEnableExpress";
+import { BridgeOutParams, SendParam } from "domain/multichain/types";
+import { useGmxAccountFundingHistory } from "domain/multichain/useGmxAccountFundingHistory";
+import { useMultichainQuoteFeeUsd } from "domain/multichain/useMultichainQuoteFeeUsd";
+import { useQuoteOft } from "domain/multichain/useQuoteOft";
+import { useQuoteOftLimits } from "domain/multichain/useQuoteOftLimits";
+import { useQuoteSendNativeFee } from "domain/multichain/useQuoteSend";
+import { callRelayTransaction } from "domain/synthetics/express/callRelayTransaction";
+import { buildAndSignBridgeOutTxn } from "domain/synthetics/express/expressOrderUtils";
+import { ExpressTransactionBuilder, ExpressTxnParams, RawRelayParamsPayload } from "domain/synthetics/express/types";
+import { GMX_ACCOUNT_NETWORK_FEE_SOURCE, WALLET_NETWORK_FEE_SOURCE } from "domain/synthetics/fees/networkFeeSource";
+import { useGasPrice } from "domain/synthetics/fees/useGasPrice";
+import { getBalanceByBalanceType, TokensData, useTokensDataRequest } from "domain/synthetics/tokens";
+import {
+  getInsufficientFeeButtonMessage,
+  getNativeGasError,
+  ValidationBannerErrorName,
+} from "domain/synthetics/trade/utils/validation";
+import { convertToUsd, sortTokenDataByBalance, TokenBalanceType, TokenData } from "domain/tokens";
+import { useMaxAvailableAmount } from "domain/tokens/useMaxAvailableAmount";
+import { useChainId } from "lib/chains";
+import { useMultipleWalletExtensionsChainError } from "lib/chains/getMultipleWalletExtensionsChainError";
+import { useLeadingDebounce } from "lib/debounce/useLeadingDebounde";
+import { isCustomError, parseError } from "lib/errors";
+import { helperToast } from "lib/helperToast";
+import {
+  initMultichainWithdrawalMetricData,
+  sendOrderSimulatedMetric,
+  sendOrderSubmittedMetric,
+  sendOrderTxnSubmittedMetric,
+  sendTxnErrorMetric,
+  sendTxnSentMetric,
+  sendTxnValidationErrorMetric,
+} from "lib/metrics";
+import { expandDecimals, formatUsdParts, parseValue, USD_DECIMALS } from "lib/numbers";
+import { EMPTY_ARRAY, getByKey } from "lib/objects";
+import { useJsonRpcProvider } from "lib/rpc";
+import { TxnEventName } from "lib/transactions";
+import { ExpressTxnData, sendExpressTransaction } from "lib/transactions/sendExpressTransaction";
+import { getPageOutdatedError, useHasOutdatedUi } from "lib/useHasOutdatedUi";
+import { sendMultichainWithdrawalSuccessEvent } from "lib/userAnalytics/utils";
+import { AsyncResult, useThrottledAsync } from "lib/useThrottledAsync";
+import { WalletSigner } from "lib/wallets";
+import { getPublicClientWithRpc } from "lib/wallets/walletConfig";
+import { abis } from "sdk/abis";
+import { getContract } from "sdk/configs/contracts";
+import { convertTokenAddress, getToken, getWrappedToken, isValidTokenSafe } from "sdk/configs/tokens";
+import { CustomErrorName } from "sdk/utils/errors";
+import { convertToTokenAmount, getMidPrice } from "sdk/utils/tokens";
+import { applySlippageToMinOut } from "sdk/utils/trade";
+
+import { AlertInfoCard } from "components/AlertInfo/AlertInfoCard";
+import { Amount } from "components/Amount/Amount";
+import { AmountWithUsdBalance } from "components/AmountWithUsd/AmountWithUsd";
+import Button from "components/Button/Button";
+import { DropdownSelector } from "components/DropdownSelector/DropdownSelector";
+import { getTxnErrorToast } from "components/Errors/errorToasts";
+import { ValidationBannerErrorContent } from "components/Errors/gasErrors";
+import { getSimulationErrorButtonContent } from "components/Errors/getSimulationErrorButtonContent";
+import { calculateNetworkFeeDetails } from "components/GmxAccountModal/calculateNetworkFeeDetails";
+import { useAvailableToTradeAssetMultichain, useGmxAccountWithdrawNetworks } from "components/GmxAccountModal/hooks";
+import { MaxActions } from "components/MaxActions/MaxActions";
+import { NetworkFeeValue } from "components/NetworkFeeRow/NetworkFeeValue";
+import NumberInput from "components/NumberInput/NumberInput";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+import { ButtonTooltipWrapper } from "components/Tooltip/ButtonTooltipWrapper";
+import { ValueTransition } from "components/ValueTransition/ValueTransition";
+
+import SpinnerIcon from "img/ic_spinner.svg?react";
+
+import { SyntheticsInfoRow } from "../SyntheticsInfoRow";
+import { wrapChainAction } from "./wrapChainAction";
+
+const valueSkeleton = (
+  <Skeleton
+    baseColor="#B4BBFF1A"
+    highlightColor="#B4BBFF1A"
+    width={96}
+    height={14}
+    borderRadius={4}
+    className="leading-[14px]"
+    inline
+  />
+);
+
+const useIsFirstWithdrawal = () => {
+  const [enabled, setEnabled] = useState(true);
+  const [isFirstWithdrawal, setIsFirstWithdrawal] = useState(false);
+  const { fundingHistory, isLoading } = useGmxAccountFundingHistory({ enabled });
+
+  useEffect(() => {
+    if (isLoading) {
+      return;
+    }
+
+    if (fundingHistory === undefined || fundingHistory.length !== 0) {
+      return;
+    }
+
+    setEnabled(false);
+    const hasWithdrawal = fundingHistory.some((funding) => funding.operation === "withdrawal");
+    if (!hasWithdrawal) {
+      setIsFirstWithdrawal(true);
+    }
+  }, [fundingHistory, isLoading]);
+
+  return isFirstWithdrawal;
+};
+
+function getFilteredNetworks({
+  networks,
+  unwrappedSelectedTokenAddress,
+  chainId,
+}: {
+  networks: { id: number; name: string }[];
+  unwrappedSelectedTokenAddress: string | undefined;
+  chainId: number;
+}): { id: number; name: string; disabled?: boolean }[] {
+  if (!unwrappedSelectedTokenAddress) {
+    return networks;
+  }
+
+  return networks
+    .map((network): { id: number; name: string; disabled?: boolean } => {
+      if (network.id === chainId) {
+        return network;
+      }
+
+      const mappedTokenId = getMappedTokenId(
+        chainId as SettlementChainId,
+        unwrappedSelectedTokenAddress,
+        network.id as SourceChainId
+      );
+      const isTransferable = mappedTokenId !== undefined;
+      return {
+        ...network,
+        disabled: !isTransferable,
+      };
+    })
+    .sort((a, b) => {
+      return a.disabled ? 1 : b.disabled ? -1 : 0;
+    });
+}
+
+function getMultichainWithdrawalTokens({
+  chainId,
+  tokensData,
+}: {
+  chainId: ContractsChainId;
+  tokensData: TokensData;
+}): TokenData[] {
+  return (
+    MULTI_CHAIN_WITHDRAWAL_TRADE_TOKENS[chainId as SettlementChainId]
+      ?.map((tokenAddress) => tokensData[tokenAddress] as TokenData | undefined)
+      .filter((token): token is TokenData => {
+        return token !== undefined && token.address !== zeroAddress;
+      })
+      .sort(sortTokenDataByBalance) || EMPTY_ARRAY
+  );
+}
+
+function getSameChainWithdrawalTokens({
+  chainId,
+  tokensData,
+}: {
+  chainId: ContractsChainId;
+  tokensData: TokensData;
+}): TokenData[] {
+  return Object.values(tokensData)
+    .filter((token): token is TokenData => {
+      return (
+        token !== undefined &&
+        token.address !== zeroAddress &&
+        token.gmxAccountBalance !== undefined &&
+        token.gmxAccountBalance > 0n &&
+        !MULTI_CHAIN_WITHDRAWAL_TRADE_TOKENS[chainId as SettlementChainId]?.includes(token.address)
+      );
+    })
+    .sort(sortTokenDataByBalance);
+}
+
+function getWithdrawalTokenOptions({
+  chainId,
+  tokensData,
+}: {
+  chainId: ContractsChainId;
+  tokensData: TokensData | undefined;
+}): TokenData[] {
+  if (!isSettlementChain(chainId) || !tokensData) {
+    return EMPTY_ARRAY;
+  }
+
+  const multichainTokens = getMultichainWithdrawalTokens({ chainId, tokensData });
+  const sameChainTokens = getSameChainWithdrawalTokens({ chainId, tokensData });
+
+  return multichainTokens.concat(sameChainTokens);
+}
+
+function useWithdrawViewTransactions({
+  selectedToken,
+  inputAmountUsd,
+  bridgeOutParams,
+  expressTxnParamsAsyncResult,
+}: {
+  selectedToken: TokenData | undefined;
+  inputAmountUsd: bigint | undefined;
+  bridgeOutParams: BridgeOutParams | undefined;
+  expressTxnParamsAsyncResult: AsyncResult<ExpressTxnParams>;
+}) {
+  const { chainId } = useChainId();
+  const { address: account } = useAccount();
+  const [withdrawalViewChain] = useGmxAccountWithdrawalViewChain();
+  const [selectedTokenAddress] = useGmxAccountWithdrawalViewTokenAddress();
+  const isSameChain = withdrawalViewChain === chainId;
+  const { provider } = useJsonRpcProvider(chainId);
+  const isFirstWithdrawal = useIsFirstWithdrawal();
+  const [, setSettlementChainId] = useGmxAccountSettlementChainId();
+  const [, setIsVisibleOrView] = useGmxAccountModalOpen();
+  const {
+    setMultichainSubmittedWithdrawal,
+    setMultichainWithdrawalSentTxnHash,
+    setMultichainWithdrawalSentError,
+    setMultichainFundingPendingId,
+  } = useSyntheticsEvents();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const gasPaymentParams = expressTxnParamsAsyncResult?.data?.gasPaymentParams;
+  const unwrappedSelectedTokenAddress =
+    selectedTokenAddress !== undefined ? convertTokenAddress(chainId, selectedTokenAddress, "native") : undefined;
+  const unwrappedSelectedTokenSymbol = unwrappedSelectedTokenAddress
+    ? getToken(chainId, unwrappedSelectedTokenAddress).symbol
+    : undefined;
+
+  const handleSameChainWithdraw = useCallback(async () => {
+    if (withdrawalViewChain === undefined || selectedToken === undefined || account === undefined) {
+      return;
+    }
+
+    if (!bridgeOutParams) {
+      helperToast.error(t`Missing required parameters`);
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    await wrapChainAction(chainId, setSettlementChainId, async (signer) => {
+      try {
+        await sendSameChainWithdrawalTxn({
+          chainId: chainId as SettlementChainId,
+          signer,
+          bridgeOutParams,
+          callback: (txnEvent) => {
+            if (txnEvent.event === TxnEventName.Sent) {
+              helperToast.success("Withdrawal sent", { toastId: "same-chain-gmx-account-withdrawal" });
+              setIsVisibleOrView("transferHistory");
+              setIsSubmitting(false);
+
+              if (txnEvent.data.type === "wallet") {
+                const txnHash = txnEvent.data.transactionHash;
+                const mockId = setMultichainSubmittedWithdrawal({
+                  amount: bridgeOutParams.amount,
+                  settlementChainId: chainId,
+                  sourceChainId: 0,
+                  tokenAddress: selectedToken.address,
+                  sentTxn: txnHash,
+                });
+
+                if (!mockId) {
+                  return;
+                }
+
+                if (!isHex(txnHash)) {
+                  return;
+                }
+
+                getPublicClientWithRpc(chainId)
+                  .waitForTransactionReceipt({
+                    hash: txnHash,
+                  })
+                  .then((receipt) => {
+                    const bridgeOutEvent = receipt.logs.find(
+                      (log) =>
+                        isStringEqualInsensitive(log.address, getContract(chainId, "EventEmitter")) &&
+                        matchLogRequest(
+                          encodeEventTopics({
+                            abi: abis.EventEmitter,
+                            eventName: "EventLog1",
+                            args: {
+                              eventNameHash: "MultichainBridgeOut",
+                              topic1: toHex(addressToBytes32(account)),
+                            },
+                          }),
+                          log.topics
+                        )
+                    );
+                    const bridgeOutEventIndex = bridgeOutEvent?.logIndex;
+                    if (bridgeOutEventIndex === undefined) {
+                      return;
+                    }
+
+                    const id = `${txnHash.toLowerCase()}:${bridgeOutEventIndex}`;
+                    setMultichainFundingPendingId(mockId, id);
+                  });
+              }
+            } else if (txnEvent.event === TxnEventName.Error) {
+              setIsSubmitting(false);
+            }
+          },
+        });
+      } catch (error) {
+        toastCustomOrStargateError(chainId, error, { defaultMessage: t`Withdrawal failed` });
+      } finally {
+        setIsSubmitting(false);
+      }
+    });
+  }, [
+    account,
+    bridgeOutParams,
+    chainId,
+    selectedToken,
+    setIsVisibleOrView,
+    setMultichainFundingPendingId,
+    setMultichainSubmittedWithdrawal,
+    setSettlementChainId,
+    withdrawalViewChain,
+  ]);
+
+  const handleMultichainWithdraw = useCallback(async () => {
+    if (withdrawalViewChain === undefined || selectedToken === undefined || account === undefined) {
+      return;
+    }
+
+    const metricData = initMultichainWithdrawalMetricData({
+      settlementChain: chainId,
+      sourceChain: withdrawalViewChain,
+      assetSymbol: unwrappedSelectedTokenSymbol ?? selectedToken.symbol,
+      sizeInUsd: inputAmountUsd!,
+      isFirstWithdrawal,
+    });
+
+    sendOrderSubmittedMetric(metricData.metricId);
+
+    if (
+      gasPaymentParams === undefined ||
+      bridgeOutParams === undefined ||
+      expressTxnParamsAsyncResult.promise === undefined ||
+      provider === undefined
+    ) {
+      helperToast.error(t`Missing required parameters`);
+      sendTxnValidationErrorMetric(metricData.metricId);
+      return;
+    }
+
+    const expressTxnParams = await expressTxnParamsAsyncResult.promise;
+
+    if (expressTxnParams === undefined || !expressTxnParams.gasPaymentValidations.isValid) {
+      helperToast.error(t`Missing required parameters`);
+      sendTxnValidationErrorMetric(metricData.metricId);
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const relayParamsPayload = expressTxnParams.relayParamsPayload;
+
+      await wrapChainAction(withdrawalViewChain, setSettlementChainId, async (signer) => {
+        await simulateWithdraw({
+          chainId: chainId as SettlementChainId,
+          relayerFeeTokenAddress: gasPaymentParams.relayerFeeTokenAddress,
+          relayerFeeAmount: gasPaymentParams.relayerFeeAmount,
+          relayParamsPayload: relayParamsPayload,
+          params: bridgeOutParams,
+          signer,
+          provider,
+          srcChainId: withdrawalViewChain,
+        });
+
+        sendOrderSimulatedMetric(metricData.metricId);
+
+        const signedTxnData: ExpressTxnData = await buildAndSignBridgeOutTxn({
+          chainId: chainId as SettlementChainId,
+          signer,
+          account,
+          relayParamsPayload: relayParamsPayload as RawRelayParamsPayload,
+          params: bridgeOutParams,
+          relayerFeeAmount: gasPaymentParams.relayerFeeAmount,
+          relayerFeeTokenAddress: gasPaymentParams.relayerFeeTokenAddress,
+          srcChainId: withdrawalViewChain,
+        });
+
+        const mockWithdrawalId = setMultichainSubmittedWithdrawal({
+          amount: bridgeOutParams.amount,
+          settlementChainId: chainId,
+          sourceChainId: withdrawalViewChain,
+          tokenAddress: unwrappedSelectedTokenAddress ?? selectedToken.address,
+        });
+
+        const receipt = await sendExpressTransaction({
+          chainId,
+          txnData: signedTxnData,
+        });
+
+        sendOrderTxnSubmittedMetric(metricData.metricId);
+
+        setIsVisibleOrView("transferHistory");
+
+        const txResult = await receipt.wait();
+
+        if (txResult.status === "success") {
+          sendTxnSentMetric(metricData.metricId);
+          sendMultichainWithdrawalSuccessEvent(metricData.metricId);
+          if (txResult.transactionHash && mockWithdrawalId) {
+            setMultichainWithdrawalSentTxnHash(mockWithdrawalId, txResult.transactionHash);
+          }
+        } else if (txResult.status === "failed") {
+          if (mockWithdrawalId) {
+            setMultichainWithdrawalSentError(mockWithdrawalId);
+          }
+
+          if (txResult.relayStatus) {
+            const relayError = extractRelayTaskError(txResult.relayStatus);
+            const toastParams = getTxnErrorToast(chainId, parseError(relayError), {
+              defaultMessage: t`Withdrawal failed`,
+            });
+
+            helperToast.error(toastParams.errorContent, {
+              autoClose: toastParams.autoCloseToast,
+              tradingErrorInfo: {
+                actionName: "Multichain Withdrawal",
+                errorData: relayError,
+                metricId: metricData.metricId,
+              },
+            });
+            sendTxnErrorMetric(metricData.metricId, relayError, "relayer");
+          }
+        }
+      });
+    } catch (error) {
+      const prettyError = toastCustomOrStargateError(chainId, error, {
+        actionName: "Multichain Withdrawal",
+        metricId: metricData.metricId,
+      });
+      sendTxnErrorMetric(metricData.metricId, prettyError, "unknown");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [
+    account,
+    bridgeOutParams,
+    chainId,
+    expressTxnParamsAsyncResult.promise,
+    gasPaymentParams,
+    inputAmountUsd,
+    isFirstWithdrawal,
+    provider,
+    selectedToken,
+    setIsVisibleOrView,
+    setMultichainSubmittedWithdrawal,
+    setMultichainWithdrawalSentError,
+    setMultichainWithdrawalSentTxnHash,
+    setSettlementChainId,
+    unwrappedSelectedTokenAddress,
+    unwrappedSelectedTokenSymbol,
+    withdrawalViewChain,
+  ]);
+
+  const handleWithdraw = useCallback(async () => {
+    if (isSameChain) {
+      await handleSameChainWithdraw();
+    } else {
+      await handleMultichainWithdraw();
+    }
+  }, [isSameChain, handleSameChainWithdraw, handleMultichainWithdraw]);
+
+  return { handleWithdraw, isSubmitting };
+}
+
+export const WithdrawalView = () => {
+  const { chainId } = useChainId();
+  const [withdrawalViewChain, setWithdrawalViewChain] = useGmxAccountWithdrawalViewChain();
+  const isSameChain = withdrawalViewChain === chainId;
+  const { address: account } = useAccount();
+  const [isVisibleOrView] = useGmxAccountModalOpen();
+  const [inputValue, setInputValue] = useGmxAccountWithdrawalViewTokenInputValue();
+  const [selectedTokenAddress, setSelectedTokenAddress] = useGmxAccountWithdrawalViewTokenAddress();
+
+  const hasOutdatedUi = useHasOutdatedUi();
+  const multipleWalletExtensionsChainError = useMultipleWalletExtensionsChainError();
+
+  const { tokensData } = useTokensDataRequest(chainId, withdrawalViewChain);
+  const networks = useGmxAccountWithdrawNetworks();
+  const globalExpressParams = useSelector(selectGmxAccountExpressGlobalParams);
+  const relayerFeeToken = getByKey(tokensData, globalExpressParams?.relayerFeeTokenAddress);
+  const gasPaymentToken = useSelector(selectGmxAccountGasPaymentToken);
+  const gasPaymentTokenAddress = useSelector(selectGmxAccountGasPaymentTokenAddress);
+
+  const selectedToken = useMemo(() => {
+    return getByKey(tokensData, selectedTokenAddress);
+  }, [selectedTokenAddress, tokensData]);
+
+  const unwrappedSelectedTokenAddress =
+    selectedTokenAddress !== undefined ? convertTokenAddress(chainId, selectedTokenAddress, "native") : undefined;
+  const wrappedNativeTokenAddress = getContract(chainId, "NATIVE_TOKEN");
+  const wrappedNativeToken = getByKey(tokensData, wrappedNativeTokenAddress);
+
+  const selectedTokenSettlementChainTokenId = unwrappedSelectedTokenAddress
+    ? getMultichainTokenId(chainId, unwrappedSelectedTokenAddress)
+    : undefined;
+
+  const realInputAmount =
+    selectedToken && inputValue !== undefined ? parseValue(inputValue, selectedToken.decimals) : undefined;
+  const inputAmount = useLeadingDebounce(realInputAmount);
+  const inputAmountUsd = selectedToken
+    ? convertToUsd(inputAmount, selectedToken.decimals, selectedToken.prices.maxPrice)
+    : undefined;
+
+  const isInsufficientBalance =
+    selectedToken?.gmxAccountBalance !== undefined &&
+    inputAmount !== undefined &&
+    inputAmount > selectedToken.gmxAccountBalance;
+
+  const filteredNetworks = useMemo(
+    () =>
+      getFilteredNetworks({
+        networks,
+        unwrappedSelectedTokenAddress,
+        chainId,
+      }),
+    [unwrappedSelectedTokenAddress, networks, chainId]
+  );
+
+  const tokenOptions = useMemo(() => getWithdrawalTokenOptions({ chainId, tokensData }), [chainId, tokensData]);
+
+  const { gmxAccountUsd, isLoading: isGmxAccountUsdLoading } = useAvailableToTradeAssetMultichain();
+
+  const { nextGmxAccountBalanceUsd } = useMemo(() => {
+    if (
+      selectedToken === undefined ||
+      inputAmount === undefined ||
+      inputAmountUsd === undefined ||
+      isInsufficientBalance
+    ) {
+      return { nextGmxAccountBalanceUsd: undefined };
+    }
+
+    const nextGmxAccountBalanceUsd = (gmxAccountUsd ?? 0n) - inputAmountUsd;
+
+    return { nextGmxAccountBalanceUsd };
+  }, [selectedToken, inputAmount, inputAmountUsd, gmxAccountUsd, isInsufficientBalance]);
+
+  const sendParamsWithoutSlippage: SendParam | undefined = useMemo(() => {
+    if (
+      isSameChain ||
+      !account ||
+      inputAmount === undefined ||
+      inputAmount <= 0n ||
+      withdrawalViewChain === undefined
+    ) {
+      return;
+    }
+
+    return getMultichainTransferSendParams({
+      dstChainId: withdrawalViewChain,
+      account,
+      amountLD: inputAmount,
+      isToGmx: false,
+    });
+  }, [isSameChain, account, inputAmount, withdrawalViewChain]);
+
+  const { data: quoteOft, isLoading: isQuoteOftLoading } = useQuoteOft({
+    sendParams: sendParamsWithoutSlippage,
+    fromStargateAddress: selectedTokenSettlementChainTokenId?.stargate,
+    fromChainId: chainId,
+    toChainId: withdrawalViewChain,
+  });
+
+  const { isBelowLimit, lowerLimitFormatted, isAboveLimit, upperLimitFormatted } = useQuoteOftLimits({
+    quoteOft,
+    amountLD: inputAmount,
+    isStable: selectedToken?.isStable,
+    decimals: selectedTokenSettlementChainTokenId?.decimals,
+    symbol: selectedToken?.symbol,
+    enabled: !isSameChain,
+  });
+
+  const baseSendParams = useMemo(() => {
+    if (isSameChain || !withdrawalViewChain) {
+      return;
+    }
+
+    const prices = getByKey(tokensData, unwrappedSelectedTokenAddress)?.prices;
+    const decimals = selectedTokenSettlementChainTokenId?.decimals;
+
+    if (!prices || decimals === undefined) {
+      return;
+    }
+
+    const fakeInputAmount = convertToTokenAmount(expandDecimals(1, USD_DECIMALS), decimals, getMidPrice(prices));
+
+    if (fakeInputAmount === undefined) {
+      return;
+    }
+
+    return getMultichainTransferSendParams({
+      dstChainId: withdrawalViewChain,
+      account: RANDOM_ACCOUNT.address,
+      amountLD: fakeInputAmount,
+      isToGmx: false,
+      srcChainId: chainId,
+    });
+  }, [
+    chainId,
+    isSameChain,
+    selectedTokenSettlementChainTokenId?.decimals,
+    tokensData,
+    unwrappedSelectedTokenAddress,
+    withdrawalViewChain,
+  ]);
+
+  const { data: baseNativeFee, isLoading: isBaseNativeFeeLoading } = useQuoteSendNativeFee({
+    sendParams: baseSendParams,
+    fromStargateAddress: selectedTokenSettlementChainTokenId?.stargate,
+    fromChainId: chainId,
+    toChainId: withdrawalViewChain,
+  });
+
+  const {
+    networkFeeUsd: bridgeNetworkFeeUsd,
+    protocolFeeUsd,
+    protocolFeeAmount,
+    networkFee: bridgeNetworkFee,
+  } = useMultichainQuoteFeeUsd({
+    quoteSendNativeFee: baseNativeFee,
+    quoteOft,
+    unwrappedTokenAddress: unwrappedSelectedTokenAddress,
+    sourceChainId: chainId,
+    targetChainId: withdrawalViewChain,
+  });
+
+  const baseBridgeOutParams: BridgeOutParams | undefined = useMemo(() => {
+    if (
+      withdrawalViewChain === undefined ||
+      selectedTokenAddress === undefined ||
+      unwrappedSelectedTokenAddress === undefined
+    ) {
+      return;
+    }
+
+    const prices = getByKey(tokensData, unwrappedSelectedTokenAddress)?.prices;
+    const decimals = selectedTokenSettlementChainTokenId?.decimals;
+
+    if (!prices || decimals === undefined) {
+      return;
+    }
+
+    const fakeAmount = convertToTokenAmount(expandDecimals(10, USD_DECIMALS), decimals, getMidPrice(prices));
+    if (fakeAmount === undefined) {
+      return;
+    }
+
+    if (isSameChain) {
+      return {
+        token: selectedTokenAddress as Address,
+        amount: fakeAmount,
+        minAmountOut: fakeAmount,
+        data: "0x",
+        provider: zeroAddress,
+      };
+    }
+
+    const dstEid = getLayerZeroEndpointId(withdrawalViewChain);
+    const stargateAddress = getStargatePoolAddress(chainId, unwrappedSelectedTokenAddress);
+
+    if (dstEid === undefined || stargateAddress === undefined) {
+      return;
+    }
+
+    return {
+      token: selectedTokenAddress as Address,
+      amount: fakeAmount,
+      minAmountOut: 0n,
+      data: encodeAbiParameters(
+        [
+          {
+            type: "uint32",
+            name: "dstEid",
+          },
+        ],
+        [dstEid]
+      ),
+      provider: stargateAddress,
+    };
+  }, [
+    withdrawalViewChain,
+    selectedTokenAddress,
+    unwrappedSelectedTokenAddress,
+    tokensData,
+    selectedTokenSettlementChainTokenId?.decimals,
+    isSameChain,
+    chainId,
+  ]);
+
+  const bridgeOutParams: BridgeOutParams | undefined = useMemo(() => {
+    if (
+      withdrawalViewChain === undefined ||
+      selectedTokenAddress === undefined ||
+      unwrappedSelectedTokenAddress === undefined ||
+      inputAmount === undefined ||
+      inputAmount <= 0n
+    ) {
+      return;
+    }
+
+    if (isSameChain) {
+      return {
+        token: selectedTokenAddress as Address,
+        amount: inputAmount,
+        minAmountOut: inputAmount, // Ignored by the same-chain transferOut path
+        data: "0x",
+        provider: zeroAddress,
+      };
+    }
+
+    const dstEid = getLayerZeroEndpointId(withdrawalViewChain);
+    const stargateAddress = getStargatePoolAddress(chainId, unwrappedSelectedTokenAddress);
+
+    if (dstEid === undefined || stargateAddress === undefined || quoteOft === undefined) {
+      return;
+    }
+
+    return {
+      token: selectedTokenAddress as Address,
+      amount: inputAmount,
+      minAmountOut: applySlippageToMinOut(MULTICHAIN_FUNDING_SLIPPAGE_BPS, quoteOft.receipt.amountReceivedLD),
+      data: encodeAbiParameters(
+        [
+          {
+            type: "uint32",
+            name: "dstEid",
+          },
+        ],
+        [dstEid]
+      ),
+      provider: stargateAddress,
+    };
+  }, [
+    withdrawalViewChain,
+    selectedTokenAddress,
+    unwrappedSelectedTokenAddress,
+    inputAmount,
+    isSameChain,
+    chainId,
+    quoteOft,
+  ]);
+
+  const gasPrice = useGasPrice(chainId);
+
+  const sameChainNetworkFeeAsyncResult = useThrottledAsync(
+    async ({ params }) => {
+      const client = getPublicClientWithRpc(params.chainId);
+
+      return estimateSameChainWithdrawalGas({
+        chainId: params.chainId as SettlementChainId,
+        client,
+        bridgeOutParams: params.bridgeOutParams,
+        account: params.account,
+      });
+    },
+    {
+      params:
+        isSameChain && account && (bridgeOutParams ?? baseBridgeOutParams) && chainId
+          ? {
+              account,
+              bridgeOutParams: bridgeOutParams ?? baseBridgeOutParams!,
+              chainId,
+            }
+          : undefined,
+      withLoading: true,
+    }
+  );
+
+  const sameChainNetworkFeeDetails = useMemo(
+    () =>
+      calculateNetworkFeeDetails({
+        gasLimit: sameChainNetworkFeeAsyncResult.data,
+        gasPrice,
+        tokensData,
+      }),
+    [sameChainNetworkFeeAsyncResult.data, gasPrice, tokensData]
+  );
+
+  const sameChainGasError = isSameChain
+    ? getNativeGasError({
+        chainId,
+        networkFee: sameChainNetworkFeeDetails?.amount,
+        nativeBalance: getByKey(tokensData, zeroAddress)?.walletBalance,
+      })
+    : undefined;
+
+  const isSelectedGasPaymentToken = useMemo(() => {
+    if (selectedToken === undefined || gasPaymentToken === undefined) {
+      return false;
+    }
+
+    return isStringEqualInsensitive(
+      convertTokenAddress(chainId, selectedToken.address, "wrapped"),
+      convertTokenAddress(chainId, gasPaymentToken.address, "wrapped")
+    );
+  }, [chainId, gasPaymentToken, selectedToken]);
+
+  const gasPaymentTokenAsCollateralAmount = isSelectedGasPaymentToken ? inputAmount : undefined;
+  const baseGasPaymentTokenAsCollateralAmount = isSelectedGasPaymentToken ? baseBridgeOutParams?.amount : undefined;
+
+  const baseExpressTransactionBuilder: ExpressTransactionBuilder | undefined = useMemo(() => {
+    if (
+      account === undefined ||
+      baseBridgeOutParams === undefined ||
+      withdrawalViewChain === undefined ||
+      isSameChain
+    ) {
+      return;
+    }
+
+    const builder: ExpressTransactionBuilder = async ({ gasPaymentParams, relayParams }) => ({
+      txnData: await buildAndSignBridgeOutTxn({
+        chainId: chainId as SettlementChainId,
+        signer: undefined,
+        account,
+        relayParamsPayload: relayParams,
+        params: baseBridgeOutParams,
+        emptySignature: true,
+        relayerFeeTokenAddress: gasPaymentParams.relayerFeeTokenAddress,
+        relayerFeeAmount: gasPaymentParams.relayerFeeAmount,
+        srcChainId: withdrawalViewChain,
+      }),
+    });
+
+    return builder;
+  }, [account, baseBridgeOutParams, chainId, isSameChain, withdrawalViewChain]);
+
+  const baseExpressTxnParamsAsyncResult = useArbitraryRelayParamsAndPayload({
+    expressTransactionBuilder: baseExpressTransactionBuilder,
+    isGmxAccount: true,
+    requireValidations: false,
+    overrideWnt: !isSameChain,
+    gasPaymentTokenAsCollateralAmount: baseGasPaymentTokenAsCollateralAmount,
+    enabled: !isSameChain,
+  });
+
+  const expressTransactionBuilder: ExpressTransactionBuilder | undefined = useMemo(() => {
+    if (account === undefined || bridgeOutParams === undefined || withdrawalViewChain === undefined || isSameChain) {
+      return;
+    }
+
+    const expressTransactionBuilder: ExpressTransactionBuilder = async ({ gasPaymentParams, relayParams }) => ({
+      txnData: await buildAndSignBridgeOutTxn({
+        chainId: chainId as SettlementChainId,
+        signer: undefined,
+        account,
+        relayParamsPayload: relayParams,
+        params: bridgeOutParams,
+        emptySignature: true,
+        relayerFeeTokenAddress: gasPaymentParams.relayerFeeTokenAddress,
+        relayerFeeAmount: gasPaymentParams.relayerFeeAmount,
+        srcChainId: withdrawalViewChain,
+      }),
+    });
+
+    return expressTransactionBuilder;
+  }, [account, bridgeOutParams, chainId, isSameChain, withdrawalViewChain]);
+
+  const expressTxnParamsAsyncResult = useArbitraryRelayParamsAndPayload({
+    expressTransactionBuilder,
+    isGmxAccount: true,
+    requireValidations: false,
+    overrideWnt: !isSameChain,
+    gasPaymentTokenAsCollateralAmount,
+    enabled: !isSameChain,
+  });
+
+  const errors = useArbitraryError(expressTxnParamsAsyncResult.error, { isGmxAccount: true });
+
+  const isBridgeOutputBelowMinimum =
+    isCustomError(expressTxnParamsAsyncResult.error) &&
+    expressTxnParamsAsyncResult.error.name === CustomErrorName.InsufficientBridgeOutputAmount;
+
+  const isOutOfTokenErrorToken = useMemo(() => {
+    if (errors?.isOutOfTokenError?.tokenAddress) {
+      return getByKey(tokensData, errors?.isOutOfTokenError?.tokenAddress);
+    }
+  }, [errors, tokensData]);
+
+  const relayFeeAmount = expressTxnParamsAsyncResult?.data?.gasPaymentParams.relayerFeeAmount;
+  const gasPaymentTokenAmount = expressTxnParamsAsyncResult?.data?.gasPaymentParams.gasPaymentTokenAmount;
+  const baseRelayFeeAmount = baseExpressTxnParamsAsyncResult?.data?.gasPaymentParams.relayerFeeAmount;
+  const baseGasPaymentTokenAmount = baseExpressTxnParamsAsyncResult?.data?.gasPaymentParams.gasPaymentTokenAmount;
+
+  const someRelayFeeAmount = relayFeeAmount ?? baseRelayFeeAmount;
+  const someGasPaymentTokenAmount = gasPaymentTokenAmount ?? baseGasPaymentTokenAmount;
+
+  const { networkFeeUsd, wntFee, wntFeeUsd, networkFeeInGasPaymentToken } = useMemo(() => {
+    if (
+      someGasPaymentTokenAmount === undefined ||
+      gasPaymentToken === undefined ||
+      someRelayFeeAmount === undefined ||
+      relayerFeeToken === undefined
+    ) {
+      return {
+        networkFeeUsd: undefined,
+        wntFee: undefined,
+        wntFeeUsd: undefined,
+        networkFeeInGasPaymentToken: undefined,
+      };
+    }
+
+    const relayFeeUsd = convertToUsd(someRelayFeeAmount, relayerFeeToken.decimals, getMidPrice(relayerFeeToken.prices));
+
+    const gasPaymentTokenUsd = convertToUsd(
+      someGasPaymentTokenAmount,
+      gasPaymentToken?.decimals,
+      getMidPrice(gasPaymentToken.prices)
+    );
+
+    if (
+      relayFeeUsd === undefined ||
+      gasPaymentTokenUsd === undefined ||
+      bridgeNetworkFeeUsd === undefined ||
+      bridgeNetworkFee === undefined
+    ) {
+      return {
+        networkFeeUsd: undefined,
+        wntFee: undefined,
+        wntFeeUsd: undefined,
+        networkFeeInGasPaymentToken: undefined,
+      };
+    }
+
+    const bridgeNetworkFeeInGasPaymentToken = convertToTokenAmount(
+      bridgeNetworkFeeUsd,
+      gasPaymentToken.decimals,
+      getMidPrice(gasPaymentToken.prices)
+    )!;
+
+    const wntFee = bridgeNetworkFee + (gasPaymentToken.isWrapped ? someRelayFeeAmount : 0n);
+    const wntFeeUsd = bridgeNetworkFeeUsd + (gasPaymentToken.isWrapped ? relayFeeUsd : 0n);
+
+    return {
+      networkFeeUsd: gasPaymentTokenUsd + bridgeNetworkFeeUsd,
+      wntFee,
+      wntFeeUsd,
+      networkFeeInGasPaymentToken: someGasPaymentTokenAmount + bridgeNetworkFeeInGasPaymentToken,
+    };
+  }, [
+    bridgeNetworkFee,
+    bridgeNetworkFeeUsd,
+    gasPaymentToken,
+    relayerFeeToken,
+    someGasPaymentTokenAmount,
+    someRelayFeeAmount,
+  ]);
+  const [lastValidNetworkFees, setLastValidNetworkFees] = useState({
+    wntFee,
+    networkFeeUsd,
+    networkFeeInGasPaymentToken,
+    wntFeeUsd,
+    someGasPaymentTokenAmount,
+    bridgeNetworkFee,
+    bridgeNetworkFeeUsd,
+  });
+
+  useEffect(
+    function resetLastValidNetworkFeesOnContextChange() {
+      setLastValidNetworkFees({
+        wntFee: undefined,
+        networkFeeUsd: undefined,
+        networkFeeInGasPaymentToken: undefined,
+        wntFeeUsd: undefined,
+        someGasPaymentTokenAmount: undefined,
+        bridgeNetworkFee: undefined,
+        bridgeNetworkFeeUsd: undefined,
+      });
+    },
+    [selectedTokenAddress, withdrawalViewChain, gasPaymentToken?.address]
+  );
+
+  useEffect(() => {
+    if (bridgeNetworkFee !== undefined && bridgeNetworkFeeUsd !== undefined) {
+      setLastValidNetworkFees((prev) => ({ ...prev, bridgeNetworkFee, bridgeNetworkFeeUsd }));
+    }
+  }, [bridgeNetworkFee, bridgeNetworkFeeUsd]);
+
+  useEffect(() => {
+    if (
+      wntFee !== undefined &&
+      networkFeeUsd !== undefined &&
+      wntFeeUsd !== undefined &&
+      networkFeeInGasPaymentToken !== undefined
+    ) {
+      setLastValidNetworkFees((prev) => ({
+        ...prev,
+        wntFee,
+        networkFeeUsd,
+        networkFeeInGasPaymentToken,
+        wntFeeUsd,
+      }));
+    }
+  }, [wntFee, networkFeeUsd, networkFeeInGasPaymentToken, wntFeeUsd]);
+
+  useEffect(() => {
+    if (someGasPaymentTokenAmount !== undefined) {
+      setLastValidNetworkFees((prev) => ({ ...prev, someGasPaymentTokenAmount }));
+    }
+  }, [someGasPaymentTokenAmount]);
+
+  const showWntWarning = useMemo(() => {
+    if (
+      wrappedNativeTokenAddress === zeroAddress ||
+      !wrappedNativeToken ||
+      wrappedNativeToken.gmxAccountBalance === undefined
+    ) {
+      return false;
+    }
+
+    if (wrappedNativeToken.gmxAccountBalance === 0n) {
+      return true;
+    }
+
+    const someWntFee = wntFee ?? lastValidNetworkFees.wntFee ?? baseNativeFee;
+
+    if (someWntFee === undefined) {
+      return false;
+    }
+
+    const value = (unwrappedSelectedTokenAddress === zeroAddress ? inputAmount : 0n) ?? 0n;
+
+    return wrappedNativeToken.gmxAccountBalance - value < someWntFee;
+  }, [
+    baseNativeFee,
+    inputAmount,
+    lastValidNetworkFees.wntFee,
+    unwrappedSelectedTokenAddress,
+    wntFee,
+    wrappedNativeToken,
+    wrappedNativeTokenAddress,
+  ]);
+
+  const { gasPaymentTokenForMax, gasPaymentTokenAmountForMax } = useMemo(() => {
+    if (isSameChain) {
+      return {
+        gasPaymentTokenForMax: undefined,
+        gasPaymentTokenAmountForMax: undefined,
+      };
+    }
+
+    if (selectedToken?.isWrapped) {
+      return {
+        gasPaymentTokenForMax: selectedToken,
+        gasPaymentTokenAmountForMax: wntFee ?? lastValidNetworkFees.wntFee,
+      };
+    }
+
+    if (gasPaymentToken?.isWrapped) {
+      return {
+        gasPaymentTokenForMax: gasPaymentToken,
+        gasPaymentTokenAmountForMax: networkFeeInGasPaymentToken ?? lastValidNetworkFees.networkFeeInGasPaymentToken,
+      };
+    }
+
+    return {
+      gasPaymentTokenForMax: gasPaymentToken,
+      gasPaymentTokenAmountForMax: someGasPaymentTokenAmount ?? lastValidNetworkFees.someGasPaymentTokenAmount,
+    };
+  }, [
+    gasPaymentToken,
+    isSameChain,
+    lastValidNetworkFees.networkFeeInGasPaymentToken,
+    lastValidNetworkFees.someGasPaymentTokenAmount,
+    lastValidNetworkFees.wntFee,
+    networkFeeInGasPaymentToken,
+    selectedToken,
+    someGasPaymentTokenAmount,
+    wntFee,
+  ]);
+
+  const isLoadingWithdrawalMax = isSameChain
+    ? false
+    : expressTxnParamsAsyncResult.isLoading && gasPaymentTokenAmountForMax === undefined;
+
+  const withdrawalMaxDetails = useMaxAvailableAmount({
+    fromToken: selectedToken,
+    fromTokenAmount: inputAmount,
+    fromTokenBalance: getBalanceByBalanceType(selectedToken, TokenBalanceType.GmxAccount),
+    isLoading: isLoadingWithdrawalMax,
+    feeToken: gasPaymentTokenForMax,
+    feeTokenAmount: gasPaymentTokenAmountForMax,
+    reserveToken: gasPaymentToken,
+    isFeeEstimationFailed: !isSameChain && expressTxnParamsAsyncResult.error !== undefined,
+    isGmxAccount: true,
+  });
+
+  const handlePickToken = useCallback(
+    (tokenAddress: string) => {
+      setSelectedTokenAddress(tokenAddress);
+
+      if (withdrawalViewChain !== undefined && !isSameChain) {
+        const unwrappedTokenAddress = convertTokenAddress(chainId, tokenAddress, "native");
+        const tokenId = getMappedTokenId(chainId as SettlementChainId, unwrappedTokenAddress, withdrawalViewChain);
+        if (tokenId === undefined) {
+          const sourceChainIds = Object.keys(MULTI_CHAIN_TOKEN_MAPPING[chainId as SettlementChainId]).map(
+            Number
+          ) as SourceChainId[];
+          for (const someSourceChainId of sourceChainIds) {
+            if (someSourceChainId === withdrawalViewChain) {
+              continue;
+            }
+
+            const mappedTokenId = getMappedTokenId(
+              chainId as SettlementChainId,
+              unwrappedTokenAddress,
+              someSourceChainId
+            );
+            if (mappedTokenId) {
+              setWithdrawalViewChain(someSourceChainId);
+              return;
+            }
+          }
+
+          setWithdrawalViewChain(undefined);
+        }
+      }
+    },
+    [chainId, isSameChain, setSelectedTokenAddress, setWithdrawalViewChain, withdrawalViewChain]
+  );
+
+  const { handleWithdraw, isSubmitting } = useWithdrawViewTransactions({
+    selectedToken,
+    inputAmountUsd,
+    bridgeOutParams,
+    expressTxnParamsAsyncResult,
+  });
+
+  const handleMaxButtonClick = useCallback(() => {
+    if (withdrawalMaxDetails.maxAvailableAmount > 0n) {
+      setInputValue(withdrawalMaxDetails.formattedMaxAvailableAmount);
+    }
+  }, [withdrawalMaxDetails.maxAvailableAmount, withdrawalMaxDetails.formattedMaxAvailableAmount, setInputValue]);
+
+  const handleKeepGasClick = useCallback(() => {
+    if (withdrawalMaxDetails.formattedKeepGasAmount !== undefined) {
+      setInputValue(withdrawalMaxDetails.formattedKeepGasAmount);
+    }
+  }, [withdrawalMaxDetails.formattedKeepGasAmount, setInputValue]);
+
+  const isInputEmpty = inputAmount === undefined || inputAmount <= 0n;
+
+  const shouldShowInfoRowPlaceholder = inputAmount !== undefined && inputAmount > 0n;
+
+  const areMultichainFeesLoading = isQuoteOftLoading || isBaseNativeFeeLoading;
+
+  const isNetworkFeeLoading =
+    shouldShowInfoRowPlaceholder &&
+    (isSameChain
+      ? sameChainNetworkFeeAsyncResult.isLoading
+      : areMultichainFeesLoading || (!expressTxnParamsAsyncResult.data && !expressTxnParamsAsyncResult.error));
+
+  const expressOrdersEnabled = useSelector(selectExpressOrdersEnabled);
+  const setExpressOrdersEnabled = useSelector(selectSetExpressOrdersEnabled);
+  const { setIsSettingsVisible } = useSettings();
+
+  useEffect(() => {
+    if (withdrawalViewChain !== undefined && !isSameChain && !expressOrdersEnabled) {
+      setExpressOrdersEnabled(true);
+      toastEnableExpress(() => setIsSettingsVisible(true));
+    }
+  }, [withdrawalViewChain, isSameChain, expressOrdersEnabled, setExpressOrdersEnabled, setIsSettingsVisible]);
+
+  let buttonState: {
+    text: React.ReactNode;
+    bannerErrorName?: ValidationBannerErrorName;
+    disabled?: boolean;
+    onClick?: () => void;
+    errorDescription?: ReactNode;
+  } = {
+    text: t`Withdraw`,
+    onClick: handleWithdraw,
+  };
+
+  if (hasOutdatedUi) {
+    buttonState = {
+      text: getPageOutdatedError(),
+      disabled: true,
+    };
+  } else if (multipleWalletExtensionsChainError.buttonErrorMessage) {
+    buttonState = {
+      text: multipleWalletExtensionsChainError.buttonErrorMessage,
+      errorDescription: multipleWalletExtensionsChainError.buttonTooltipMessage,
+      disabled: true,
+    };
+  } else if (isSubmitting) {
+    buttonState = {
+      text: (
+        <>
+          <Trans>Withdrawing...</Trans>
+          <SpinnerIcon className="ml-4 animate-spin" />
+        </>
+      ),
+      disabled: true,
+    };
+  } else if (isInputEmpty) {
+    buttonState = {
+      text: t`Enter withdrawal amount`,
+      disabled: true,
+    };
+  } else if (isInsufficientBalance) {
+    buttonState = {
+      text: t`Insufficient balance`,
+      disabled: true,
+    };
+  } else if (isAboveLimit && withdrawalViewChain !== undefined) {
+    const networkName = getChainName(withdrawalViewChain);
+    buttonState = {
+      text: t`Insufficient bridge liquidity to ${networkName}`,
+      disabled: true,
+    };
+  } else if (isBelowLimit) {
+    buttonState = {
+      text: t`Withdraw`,
+      disabled: true,
+    };
+  } else if (isNetworkFeeLoading) {
+    buttonState = {
+      text: (
+        <>
+          <Trans>Loading network fees…</Trans>
+          <SpinnerIcon className="ml-4 animate-spin" />
+        </>
+      ),
+      disabled: true,
+    };
+  } else if (sameChainGasError?.buttonErrorMessage) {
+    buttonState = {
+      text: sameChainGasError.buttonErrorMessage,
+      bannerErrorName: sameChainGasError.bannerErrorName,
+      disabled: true,
+    };
+  } else if ((withdrawalViewChain as SourceChainId | ContractsChainId | undefined) !== chainId) {
+    if (
+      expressTxnParamsAsyncResult.data?.gasPaymentValidations.isOutGasTokenBalance ||
+      errors?.isOutOfTokenError?.isGasPaymentToken
+    ) {
+      buttonState = {
+        text: getInsufficientFeeButtonMessage({
+          tokenSymbol: getToken(chainId, gasPaymentTokenAddress).symbol,
+          feeSource: GMX_ACCOUNT_NETWORK_FEE_SOURCE,
+        }),
+        bannerErrorName: ValidationBannerErrorName.insufficientGmxAccountCurrentGasTokenBalance,
+        disabled: true,
+      };
+    } else if (showWntWarning) {
+      buttonState = {
+        text: getInsufficientFeeButtonMessage({
+          tokenSymbol: getWrappedToken(chainId).symbol,
+          feeSource: GMX_ACCOUNT_NETWORK_FEE_SOURCE,
+        }),
+        bannerErrorName: ValidationBannerErrorName.insufficientGmxAccountWntBalance,
+        disabled: true,
+      };
+    } else if (errors?.isOutOfTokenError) {
+      buttonState = {
+        text: t`Insufficient ${isOutOfTokenErrorToken?.symbol} balance`,
+        disabled: true,
+      };
+    } else if (isBridgeOutputBelowMinimum) {
+      buttonState = {
+        text: t`Receive amount below minimum`,
+        disabled: true,
+      };
+    } else if (expressTxnParamsAsyncResult.error) {
+      buttonState = {
+        ...getSimulationErrorButtonContent({
+          chainId,
+          error: expressTxnParamsAsyncResult.error,
+          fallbackText: t`Error simulating withdrawal`,
+        }),
+        disabled: true,
+      };
+    }
+  }
+
+  useEffect(
+    function fallbackWithdrawTokens() {
+      const hasSelectedTokenAddress = selectedTokenAddress !== undefined;
+      if (!hasSelectedTokenAddress) {
+        return;
+      }
+
+      const isValidSameChainToken = isSameChain && isValidTokenSafe(chainId, selectedTokenAddress);
+
+      const isValidMultichainToken =
+        !isSameChain &&
+        MULTI_CHAIN_WITHDRAWAL_TRADE_TOKENS[chainId as SettlementChainId]?.includes(selectedTokenAddress);
+
+      if (isValidSameChainToken || isValidMultichainToken) {
+        return;
+      }
+
+      if (!withdrawalViewChain || !isSettlementChain(chainId) || isVisibleOrView !== "withdraw") {
+        return;
+      }
+
+      const settlementChainWrappedTokenAddresses = MULTI_CHAIN_WITHDRAWAL_TRADE_TOKENS[chainId];
+      if (!settlementChainWrappedTokenAddresses) {
+        return;
+      }
+
+      const preferredToken = settlementChainWrappedTokenAddresses.find((tokenAddress) => {
+        const tokenData = tokensData?.[tokenAddress];
+        return (
+          tokenData?.address === CHAIN_ID_PREFERRED_DEPOSIT_TOKEN[chainId] &&
+          tokenData?.gmxAccountBalance !== undefined &&
+          tokenData.gmxAccountBalance > 0n
+        );
+      });
+
+      if (preferredToken) {
+        setSelectedTokenAddress(preferredToken);
+        return;
+      }
+
+      let maxGmxAccountBalanceUsd = 0n;
+      let maxBalanceSettlementChainTokenAddress: string | undefined = undefined;
+
+      for (const tokenAddress of settlementChainWrappedTokenAddresses) {
+        const tokenData = tokensData?.[tokenAddress];
+        if (tokenData === undefined) {
+          continue;
+        }
+
+        const prices = tokenData.prices;
+        const balance = tokenData.gmxAccountBalance;
+        if (prices === undefined || balance === undefined) {
+          continue;
+        }
+
+        const price = getMidPrice(prices);
+        const balanceUsd = convertToUsd(balance, tokenData.decimals, price)!;
+        if (balanceUsd > maxGmxAccountBalanceUsd) {
+          maxGmxAccountBalanceUsd = balanceUsd;
+          maxBalanceSettlementChainTokenAddress = tokenAddress;
+        }
+      }
+
+      if (maxBalanceSettlementChainTokenAddress) {
+        setSelectedTokenAddress(maxBalanceSettlementChainTokenAddress);
+      }
+    },
+    [
+      chainId,
+      isSameChain,
+      isVisibleOrView,
+      selectedTokenAddress,
+      setSelectedTokenAddress,
+      tokensData,
+      withdrawalViewChain,
+    ]
+  );
+
+  useEffect(
+    function fallbackWithdrawalViewChain() {
+      if (withdrawalViewChain === undefined || isVisibleOrView !== "withdraw" || filteredNetworks.length === 0) {
+        return;
+      }
+
+      const isValidWithdrawalViewChain = filteredNetworks.map((network) => network.id).includes(withdrawalViewChain);
+
+      if (isValidWithdrawalViewChain) {
+        return;
+      }
+
+      setWithdrawalViewChain(undefined);
+    },
+    [withdrawalViewChain, isSameChain, isVisibleOrView, filteredNetworks, setWithdrawalViewChain]
+  );
+
+  const isTestnet = isTestnetChain(chainId);
+
+  const estimatedTimeValue = useMemo(() => {
+    if (isSameChain) {
+      return <Trans>Instant</Trans>;
+    }
+
+    if (inputAmount === undefined || inputAmount === 0n) {
+      return "...";
+    }
+
+    return isTestnet ? <Trans>1m 40s</Trans> : <Trans>20s</Trans>;
+  }, [isSameChain, inputAmount, isTestnet]);
+
+  const networkFeeValue = useMemo(() => {
+    if (isSameChain) {
+      if (!sameChainNetworkFeeDetails) {
+        return "...";
+      }
+
+      return (
+        <NetworkFeeValue
+          amount={sameChainNetworkFeeDetails.amount}
+          decimals={sameChainNetworkFeeDetails.decimals}
+          usd={sameChainNetworkFeeDetails.usd}
+          symbol={sameChainNetworkFeeDetails.symbol}
+          source={WALLET_NETWORK_FEE_SOURCE}
+          isExpress={false}
+        />
+      );
+    }
+
+    const someExpressFeeAmount = someGasPaymentTokenAmount ?? lastValidNetworkFees.someGasPaymentTokenAmount;
+
+    if (someExpressFeeAmount === undefined || gasPaymentToken === undefined) {
+      return "...";
+    }
+
+    return (
+      <NetworkFeeValue
+        amount={someExpressFeeAmount}
+        decimals={gasPaymentToken.decimals}
+        usd={convertToUsd(someExpressFeeAmount, gasPaymentToken.decimals, getMidPrice(gasPaymentToken.prices))}
+        symbol={gasPaymentToken.symbol}
+        isStable={gasPaymentToken.isStable}
+        source={GMX_ACCOUNT_NETWORK_FEE_SOURCE}
+        isExpress
+      />
+    );
+  }, [
+    gasPaymentToken,
+    isSameChain,
+    lastValidNetworkFees.someGasPaymentTokenAmount,
+    sameChainNetworkFeeDetails,
+    someGasPaymentTokenAmount,
+  ]);
+
+  const bridgeFeeValue = useMemo(() => {
+    const someBridgeNetworkFee = bridgeNetworkFee ?? lastValidNetworkFees.bridgeNetworkFee;
+    const someBridgeNetworkFeeUsd = bridgeNetworkFeeUsd ?? lastValidNetworkFees.bridgeNetworkFeeUsd;
+
+    if (someBridgeNetworkFee === undefined || someBridgeNetworkFeeUsd === undefined || relayerFeeToken === undefined) {
+      return "...";
+    }
+
+    const bridgeFeeTokenSymbol = relayerFeeToken.symbol;
+
+    return (
+      <NetworkFeeValue
+        amount={someBridgeNetworkFee}
+        decimals={relayerFeeToken.decimals}
+        usd={someBridgeNetworkFeeUsd}
+        symbol={bridgeFeeTokenSymbol}
+        source={GMX_ACCOUNT_NETWORK_FEE_SOURCE}
+        tooltipContent={t`The bridge fee is paid in ${bridgeFeeTokenSymbol} from your GMX Account.`}
+      />
+    );
+  }, [
+    bridgeNetworkFee,
+    bridgeNetworkFeeUsd,
+    lastValidNetworkFees.bridgeNetworkFee,
+    lastValidNetworkFees.bridgeNetworkFeeUsd,
+    relayerFeeToken,
+  ]);
+
+  const withdrawFeeValue = useMemo(() => {
+    if (isSameChain) {
+      return <Trans>No fee</Trans>;
+    }
+
+    if (protocolFeeUsd === undefined || selectedTokenSettlementChainTokenId === undefined) {
+      return "...";
+    }
+
+    return (
+      <AmountWithUsdBalance
+        className="leading-1"
+        amount={protocolFeeAmount === undefined ? undefined : -protocolFeeAmount}
+        decimals={selectedTokenSettlementChainTokenId.decimals}
+        usd={-protocolFeeUsd}
+        symbol={selectedToken?.symbol}
+      />
+    );
+  }, [isSameChain, protocolFeeUsd, selectedTokenSettlementChainTokenId, protocolFeeAmount, selectedToken?.symbol]);
+
+  const isWithdrawFeeLoading = shouldShowInfoRowPlaceholder && areMultichainFeesLoading;
+
+  const isGmxBalanceLoading = shouldShowInfoRowPlaceholder && isGmxAccountUsdLoading;
+
+  const networkItemDisabledMessage = useCallback(
+    (option: { id: number; name: string; disabled?: boolean | string }) => {
+      return t`Withdrawing ${selectedToken?.symbol} to ${option.name} is not supported`;
+    },
+    [selectedToken?.symbol]
+  );
+
+  return (
+    <div className="flex grow flex-col overflow-y-auto p-adaptive">
+      <div className="flex flex-col gap-[--padding-adaptive]">
+        <div className="flex flex-col gap-6">
+          <div className="text-body-medium text-typography-secondary">
+            <Trans>Asset</Trans>
+          </div>
+          <DropdownSelector
+            value={selectedTokenAddress}
+            onChange={handlePickToken}
+            placeholder={t`Select token`}
+            button={
+              selectedTokenAddress && selectedToken ? (
+                <div className="flex items-center gap-8">
+                  <TokenIcon symbol={selectedToken.symbol} displaySize={20} />
+                  <span>{selectedToken.symbol}</span>
+                </div>
+              ) : undefined
+            }
+            options={tokenOptions}
+            item={WithdrawAssetItem}
+            itemKey={withdrawAssetItemKey}
+          />
+        </div>
+
+        <div className="flex flex-col gap-6">
+          <div className="text-body-medium text-typography-secondary">
+            <Trans>To network</Trans>
+          </div>
+          <DropdownSelector
+            value={withdrawalViewChain}
+            onChange={(value) => {
+              setWithdrawalViewChain(Number(value) as SourceChainId);
+            }}
+            placeholder={t`Select network`}
+            button={
+              <div className="flex items-center gap-8">
+                {withdrawalViewChain !== undefined ? (
+                  <>
+                    <img
+                      src={CHAIN_ID_TO_NETWORK_ICON[withdrawalViewChain]}
+                      alt={getChainName(withdrawalViewChain)}
+                      className="size-20"
+                    />
+                    <span className="text-16 leading-base">{getChainName(withdrawalViewChain)}</span>
+                  </>
+                ) : (
+                  <>
+                    <Skeleton
+                      baseColor="#B4BBFF1A"
+                      highlightColor="#B4BBFF1A"
+                      width={20}
+                      height={20}
+                      borderRadius={10}
+                    />
+                    <Skeleton baseColor="#B4BBFF1A" highlightColor="#B4BBFF1A" width={40} height={16} />
+                  </>
+                )}
+              </div>
+            }
+            options={filteredNetworks}
+            item={NetworkItem}
+            itemKey={networkItemKey}
+            itemDisabled={networkItemDisabled}
+            itemDisabledMessage={networkItemDisabledMessage}
+          />
+        </div>
+
+        <div className="flex flex-col gap-6">
+          <div className="text-body-medium flex items-center justify-between text-typography-secondary">
+            <Trans>Withdraw</Trans>
+            {selectedToken !== undefined && selectedToken.gmxAccountBalance !== undefined && (
+              <div className="flex items-center gap-8">
+                {selectedToken.gmxAccountBalance > 0n && (
+                  <MaxActions
+                    qa="withdraw"
+                    state={withdrawalMaxDetails.maxActions}
+                    onMax={handleMaxButtonClick}
+                    onKeepGas={handleKeepGasClick}
+                  />
+                )}
+                <button type="button" onClick={handleMaxButtonClick}>
+                  <Trans>Available:</Trans>{" "}
+                  <Amount
+                    className="text-typography-primary"
+                    amount={selectedToken.gmxAccountBalance}
+                    decimals={selectedToken.decimals}
+                    isStable={selectedToken.isStable}
+                    symbol={selectedToken.symbol}
+                  />
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="relative text-16 leading-base">
+            <NumberInput
+              value={inputValue}
+              onValueChange={(e) => setInputValue(e.target.value)}
+              className="w-full rounded-8 border border-slate-800 bg-slate-800 py-13 pl-14 pr-96 text-16 leading-base
+                         focus-within:border-blue-300 hover:bg-fill-surfaceElevatedHover"
+              placeholder="0.00"
+              maxDecimals={selectedToken?.decimals}
+            />
+            <div className="pointer-events-none absolute right-14 top-1/2 flex -translate-y-1/2 items-center gap-8">
+              <span className="text-typography-secondary">{selectedToken?.symbol}</span>
+            </div>
+          </div>
+          <div className="text-body-medium text-typography-secondary numbers">
+            <UsdValue usd={inputAmountUsd ?? 0n} />
+          </div>
+        </div>
+      </div>
+
+      {!isInsufficientBalance && (
+        <>
+          {isAboveLimit && (
+            <AlertInfoCard type="warning" className="my-4" hideClose>
+              <div>
+                <Trans>
+                  GMX Account withdrawals are limited by Stargate bridge liquidity. Try an amount smaller than{" "}
+                  <span className="numbers">{upperLimitFormatted}</span>.
+                </Trans>
+              </div>
+            </AlertInfoCard>
+          )}
+          {isBelowLimit && (
+            <AlertInfoCard type="warning" className="my-4" hideClose>
+              <div>
+                <Trans>
+                  Amount is below the withdrawal limit. Try an amount larger than{" "}
+                  <span className="numbers">{lowerLimitFormatted}</span>.
+                </Trans>
+              </div>
+            </AlertInfoCard>
+          )}
+        </>
+      )}
+
+      <div className="h-32 shrink-0 grow" />
+
+      {selectedTokenAddress && (
+        <div className="mb-16 flex flex-col gap-10">
+          <SyntheticsInfoRow
+            label={<Trans>Estimated time</Trans>}
+            valueClassName="numbers"
+            value={estimatedTimeValue}
+          />
+          <SyntheticsInfoRow
+            label={<Trans>Network fee</Trans>}
+            labelClassName="whitespace-nowrap"
+            value={isNetworkFeeLoading ? valueSkeleton : networkFeeValue}
+          />
+          {!isSameChain && (
+            <SyntheticsInfoRow
+              label={<Trans>Bridge fee</Trans>}
+              labelClassName="whitespace-nowrap"
+              value={isNetworkFeeLoading ? valueSkeleton : bridgeFeeValue}
+            />
+          )}
+          <SyntheticsInfoRow
+            label={<Trans>Withdraw fee</Trans>}
+            value={isWithdrawFeeLoading ? valueSkeleton : withdrawFeeValue}
+          />
+          <SyntheticsInfoRow
+            label={<Trans>GMX Account balance</Trans>}
+            value={
+              isGmxBalanceLoading ? (
+                valueSkeleton
+              ) : (
+                <ValueTransition from={formatUsdParts(gmxAccountUsd)} to={formatUsdParts(nextGmxAccountBalanceUsd)} />
+              )
+            }
+          />
+        </div>
+      )}
+
+      {!isInsufficientBalance && (
+        <>
+          {buttonState.bannerErrorName && (
+            <AlertInfoCard type="error" className="mb-16" hideClose>
+              <ValidationBannerErrorContent
+                validationBannerErrorName={buttonState.bannerErrorName}
+                chainId={chainId}
+                srcChainId={withdrawalViewChain}
+                gasPaymentTokenAddress={gasPaymentToken?.address}
+              />
+            </AlertInfoCard>
+          )}
+
+          {withdrawalMaxDetails.gasPaymentTokenWarningContent && (
+            <AlertInfoCard type="warning" className="mb-16" hideClose>
+              {withdrawalMaxDetails.gasPaymentTokenWarningContent}
+            </AlertInfoCard>
+          )}
+        </>
+      )}
+
+      <ButtonTooltipWrapper content={buttonState.errorDescription}>
+        <Button
+          variant="primary-action"
+          className="w-full shrink-0"
+          onClick={buttonState.onClick}
+          disabled={buttonState.disabled}
+        >
+          {buttonState.text}
+        </Button>
+      </ButtonTooltipWrapper>
+    </div>
+  );
+};
+
+function networkItemKey(option: { id: number; name: string }) {
+  return option.id;
+}
+
+function networkItemDisabled(option: { id: number; name: string; disabled?: boolean | string }): boolean {
+  return !!option.disabled;
+}
+
+function NetworkItem({ option }: { option: { id: number; name: string; disabled?: boolean } }) {
+  return (
+    <div className="flex items-center justify-between">
+      <div className="flex items-center gap-8">
+        <img src={CHAIN_ID_TO_NETWORK_ICON[option.id as AnyChainId]} alt={option.name} className="size-20" />
+        <span className="text-body-large">{option.name}</span>
+      </div>
+    </div>
+  );
+}
+
+function WithdrawAssetItem({ option }: { option: TokenData }) {
+  const isZero = option.gmxAccountBalance === 0n || option.gmxAccountBalance === undefined;
+  return (
+    <div className="flex items-center justify-between gap-8">
+      <div className="flex gap-8">
+        <TokenIcon symbol={option.symbol} displaySize={20} />
+        <span>
+          {option.symbol} <span className="text-body-small text-typography-secondary">{option.name}</span>
+        </span>
+      </div>
+      <div className={cx(isZero ? "text-typography-secondary" : "text-typography-primary")}>
+        <Amount
+          className="text-typography-primary"
+          amount={option.gmxAccountBalance}
+          decimals={option.decimals}
+          isStable={option.isStable}
+          showZero
+          emptyValue="-"
+        />
+      </div>
+    </div>
+  );
+}
+
+function withdrawAssetItemKey(option: TokenData) {
+  return option.address;
+}
+
+async function simulateWithdraw({
+  provider,
+  signer,
+  chainId,
+  srcChainId,
+  relayParamsPayload,
+  relayerFeeTokenAddress,
+  relayerFeeAmount,
+  params,
+}: {
+  provider: Provider;
+  signer: WalletSigner;
+  chainId: SettlementChainId;
+  srcChainId: SourceChainId;
+  relayerFeeTokenAddress: string;
+  relayerFeeAmount: bigint;
+  relayParamsPayload: RawRelayParamsPayload;
+  params: BridgeOutParams;
+}): Promise<void> {
+  if (!provider) {
+    throw new Error("Provider is required");
+  }
+
+  const { callData, to } = await buildAndSignBridgeOutTxn({
+    signer,
+    account: signer.address,
+    chainId,
+    srcChainId,
+    relayParamsPayload,
+    params,
+    emptySignature: true,
+    relayerFeeTokenAddress,
+    relayerFeeAmount: relayerFeeAmount,
+  });
+
+  await fallbackCustomError(async () => {
+    await callRelayTransaction({
+      calldata: callData,
+      provider,
+      relayRouterAddress: to as Address,
+    });
+  }, "simulation");
+}

@@ -1,0 +1,264 @@
+import { tz } from "@date-fns/tz";
+import { i18n } from "@lingui/core";
+import { t } from "@lingui/macro";
+import type { Locale as DateLocale } from "date-fns";
+import { format } from "date-fns/format";
+import { formatRelative } from "date-fns/formatRelative";
+import { enUS as dateEn } from "date-fns/locale/en-US";
+
+import { getStringContractErrorArg } from "lib/errors";
+import { NumberPart, NumberPartInput, numberParts } from "lib/numbers";
+import { TradeActionType } from "sdk/utils/tradeHistory/types";
+
+import { LOCALE_DATE_LOCALE_MAP } from "components/DateRangeSelect/DateRangeSelect";
+import { getContractErrorMessage, getMarginBelowMinimumErrorMessage } from "components/Errors/getContractErrorMessage";
+
+import { CustomErrorName } from "./CustomErrorName";
+
+export function getOrderActionText(eventName: TradeActionType) {
+  let actionText = "";
+
+  if (eventName === TradeActionType.OrderCreated) {
+    actionText = t`Create`;
+  }
+
+  if (eventName === TradeActionType.OrderCancelled) {
+    actionText = t`Cancel`;
+  }
+
+  if (eventName === TradeActionType.OrderExecuted) {
+    actionText = t`Execute`;
+  }
+
+  if (eventName === TradeActionType.OrderUpdated) {
+    actionText = t`Update`;
+  }
+
+  if (eventName === TradeActionType.OrderFrozen) {
+    actionText = t`Freeze`;
+  }
+
+  return actionText;
+}
+export type TooltipState = "success" | "error" | "muted" | undefined;
+export type FormattedText = string | NumberPart[];
+export type TooltipString =
+  | undefined
+  | string
+  | {
+      text: FormattedText | undefined;
+      state?: TooltipState;
+    };
+export type TooltipValue = TooltipString | TooltipString[];
+
+export function numericText(...inputs: NumberPartInput[]): { text: NumberPart[] } {
+  return { text: numberParts(...inputs) };
+}
+
+export function numberToState(value: bigint | undefined): TooltipState {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value > 0) {
+    return "success";
+  }
+  if (value < 0) {
+    return "error";
+  }
+
+  return undefined;
+}
+export type Line =
+  | TooltipString
+  | TooltipString[]
+  | {
+      key: string;
+      value: TooltipValue;
+    };
+export type TooltipContent = Line[];
+export function lines(...args: TooltipContent): TooltipContent {
+  return args;
+}
+export function infoRow(key: string, value: TooltipValue): Line {
+  return {
+    key,
+    value,
+  };
+}
+
+export type RowDetails = {
+  action: string;
+  actionComment?: TooltipContent;
+  isActionError?: boolean;
+  timestamp: string;
+  timestampUTC: string;
+  market: string;
+  fullMarket?: string;
+  indexName?: string;
+  poolName?: string;
+  fullMarketNames?: {
+    indexName: string;
+    poolName: string;
+  }[];
+  size: FormattedText;
+  sizeComment?: TooltipContent;
+  price: FormattedText;
+  priceComment: TooltipContent | null;
+  pnl?: FormattedText;
+  pnlState?: TooltipState;
+  pnlTooltip?: string;
+  fees?: FormattedText;
+  feesTooltip?: TooltipContent;
+  isLong?: boolean;
+  indexTokenSymbol?: string;
+  swapFromTokenSymbol?: string;
+  swapFromTokenAmount?: string;
+  swapToTokenSymbol?: string;
+  swapToTokenAmount?: string;
+  //#region CSV fields
+  marketPrice?: string;
+  executionPrice?: string;
+  acceptablePrice?: string;
+  priceImpact?: string;
+  triggerPrice?: string;
+  //#endregion
+};
+
+const CUSTOM_DATE_LOCALES = Object.fromEntries(
+  Object.entries(LOCALE_DATE_LOCALE_MAP).map(([locale, dateLocale]) => {
+    const originalFormatRelative = dateLocale.formatRelative;
+
+    const customDateLocale = {
+      ...dateLocale,
+      formatRelative: (...args: Parameters<typeof originalFormatRelative>) => {
+        const token = args[0];
+        // @see docs for patterns https://date-fns.org/v4.1.0/docs/format
+
+        if (token === "other" || !originalFormatRelative) {
+          return "dd MMM yyyy, HH:mm";
+        }
+
+        if (token === "lastWeek") {
+          return "eeee, HH:mm";
+        }
+
+        return originalFormatRelative(...args);
+      },
+    };
+
+    return [locale, customDateLocale];
+  })
+);
+
+/**
+ * This format is understandable by the Google Sheets
+ */
+export function formatTradeActionTimestamp(timestamp: number, relativeTimestamp = true) {
+  const localeStr = i18n.locale;
+
+  const locale: DateLocale = CUSTOM_DATE_LOCALES[localeStr] ?? dateEn;
+
+  if (!relativeTimestamp) {
+    return format(new Date(timestamp * 1000), "yyyy-MM-dd HH:mm:ss", {
+      locale,
+    });
+  }
+
+  return formatRelative(new Date(timestamp * 1000), new Date(), {
+    locale,
+  });
+}
+
+export function formatTradeActionTimestampUTC(timestamp: number) {
+  return `UTC: ${format(timestamp * 1000, "yyyy-MM-dd HH:mm:ss", {
+    in: tz("UTC"),
+  })}`;
+}
+
+export type MakeOptional<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+
+export function getErrorTooltipTitle(errorName: string, isMarketOrder: boolean, errorArgs?: unknown) {
+  if (errorName === CustomErrorName.OrderNotFulfillableAtAcceptablePrice && !isMarketOrder) {
+    return t`Execution price didn't meet acceptable price. Order will fill when the condition is met.`;
+  } else if (errorName === CustomErrorName.OrderNotFulfillableAtAcceptablePrice && isMarketOrder) {
+    return t`Execution price didn't meet acceptable price`;
+  } else if (errorName === CustomErrorName.InsufficientReserveForOpenInterest && !isMarketOrder) {
+    return t`Insufficient liquidity. Order will fill when liquidity is available.`;
+  } else if (errorName === CustomErrorName.InsufficientReserveForOpenInterest && isMarketOrder) {
+    return t`Insufficient liquidity`;
+  } else if (errorName === CustomErrorName.InsufficientSwapOutputAmount && !isMarketOrder) {
+    return t`Insufficient liquidity`;
+  } else if (errorName === CustomErrorName.InsufficientSwapOutputAmount && isMarketOrder) {
+    return t`Insufficient liquidity`;
+  }
+
+  const tradeHistoryErrorMessage = getTradeHistoryErrorMessage(errorName, errorArgs);
+
+  if (tradeHistoryErrorMessage) {
+    return tradeHistoryErrorMessage;
+  }
+
+  const contractErrorMessage = getContractErrorMessage({
+    errorData: {
+      contractError: errorName,
+      contractErrorArgs: errorArgs,
+    },
+  });
+
+  if (contractErrorMessage) {
+    return contractErrorMessage;
+  }
+
+  return t`Order failed due to a protocol validation error: ${errorName}`;
+}
+
+const MIN_COLLATERAL_FOR_LEVERAGE_REASON = "min collateral for leverage";
+
+function getTradeHistoryErrorMessage(errorName: string, errorArgs?: unknown) {
+  switch (errorName) {
+    case CustomErrorName.DisabledFeature:
+      return t`This action is currently disabled`;
+    case CustomErrorName.InsufficientExecutionFee:
+      return t`Execution fee is too low for current network costs`;
+    case CustomErrorName.InsufficientMarketTokens:
+      return t`Insufficient GM tokens for withdrawal`;
+    case CustomErrorName.InsufficientWntAmount:
+    case CustomErrorName.InsufficientWntAmountForExecutionFee:
+      return t`Not enough native token was provided for the execution fee`;
+    case CustomErrorName.InvalidKeeperForFrozenOrder:
+      return t`Frozen order can only be executed by an authorized keeper`;
+    case CustomErrorName.InvalidOrderPrices:
+      return t`Trigger price condition has not been met`;
+    case CustomErrorName.InvalidSignature:
+      return t`Invalid signature. Try signing the request again`;
+    case CustomErrorName.MaxPoolAmountForDepositExceeded:
+    case "MaxPoolUsdForDepositExceeded":
+      return t`Max deposit capacity reached for this pool`;
+    case CustomErrorName.OrderAlreadyFrozen:
+      return t`Order is already frozen`;
+    case CustomErrorName.EmptyPosition:
+    case CustomErrorName.PositionNotFound:
+      return t`Position not found. It may have been closed`;
+    case CustomErrorName.RequestNotYetCancellable:
+      return t`Request cannot be canceled yet. Try again after the cancellation delay`;
+    case CustomErrorName.UnsupportedOrderType:
+      return t`This order type is not supported`;
+    case CustomErrorName.DepositNotFound:
+      return t`Deposit not found. It may have been executed or canceled`;
+    case CustomErrorName.WithdrawalNotFound:
+      return t`Withdrawal not found. It may have been executed or canceled`;
+    case CustomErrorName.InsufficientFundsToPayForCosts:
+      return t`Insufficient collateral to cover order costs`;
+    case CustomErrorName.LiquidatablePosition:
+      return getStringContractErrorArg(errorArgs, 0, "reason") === MIN_COLLATERAL_FOR_LEVERAGE_REASON
+        ? getMarginBelowMinimumErrorMessage()
+        : t`Position would be liquidatable at current prices`;
+    default:
+      return undefined;
+  }
+}
+
+const DOUBLE_NON_BREAKING_SPACE = String.fromCharCode(160) + String.fromCharCode(160);
+export const INEQUALITY_GT = ">" + DOUBLE_NON_BREAKING_SPACE;
+export const INEQUALITY_LT = "<" + DOUBLE_NON_BREAKING_SPACE;

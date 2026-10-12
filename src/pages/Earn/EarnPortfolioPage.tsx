@@ -1,0 +1,113 @@
+import { useMemo } from "react";
+
+import { selectMultichainMarketTokenBalances } from "context/PoolsDetailsContext/selectors/selectMultichainMarketTokenBalances";
+import {
+  selectGlvAndMarketsInfoData,
+  selectMultichainMarketTokensBalancesIsLoading,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { getPlatformTokenBalanceAfterThreshold } from "domain/multichain/getPlatformTokenBalanceAfterThreshold";
+import { useStakingProcessedData } from "domain/stake/useStakingProcessedData";
+import { useMarketTokensData } from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { usePerformanceAnnualized } from "domain/synthetics/markets/usePerformanceAnnualized";
+import useVestingData from "domain/vesting/useVestingData";
+import { useChainId } from "lib/chains";
+import { getByKey } from "lib/objects";
+import { useIsWalletInitializing } from "lib/wallets/useIsWalletInitializing";
+import useWallet from "lib/wallets/useWallet";
+import { useBuyGmxDeepLink } from "pages/Earn/buyGmxDeepLink";
+import EarnPageLayout from "pages/Earn/EarnPageLayout";
+
+import { BuyGmxModal } from "components/BuyGmxModal/BuyGmxModal";
+import AssetsList from "components/Earn/Portfolio/AssetsList/AssetsList";
+import { EarningsOverview } from "components/Earn/Portfolio/EarningsOverview/EarningsOverview";
+import ErrorBoundary from "components/Errors/ErrorBoundary";
+import Loader from "components/Loader/Loader";
+
+export default function EarnPortfolioPage() {
+  const { account } = useWallet();
+  const isWalletInitializing = useIsWalletInitializing();
+  const { data: processedData, mutate: mutateProcessedData } = useStakingProcessedData();
+  const [isBuyGmxModalVisible, setIsBuyGmxModalVisible] = useBuyGmxDeepLink();
+
+  const { chainId, srcChainId } = useChainId();
+  const marketsInfoData = useSelector(selectGlvAndMarketsInfoData);
+  const { marketTokensData } = useMarketTokensData(chainId, srcChainId, { isDeposit: false, withGlv: true });
+  const multichainMarketTokensBalances = useSelector(selectMultichainMarketTokenBalances);
+
+  const { performance: performanceTotal, isLoading: isPerformanceTotalLoading } = usePerformanceAnnualized({
+    chainId,
+    period: "total",
+  });
+
+  const { performance: performance30d, isLoading: isPerformance30dLoading } = usePerformanceAnnualized({
+    chainId,
+    period: "30d",
+  });
+
+  const gmGlvAssets = useMemo(() => {
+    if (!marketsInfoData || !marketTokensData) {
+      return [];
+    }
+
+    return Object.values(marketsInfoData).filter((info) => {
+      const tokenAddress = isGlvInfo(info) ? info.glvTokenAddress : info.marketTokenAddress;
+      const balance = getByKey(multichainMarketTokensBalances, tokenAddress)?.totalBalance;
+      const balanceUsd = getByKey(multichainMarketTokensBalances, tokenAddress)?.totalBalanceUsd;
+
+      const filteredBalanceUsd = getPlatformTokenBalanceAfterThreshold(balanceUsd);
+      return filteredBalanceUsd !== 0n && balance !== undefined && balance > 0n;
+    });
+  }, [marketTokensData, marketsInfoData, multichainMarketTokensBalances]);
+
+  const vestingData = useVestingData(account);
+
+  const hasGmxAssets = processedData
+    ? (processedData.gmxBalance ?? 0n) > 0n || (processedData.gmxInStakedGmx ?? 0n) > 0n
+    : false;
+  const hasEsGmxAssets = processedData
+    ? (processedData.esGmxBalance ?? 0n) > 0n ||
+      (processedData.esGmxInStakedGmx ?? 0n) > 0n ||
+      (vestingData?.gmxVesterVestedAmount ?? 0n) > 0n ||
+      (vestingData?.affiliateVesterVestedAmount ?? 0n) > 0n
+    : false;
+
+  const hasGmGlvAssets = gmGlvAssets.length > 0;
+
+  const hasAnyAssets = hasGmxAssets || hasEsGmxAssets || hasGmGlvAssets;
+
+  const isMultichainBalancesLoading = useSelector(selectMultichainMarketTokensBalancesIsLoading);
+  const areAssetsLoading =
+    Boolean(account) && (!processedData || !marketsInfoData || !marketTokensData || isMultichainBalancesLoading);
+
+  return (
+    <EarnPageLayout>
+      <BuyGmxModal isVisible={isBuyGmxModalVisible} setIsVisible={setIsBuyGmxModalVisible} />
+
+      {account && !isWalletInitializing && (
+        <ErrorBoundary id="EarnPortfolio-EarningsOverview" variant="block" wrapperClassName="rounded-t-8">
+          <EarningsOverview processedData={processedData} mutateProcessedData={mutateProcessedData} />
+        </ErrorBoundary>
+      )}
+      {isWalletInitializing || areAssetsLoading ? (
+        <Loader />
+      ) : (
+        <ErrorBoundary id="EarnPortfolio-AssetsList" variant="block" wrapperClassName="rounded-t-8">
+          <AssetsList
+            processedData={processedData}
+            chainId={chainId}
+            hasAnyAssets={hasAnyAssets}
+            hasGmx={hasGmxAssets}
+            hasEsGmx={hasEsGmxAssets}
+            gmGlvAssets={gmGlvAssets}
+            performanceTotal={performanceTotal}
+            performance30d={performance30d}
+            isPerformanceLoading={isPerformanceTotalLoading || isPerformance30dLoading}
+            multichainMarketTokensBalances={multichainMarketTokensBalances}
+          />
+        </ErrorBoundary>
+      )}
+    </EarnPageLayout>
+  );
+}

@@ -1,0 +1,164 @@
+import { Trans } from "@lingui/macro";
+import { type ReactNode } from "react";
+
+import { GmxAccountModalView } from "context/GmxAccountContext/GmxAccountContext";
+import { useGmxAccountModalOpen, useGmxAccountWalletReceiveViewBackTo } from "context/GmxAccountContext/hooks";
+import { userAnalytics } from "lib/userAnalytics";
+import { OneClickPromotionEvent } from "lib/userAnalytics/types";
+
+import ModalWithPortal from "components/Modal/ModalWithPortal";
+import { SlideModal } from "components/Modal/SlideModal";
+
+import { AvailableToTradeAssetsView } from "./AvailableToTradeAssetsView";
+import { DepositStatusView } from "./DepositStatusView";
+import { DepositView } from "./DepositView";
+import {
+  AvailableToTradeAssetsTitle,
+  MainViewTitle,
+  TransferDetailsTitle,
+  TransferHistoryScreen,
+  TransferHistoryTitle,
+  WithdrawalScreen,
+} from "./GmxAccountModalShared";
+import { MainView } from "./MainView";
+import { SelectAssetToDepositView } from "./SelectAssetToDepositView";
+import { WalletReceiveOptionsView } from "./WalletReceiveOptionsView";
+import { WalletReceiveView } from "./WalletReceiveView";
+import { WalletSendView } from "./WalletSendView";
+
+const MAIN_VIEWS = ["main", "availableToTradeAssets", "transferDetails", "transferHistory"] as const;
+const OVERLAY_VIEWS = [
+  "deposit",
+  "withdraw",
+  "depositStatus",
+  "selectAssetToDeposit",
+  "walletReceiveOptions",
+  "walletReceive",
+  "walletSend",
+] as const;
+
+type MainView = (typeof MAIN_VIEWS)[number];
+type OverlayView = (typeof OVERLAY_VIEWS)[number];
+
+function isMainView(view: GmxAccountModalView): view is MainView {
+  return MAIN_VIEWS.includes(view as MainView);
+}
+
+function isOverlayView(view: GmxAccountModalView): view is OverlayView {
+  return OVERLAY_VIEWS.includes(view as OverlayView);
+}
+
+const SLIDE_MODAL_LABELS: Record<MainView, ReactNode> = {
+  main: <MainViewTitle />,
+  availableToTradeAssets: <AvailableToTradeAssetsTitle />,
+  transferDetails: <TransferDetailsTitle />,
+  transferHistory: <TransferHistoryTitle />,
+};
+
+const OVERLAY_MODAL_LABELS: Record<OverlayView, ReactNode> = {
+  deposit: <Trans>Deposit to GMX Account</Trans>,
+  withdraw: <Trans>Withdraw from GMX Account</Trans>,
+  depositStatus: <Trans>Deposit in progress...</Trans>,
+  selectAssetToDeposit: <Trans>Select asset to deposit</Trans>,
+  walletReceiveOptions: <Trans>Receive funds</Trans>,
+  walletReceive: <Trans>Receive to Wallet</Trans>,
+  walletSend: <Trans>Send from Wallet</Trans>,
+};
+
+function OverlayContent({ view }: { view: OverlayView }) {
+  switch (view) {
+    case "deposit":
+      return <DepositView />;
+    case "selectAssetToDeposit":
+      return <SelectAssetToDepositView />;
+    case "depositStatus":
+      return <DepositStatusView />;
+    case "withdraw":
+      return <WithdrawalScreen />;
+    case "walletReceiveOptions":
+      return <WalletReceiveOptionsView />;
+    case "walletReceive":
+      return <WalletReceiveView />;
+    case "walletSend":
+      return <WalletSendView />;
+  }
+}
+
+export function GmxAccountModalDesktop({ account }: { account: string }) {
+  const [modalState, setModalState] = useGmxAccountModalOpen();
+  const [walletReceiveViewBackTo] = useGmxAccountWalletReceiveViewBackTo();
+
+  const isOpen = modalState !== false;
+  const view: GmxAccountModalView = typeof modalState === "string" ? modalState : "main";
+
+  const slideModalLabel = isMainView(view) ? SLIDE_MODAL_LABELS[view] : SLIDE_MODAL_LABELS.main;
+  const showMainViewInBackground = isOverlayView(view);
+  const isMainViewContent = view === "main" || showMainViewInBackground;
+
+  const handleOverlayBack = view === "walletReceive" ? () => setModalState("walletReceiveOptions") : undefined;
+
+  const handleOverlayClose = (nextVisible: boolean) => {
+    if (nextVisible) return;
+
+    if ((view === "walletReceive" || view === "walletReceiveOptions") && walletReceiveViewBackTo !== undefined) {
+      setModalState(walletReceiveViewBackTo);
+      return;
+    }
+
+    if (view === "depositStatus") {
+      userAnalytics.pushEvent<OneClickPromotionEvent>({
+        event: "OneClickPromotion",
+        data: { action: "UserRejected" },
+      });
+      setModalState("transferHistory");
+      return;
+    }
+
+    setModalState("main");
+  };
+
+  return (
+    <>
+      <SlideModal
+        label={slideModalLabel}
+        isVisible={isOpen}
+        setIsVisible={setModalState}
+        desktopContentClassName={isMainViewContent ? "!w-[420px]" : "!h-[640px] !w-[420px]"}
+        desktopClassName="!items-start !justify-end !pt-[56px] !pr-8"
+        disableOverflowHandling={true}
+        className="text-body-medium"
+        contentPadding={false}
+        hideHeaderBorder
+      >
+        {(view === "main" || showMainViewInBackground) && <MainView account={account} />}
+
+        {view === "availableToTradeAssets" && <AvailableToTradeAssetsView />}
+        {(view === "transferHistory" || view === "transferDetails") && (
+          <TransferHistoryScreen showDetails={view === "transferDetails"} />
+        )}
+      </SlideModal>
+
+      {isOverlayView(view) && (
+        <ModalWithPortal
+          label={OVERLAY_MODAL_LABELS[view]}
+          isVisible={isOpen}
+          setIsVisible={handleOverlayClose}
+          onBack={handleOverlayBack}
+          contentPadding={false}
+          disableOverflowHandling={true}
+          contentClassName={
+            view === "depositStatus" || view === "walletReceive" || view === "walletReceiveOptions"
+              ? "!w-[420px] text-body-medium"
+              : "!h-[640px] !w-[420px] !overflow-hidden text-body-medium"
+          }
+          hideHeaderBorder
+          zIndex={1002}
+        >
+          <div className="flex min-h-0 grow flex-col">
+            <OverlayContent view={view} />
+          </div>
+        </ModalWithPortal>
+      )}
+    </>
+  );
+}

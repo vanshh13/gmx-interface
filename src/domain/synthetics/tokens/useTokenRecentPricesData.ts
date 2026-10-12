@@ -1,0 +1,125 @@
+import { useMemo } from "react";
+import { useLocation } from "react-router-dom";
+
+import { ContractsChainId } from "config/chains";
+import { GLV_MARKETS } from "config/markets";
+import { parseContractPrice, TokenPricesData } from "domain/synthetics/tokens";
+import { FreshnessMetricId, metrics, TickersErrorsCounter } from "lib/metrics";
+import { freshnessMetrics } from "lib/metrics/reportFreshnessMetric";
+import { useOracleKeeperFetcher } from "lib/oracleKeeperFetcher/useOracleKeeperFetcher";
+import { LEADERBOARD_PRICES_UPDATE_INTERVAL, PRICES_CACHE_TTL, PRICES_UPDATE_INTERVAL } from "lib/timeConstants";
+import { getToken, getTokenBySymbol, getWrappedToken, NATIVE_TOKEN_ADDRESS } from "sdk/configs/tokens";
+import type { Token } from "sdk/utils/tokens/types";
+
+import { useSequentialTimedSWR } from "./useSequentialTimedSWR";
+
+export type TokenPricesDataResult = {
+  pricesData?: TokenPricesData;
+  updatedAt?: number;
+  error?: Error;
+  isPriceDataLoading: boolean;
+};
+
+const PRICES_CACHE: { [chainId: number]: TokenPricesData } = {};
+const PRICES_CACHE_UPDATED: { [chainId: number]: { [address: string]: number } } = {};
+
+export function useTokenRecentPricesRequest(
+  chainId: ContractsChainId,
+  params?: { enabled?: boolean }
+): TokenPricesDataResult {
+  const { enabled = true } = params ?? {};
+  const oracleKeeperFetcher = useOracleKeeperFetcher(chainId);
+  const pathname = useLocation().pathname;
+
+  // TODO temp workaround
+  const refreshPricesInterval = useMemo(() => {
+    return pathname.startsWith("/leaderboard") || pathname.startsWith("/competitions")
+      ? LEADERBOARD_PRICES_UPDATE_INTERVAL
+      : PRICES_UPDATE_INTERVAL;
+  }, [pathname]);
+
+  PRICES_CACHE[chainId] = PRICES_CACHE[chainId] || {};
+  PRICES_CACHE_UPDATED[chainId] = PRICES_CACHE_UPDATED[chainId] || {};
+
+  const key = enabled ? [chainId, oracleKeeperFetcher.url, "useTokenRecentPrices"] : null;
+
+  const { data, error, isLoading } = useSequentialTimedSWR(key, {
+    refreshInterval: refreshPricesInterval,
+    refreshWhenHidden: true,
+
+    fetcher: async ([chainId]) => {
+      const priceItems = await oracleKeeperFetcher.fetchTickers().catch(() => {
+        metrics.pushCounter<TickersErrorsCounter>("tickersErrors");
+        return [];
+      });
+
+      const result: TokenPricesData = {};
+
+      priceItems.forEach((priceItem) => {
+        const tokenConfig = getPriceTokenConfig(chainId, priceItem.tokenAddress);
+        if (!tokenConfig) {
+          return;
+        }
+
+        const formattedPrices = {
+          minPrice: parseContractPrice(BigInt(priceItem.minPrice), tokenConfig.decimals),
+          maxPrice: parseContractPrice(BigInt(priceItem.maxPrice), tokenConfig.decimals),
+        };
+
+        result[tokenConfig.address] = formattedPrices;
+
+        // Update cache of new received tokens
+        PRICES_CACHE[chainId][tokenConfig.address] = formattedPrices;
+        PRICES_CACHE_UPDATED[chainId][tokenConfig.address] = Date.now();
+      });
+
+      Object.keys(PRICES_CACHE_UPDATED[chainId]).forEach((address) => {
+        const cacheUpdatedAt = PRICES_CACHE_UPDATED[chainId][address];
+        const canUseCache = cacheUpdatedAt && Date.now() - cacheUpdatedAt < PRICES_CACHE_TTL;
+
+        if (!result[address] && canUseCache) {
+          result[address] = PRICES_CACHE[chainId][address];
+        }
+      });
+
+      const wrappedToken = getWrappedToken(chainId);
+
+      if (result[wrappedToken.address] && !result[NATIVE_TOKEN_ADDRESS]) {
+        result[NATIVE_TOKEN_ADDRESS] = result[wrappedToken.address];
+      }
+
+      freshnessMetrics.reportThrottled(chainId, FreshnessMetricId.Tickers);
+
+      return {
+        pricesData: result,
+        updatedAt: Date.now(),
+      };
+    },
+  });
+
+  return {
+    pricesData: data?.pricesData,
+    updatedAt: data?.updatedAt,
+    error,
+    isPriceDataLoading: isLoading,
+  };
+}
+
+export function getPriceTokenConfig(chainId: ContractsChainId, tokenAddress: string): Token | undefined {
+  try {
+    return getToken(chainId, tokenAddress);
+  } catch (e) {
+    const glvConfig = Object.values(GLV_MARKETS[chainId] ?? {}).find(
+      (glv) => glv.glvTokenAddress.toLowerCase() === tokenAddress.toLowerCase()
+    );
+
+    if (!glvConfig) {
+      return undefined;
+    }
+
+    return {
+      ...getTokenBySymbol(chainId, "GLV"),
+      address: glvConfig.glvTokenAddress,
+    };
+  }
+}

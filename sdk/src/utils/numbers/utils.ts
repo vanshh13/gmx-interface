@@ -1,0 +1,1029 @@
+import { formatUnits, parseUnits } from "viem";
+
+import { bigMath } from "utils/bigmath";
+
+import { joinNumberParts, NumberPart, numberParts, USD_PART } from "./parts";
+
+export type Numeric = number | bigint;
+export type BigNumberish = string | Numeric;
+
+export const USD_DECIMALS = 30;
+
+export const BASIS_POINTS_DIVISOR = 10000;
+export const BASIS_POINTS_DIVISOR_BIGINT = 10000n;
+export const BASIS_POINTS_DECIMALS = 4;
+
+export const PRECISION_DECIMALS = 30;
+export const PRECISION = expandDecimals(1, PRECISION_DECIMALS);
+
+export const FLOAT_PRECISION_SQRT_DECIMALS = 15;
+export const FLOAT_PRECISION_SQRT = expandDecimals(1, FLOAT_PRECISION_SQRT_DECIMALS);
+
+export const BN_ZERO = 0n;
+export const BN_ONE = 1n;
+export const BN_NEGATIVE_ONE = -1n;
+
+export const MaxUint256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+export const MaxInt256 = BigInt("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+const UINT_DECIMAL_STRING_REGEX = /^(0|[1-9]\d*)$/;
+
+export function parseUint256DecimalString(value: unknown): bigint | undefined {
+  if (typeof value !== "string" || !UINT_DECIMAL_STRING_REGEX.test(value)) {
+    return undefined;
+  }
+
+  const parsed = BigInt(value);
+  return parsed <= MaxUint256 ? parsed : undefined;
+}
+
+export function isUint256(value: unknown): value is bigint {
+  return typeof value === "bigint" && value >= 0n && value <= MaxUint256;
+}
+
+export const PERCENT_PRECISION_DECIMALS = PRECISION_DECIMALS - 2;
+
+const MAX_EXCEEDING_THRESHOLD = "1000000000";
+const MIN_EXCEEDING_THRESHOLD = "0.01";
+export const TRIGGER_PREFIX_ABOVE = ">";
+export const TRIGGER_PREFIX_BELOW = "<";
+
+declare const __nonZero: unique symbol;
+export type NonZero<T extends number | bigint> = T & { readonly [__nonZero]: true };
+
+export function isNonZero<T extends number | bigint>(value: T): value is NonZero<T> {
+  return value !== 0 && value !== 0n;
+}
+
+export function safeDivide<T extends number | bigint>(a: T, b: NonZero<T>): T {
+  return (a / b) as T;
+}
+
+export function expandDecimals(n: BigNumberish, decimals: number): bigint {
+  return BigInt(n) * 10n ** BigInt(decimals);
+}
+
+export function toBigInt(value: BigNumberish | undefined | null): bigint | undefined {
+  try {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    if (typeof value === "bigint") {
+      return value;
+    }
+    return BigInt(value);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("toBigInt error", e);
+    return undefined;
+  }
+}
+
+export function basisPointsToFloat(basisPoints: bigint) {
+  return (basisPoints * PRECISION) / BASIS_POINTS_DIVISOR_BIGINT;
+}
+
+export function getBasisPoints(numerator: bigint, denominator: bigint, shouldRoundUp = false) {
+  const result = (numerator * BASIS_POINTS_DIVISOR_BIGINT) / denominator;
+
+  if (shouldRoundUp) {
+    const remainder = (numerator * BASIS_POINTS_DIVISOR_BIGINT) % denominator;
+    if (remainder !== 0n) {
+      return result < 0n ? result - 1n : result + 1n;
+    }
+  }
+
+  return result;
+}
+
+export function formatBasisPoints(bpsValue: bigint | undefined): string | undefined {
+  if (bpsValue === undefined) {
+    return undefined;
+  }
+
+  const sign = getPlusOrMinusSymbol(bpsValue);
+
+  return `${sign}${formatAmount(bigMath.abs(bpsValue), 0, 0, true)} bps`;
+}
+
+export function formatPriceImpactBps(priceImpactUsd: bigint | undefined, sizeUsd: bigint): string | undefined {
+  return formatBasisPoints(
+    priceImpactUsd !== undefined && sizeUsd > 0n ? getBasisPoints(priceImpactUsd, sizeUsd) : undefined
+  );
+}
+
+export function roundUpMagnitudeDivision(a: bigint, b: bigint) {
+  if (a < 0n) {
+    return (a - b + 1n) / b;
+  }
+
+  return (a + b - 1n) / b;
+}
+
+// True when the amount would render as zero at displayDecimals.
+export function roundsToZero(amount: bigint, decimals: number, displayDecimals: number) {
+  const hiddenDecimals = decimals - displayDecimals;
+
+  if (hiddenDecimals <= 0) {
+    return false;
+  }
+
+  return bigMath.abs(amount) < 10n ** BigInt(hiddenDecimals);
+}
+
+export function applyFactor(value: bigint, factor: bigint) {
+  return (value * factor) / PRECISION;
+}
+
+export function numberToBigint(value: number, decimals: number) {
+  const negative = value < 0;
+  if (negative) value *= -1;
+
+  const int = Math.trunc(value);
+  let frac = value - int;
+
+  let res = BigInt(int);
+
+  for (let i = 0; i < decimals; i++) {
+    res *= 10n;
+    if (frac !== 0) {
+      frac *= 10;
+      const fracInt = Math.trunc(frac);
+      res += BigInt(fracInt);
+      frac -= fracInt;
+    }
+  }
+
+  return negative ? -res : res;
+}
+
+export const trimZeroDecimals = (amount: string) => {
+  if (amount === "") {
+    return amount;
+  }
+  if (!amount.includes(".")) {
+    return normalizeInteger(amount);
+  }
+
+  const isNegative = amount.startsWith("-");
+  const unsignedAmount = isNegative ? amount.slice(1) : amount;
+  const [integerPartRaw, fractionPartRaw = ""] = unsignedAmount.split(".");
+
+  if (/^0*$/.test(fractionPartRaw)) {
+    const integerWithSign = isNegative ? `-${integerPartRaw}` : integerPartRaw;
+    return normalizeInteger(integerWithSign);
+  }
+
+  return amount;
+};
+
+function normalizeInteger(value: string) {
+  if (!value) {
+    return "0";
+  }
+
+  const isNegative = value.startsWith("-");
+  const hasPlus = value.startsWith("+");
+  const unsigned = isNegative || hasPlus ? value.slice(1) : value;
+  const stripped = unsigned.replace(/^0+/, "") || "0";
+
+  if (stripped === "0") {
+    return "0";
+  }
+
+  return isNegative ? `-${stripped}` : stripped;
+}
+
+export function bigintToNumber(value: bigint, decimals: number) {
+  const negative = value < 0;
+  if (negative) value *= -1n;
+  const precision = expandDecimals(1, decimals);
+  const int = value / precision;
+  const frac = value % precision;
+
+  const num = parseFloat(`${int}.${frac.toString().padStart(decimals, "0")}`);
+  return negative ? -num : num;
+}
+
+export function adjustForDecimals(amount: bigint, divDecimals: number, mulDecimals: number) {
+  return (amount * expandDecimals(1, mulDecimals)) / expandDecimals(1, divDecimals);
+}
+
+export type FormatUsdOptions = {
+  fallbackToZero?: boolean;
+  displayDecimals?: number;
+  maxThreshold?: string | null;
+  minThreshold?: string;
+  displayPlus?: boolean;
+  visualMultiplier?: number;
+  roundMode?: "round" | "floor";
+};
+
+export function formatUsdParts(usd?: bigint, opts: FormatUsdOptions = {}): NumberPart[] | undefined {
+  const { fallbackToZero = false, displayDecimals = 2 } = opts;
+
+  if (typeof usd !== "bigint") {
+    if (fallbackToZero) {
+      usd = 0n;
+    } else {
+      return undefined;
+    }
+  }
+
+  if (opts.visualMultiplier) {
+    usd *= BigInt(opts.visualMultiplier);
+  }
+
+  if (opts.roundMode === "floor" && displayDecimals < USD_DECIMALS) {
+    const factor = expandDecimals(1, USD_DECIMALS - displayDecimals);
+    usd = usd >= 0n ? (usd / factor) * factor : ((usd - factor + 1n) / factor) * factor;
+  }
+
+  const defaultMinThreshold = displayDecimals > 1 ? "0." + "0".repeat(displayDecimals - 1) + "1" : undefined;
+
+  const exceedingInfo = getLimitedDisplay(usd, USD_DECIMALS, {
+    maxThreshold: opts.maxThreshold,
+    minThreshold: opts.minThreshold ?? defaultMinThreshold,
+  });
+
+  const maybePlus = opts.displayPlus ? "+" : "";
+  const sign = usd < 0n ? "-" : maybePlus;
+  const symbol = exceedingInfo.symbol ? `${exceedingInfo.symbol}\u00a0` : "";
+  const displayUsd = formatAmount(exceedingInfo.value, USD_DECIMALS, displayDecimals, true);
+  return numberParts(symbol, sign, USD_PART, displayUsd);
+}
+
+export function formatUsd(usd?: bigint, opts: FormatUsdOptions = {}) {
+  const parts = formatUsdParts(usd, opts);
+
+  return parts && joinNumberParts(parts);
+}
+
+export function formatBigUsdParts(amount: bigint, opts: { displayDecimals?: number } = {}) {
+  return formatUsdParts(amount, {
+    maxThreshold: "9999999999999999999999999",
+    displayDecimals: opts.displayDecimals ?? 0,
+  })!;
+}
+
+export function formatBigUsd(amount: bigint, opts: { displayDecimals?: number } = {}) {
+  return joinNumberParts(formatBigUsdParts(amount, opts));
+}
+
+export type FormatDeltaUsdOptions = { fallbackToZero?: boolean; showPlusForZero?: boolean; hidePercentage?: boolean };
+
+export function formatDeltaUsdParts(
+  deltaUsd?: bigint,
+  percentage?: bigint,
+  opts: FormatDeltaUsdOptions = {}
+): NumberPart[] | undefined {
+  if (typeof deltaUsd !== "bigint") {
+    if (opts.fallbackToZero) {
+      return numberParts(formatUsdParts(0n), ` (${formatAmount(0n, 2, 2)}%)`);
+    }
+
+    return undefined;
+  }
+
+  const sign = getPlusOrMinusSymbol(deltaUsd, { showPlusForZero: opts.showPlusForZero });
+
+  const exceedingInfo = getLimitedDisplay(deltaUsd, USD_DECIMALS);
+  const percentageStr =
+    percentage !== undefined && !opts.hidePercentage ? ` (${sign}${formatPercentage(bigMath.abs(percentage))})` : "";
+  const deltaUsdStr = formatAmount(exceedingInfo.value, USD_DECIMALS, 2, true);
+  const symbol = exceedingInfo.symbol ? `${exceedingInfo.symbol} ` : "";
+
+  return numberParts(symbol, sign, USD_PART, deltaUsdStr, percentageStr);
+}
+
+export function formatDeltaUsd(deltaUsd?: bigint, percentage?: bigint, opts: FormatDeltaUsdOptions = {}) {
+  const parts = formatDeltaUsdParts(deltaUsd, percentage, opts);
+
+  return parts && joinNumberParts(parts);
+}
+
+export function formatPercentage(
+  percentage?: bigint,
+  opts: {
+    fallbackToZero?: boolean;
+    signed?: boolean;
+    displayDecimals?: number;
+    bps?: boolean;
+    showPlus?: boolean;
+    useCommas?: boolean;
+  } = {}
+) {
+  const {
+    fallbackToZero = false,
+    signed = false,
+    displayDecimals = 2,
+    bps = true,
+    showPlus = true,
+    useCommas = false,
+  } = opts;
+
+  if (percentage === undefined) {
+    if (fallbackToZero) {
+      return `${formatAmount(0n, PERCENT_PRECISION_DECIMALS, displayDecimals, useCommas)}%`;
+    }
+
+    return undefined;
+  }
+
+  const sign = signed ? `${getPlusOrMinusSymbol(percentage)}` : "";
+  const displaySign = !showPlus && sign === "+" ? "" : `${sign}`;
+
+  return `${displaySign}${displaySign ? "\u200a" : ""}${formatAmount(bigMath.abs(percentage), bps ? 2 : PERCENT_PRECISION_DECIMALS, displayDecimals, useCommas)}%`;
+}
+
+export function formatTokenAmount(
+  amount?: bigint,
+  tokenDecimals?: number,
+  symbol?: string,
+  opts: {
+    showAllSignificant?: boolean;
+    displayDecimals?: number;
+    fallbackToZero?: boolean;
+    useCommas?: boolean;
+    minThreshold?: string;
+    maxThreshold?: string;
+    displayPlus?: boolean;
+    isStable?: boolean;
+  } = {}
+) {
+  const {
+    showAllSignificant = false,
+    fallbackToZero = false,
+    useCommas = false,
+    minThreshold = "0",
+    maxThreshold,
+  } = opts;
+
+  let displayDecimals: number;
+  if (opts.displayDecimals !== undefined) {
+    displayDecimals = opts.displayDecimals;
+  } else if (typeof amount === "bigint" && tokenDecimals) {
+    displayDecimals = calculateDisplayDecimals(amount, tokenDecimals, 1, opts.isStable);
+  } else {
+    displayDecimals = opts.isStable ? 2 : 4;
+  }
+
+  const symbolStr = symbol ? ` ${symbol}` : "";
+
+  if (typeof amount !== "bigint" || !tokenDecimals) {
+    if (fallbackToZero) {
+      amount = 0n;
+      tokenDecimals = displayDecimals;
+    } else {
+      return undefined;
+    }
+  }
+
+  let amountStr: string;
+
+  const maybePlus = opts.displayPlus ? "+" : "";
+  const sign = amount < 0n ? "-" : maybePlus;
+
+  if (showAllSignificant) {
+    amountStr = formatAmountFree(amount, tokenDecimals, tokenDecimals);
+  } else {
+    const exceedingInfo = getLimitedDisplay(amount, tokenDecimals, { maxThreshold, minThreshold });
+    const symbol = exceedingInfo.symbol ? `${exceedingInfo.symbol} ` : "";
+    amountStr = `${symbol}${sign}${formatAmount(exceedingInfo.value, tokenDecimals, displayDecimals, useCommas, undefined)}`;
+  }
+
+  return `${amountStr}${symbolStr}`;
+}
+
+export type FormatTokenAmountWithUsdOptions = {
+  fallbackToZero?: boolean;
+  displayDecimals?: number;
+  displayPlus?: boolean;
+  isStable?: boolean;
+};
+
+export function formatTokenAmountWithUsdParts(
+  tokenAmount?: bigint,
+  usdAmount?: bigint,
+  tokenSymbol?: string,
+  tokenDecimals?: number,
+  opts: FormatTokenAmountWithUsdOptions = {}
+): NumberPart[] | undefined {
+  if (typeof tokenAmount !== "bigint" || typeof usdAmount !== "bigint" || !tokenSymbol || !tokenDecimals) {
+    if (!opts.fallbackToZero) {
+      return undefined;
+    }
+  }
+
+  const tokenStr = formatTokenAmount(tokenAmount, tokenDecimals, tokenSymbol, {
+    ...opts,
+    useCommas: true,
+    displayPlus: opts.displayPlus,
+  });
+
+  const usdParts = formatUsdParts(usdAmount, {
+    fallbackToZero: opts.fallbackToZero,
+    displayPlus: opts.displayPlus,
+  });
+
+  return numberParts(`${tokenStr} (`, usdParts, ")");
+}
+
+export function formatTokenAmountWithUsd(
+  tokenAmount?: bigint,
+  usdAmount?: bigint,
+  tokenSymbol?: string,
+  tokenDecimals?: number,
+  opts: FormatTokenAmountWithUsdOptions = {}
+) {
+  const parts = formatTokenAmountWithUsdParts(tokenAmount, usdAmount, tokenSymbol, tokenDecimals, opts);
+
+  return parts && joinNumberParts(parts);
+}
+
+/**
+ *
+ * @param opts.signed - Default `true`. whether to display a `+` or `-` sign for all non-zero values.
+ */
+export function formatRatePercentage(rate?: bigint, opts?: { displayDecimals?: number; signed?: boolean }) {
+  if (typeof rate !== "bigint") {
+    return "-";
+  }
+
+  const signed = opts?.signed ?? true;
+  const plurOrMinus = signed ? getPlusOrMinusSymbol(rate) : "";
+
+  const amount = bigMath.abs(rate * 100n);
+  return `${plurOrMinus}\u200a${formatAmount(amount, 30, opts?.displayDecimals ?? 4)}%`;
+}
+
+export function formatUsdPriceParts(price?: bigint, opts: FormatUsdOptions = {}): NumberPart[] | undefined {
+  if (price === undefined) {
+    return;
+  }
+
+  if (price < 0n) {
+    return numberParts("NA");
+  }
+
+  const decimals = calculateDisplayDecimals(price, undefined, opts.visualMultiplier);
+
+  return formatUsdParts(price, {
+    ...opts,
+    displayDecimals: decimals,
+  });
+}
+
+export function formatUsdPrice(price?: bigint, opts: FormatUsdOptions = {}) {
+  const parts = formatUsdPriceParts(price, opts);
+
+  return parts && joinNumberParts(parts);
+}
+
+export function formatPercentageDisplay(percentage: number, hideThreshold?: number) {
+  if (hideThreshold && percentage < hideThreshold) {
+    return "";
+  }
+
+  return `${percentage}%`;
+}
+
+export function formatNumberHumanParts(n: number, showDollar = false, displayDecimals = 1): NumberPart[] {
+  // For large numbers, we can neglect the decimals to avoid decimals in cases like 9999999.99999
+  if (n >= 1_000_000) {
+    n = Math.round(n);
+  }
+  const isNegative = n < 0;
+  const absN = Math.abs(n);
+  const sign = isNegative ? "-" : "";
+  const currency = showDollar ? USD_PART : undefined;
+
+  // Promote the suffix when the displayed value rounds to 1000 in the smaller unit.
+  if (Number((absN / 1_000_000).toFixed(displayDecimals)) >= 1000) {
+    return numberParts(sign, currency, `${(absN / 1_000_000_000).toFixed(displayDecimals)}b`);
+  }
+
+  if (Number((absN / 1_000).toFixed(displayDecimals)) >= 1000) {
+    return numberParts(sign, currency, `${(absN / 1_000_000).toFixed(displayDecimals)}m`);
+  }
+
+  if (Number(absN.toFixed(displayDecimals)) >= 1000) {
+    return numberParts(sign, currency, `${(absN / 1_000).toFixed(displayDecimals)}k`);
+  }
+
+  return numberParts(sign, currency, absN.toFixed(displayDecimals));
+}
+
+export function formatNumberHuman(n: number, showDollar = false, displayDecimals = 1) {
+  return joinNumberParts(formatNumberHumanParts(n, showDollar, displayDecimals));
+}
+
+export function formatAmountHumanParts(
+  amount: BigNumberish | undefined,
+  tokenDecimals: number,
+  showDollar = false,
+  displayDecimals = 1
+): NumberPart[] {
+  if (amount === undefined) {
+    return numberParts("...");
+  }
+
+  let n = Number(formatAmount(amount, tokenDecimals));
+
+  return formatNumberHumanParts(n, showDollar, displayDecimals);
+}
+
+export function formatAmountHuman(
+  amount: BigNumberish | undefined,
+  tokenDecimals: number,
+  showDollar = false,
+  displayDecimals = 1
+) {
+  return joinNumberParts(formatAmountHumanParts(amount, tokenDecimals, showDollar, displayDecimals));
+}
+
+export function formatBalanceAmount(
+  amount: bigint,
+  tokenDecimals: number,
+  tokenSymbol?: string,
+  {
+    showZero = false,
+    toExponential = true,
+    isStable = false,
+    signed = false,
+  }: {
+    showZero?: boolean;
+    toExponential?: boolean;
+    isStable?: boolean;
+    signed?: boolean;
+  } = {}
+): string {
+  if (amount === undefined) return "-";
+
+  if (amount === 0n) {
+    if (showZero === true) {
+      if (tokenSymbol) {
+        if (isStable) {
+          return `0.00 ${tokenSymbol}`;
+        }
+        return `0.0000 ${tokenSymbol}`;
+      }
+      if (isStable) {
+        return "0.00";
+      }
+      return "0.0000";
+    }
+
+    return "-";
+  }
+
+  const sign = signed || amount < 0n ? getPlusOrMinusSymbol(amount) : "";
+  const absAmount = bigMath.abs(amount);
+  const absAmountFloat = bigintToNumber(absAmount, tokenDecimals);
+
+  let value = "";
+
+  if (absAmountFloat >= 1e-8) {
+    const displayDecimals = calculateDisplayDecimals(absAmount, tokenDecimals, 1, isStable);
+    value = formatAmount(absAmount, tokenDecimals, displayDecimals, true);
+  } else {
+    if (toExponential) {
+      value = bigintToNumber(absAmount, tokenDecimals).toExponential(2);
+    } else {
+      value = bigintToNumber(absAmount, tokenDecimals).toFixed(8);
+    }
+  }
+
+  if (tokenSymbol) {
+    // Non-breaking space
+    return `${sign}${value} ${tokenSymbol}`;
+  }
+
+  return `${sign}${value}`;
+}
+
+export function formatFactor(factor: bigint) {
+  if (factor == 0n) {
+    return "0";
+  }
+
+  if (bigMath.abs(factor) > PRECISION * 1000n) {
+    return (factor / PRECISION).toString();
+  }
+
+  const trailingZeroes =
+    bigMath
+      .abs(factor)
+      .toString()
+      .match(/^(.+?)(?<zeroes>0*)$/)?.groups?.zeroes?.length || 0;
+  const factorDecimals = Math.max(PRECISION_DECIMALS - trailingZeroes, 0);
+  return formatAmount(factor, PRECISION_DECIMALS, factorDecimals);
+}
+export function numberWithCommasParts(x: BigNumberish, { showDollar = false }: { showDollar?: boolean } = {}) {
+  if (x === undefined || x === null) {
+    return numberParts("...");
+  }
+
+  const parts = x.toString().split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return numberParts(showDollar ? USD_PART : undefined, parts.join("."));
+}
+
+export function numberWithCommas(x: BigNumberish, opts: { showDollar?: boolean } = {}) {
+  return joinNumberParts(numberWithCommasParts(x, opts));
+}
+
+export const formatAmount = (
+  amount: BigNumberish | undefined,
+  tokenDecimals: number,
+  displayDecimals?: number,
+  useCommas?: boolean,
+  defaultValue?: string,
+  visualMultiplier?: number
+) => {
+  if (defaultValue === undefined || defaultValue === null) {
+    defaultValue = "...";
+  }
+  if (amount === undefined || amount === null || amount === "") {
+    return defaultValue;
+  }
+  if (displayDecimals === undefined) {
+    displayDecimals = 4;
+  }
+  const amountBigInt = roundWithDecimals(BigInt(amount) * BigInt(visualMultiplier ?? 1), {
+    displayDecimals,
+    decimals: tokenDecimals,
+  });
+  let amountStr = formatUnits(amountBigInt, tokenDecimals);
+  amountStr = limitDecimals(amountStr, displayDecimals);
+  if (displayDecimals !== 0) {
+    amountStr = padDecimals(amountStr, displayDecimals);
+  }
+  if (useCommas) {
+    return numberWithCommas(amountStr);
+  }
+  return amountStr;
+};
+
+export const formatKeyAmount = <T extends {}>(
+  map: T | undefined,
+  key: keyof T,
+  tokenDecimals: number,
+  displayDecimals: number,
+  useCommas?: boolean
+) => {
+  const value = map ? map[key] ?? undefined : undefined;
+  if (value === undefined || value === null) {
+    return "...";
+  }
+
+  return formatAmount(value as bigint, tokenDecimals, displayDecimals, useCommas);
+};
+
+export const formatArrayAmount = (
+  arr: any[],
+  index: number,
+  tokenDecimals: number,
+  displayDecimals?: number,
+  useCommas?: boolean
+) => {
+  if (!arr || arr[index] === undefined || arr[index] === null) {
+    return "...";
+  }
+
+  return formatAmount(arr[index], tokenDecimals, displayDecimals, useCommas);
+};
+
+export const formatAmountFree = (
+  amount: BigNumberish,
+  tokenDecimals: number,
+  displayDecimals?: number,
+  visualMultiplier?: number
+) => {
+  if (amount === undefined || amount === null) {
+    return "...";
+  }
+
+  let amountBigInt = BigInt(amount);
+
+  if (visualMultiplier) {
+    amountBigInt = amountBigInt / BigInt(visualMultiplier);
+  }
+
+  let amountStr = formatUnits(amountBigInt, tokenDecimals);
+  amountStr = limitDecimals(amountStr, displayDecimals);
+  return trimZeroDecimals(amountStr);
+};
+
+export function getLimitedDisplay(
+  amount: bigint,
+  tokenDecimals: number,
+  opts: { maxThreshold?: BigNumberish | null; minThreshold?: BigNumberish } = {}
+) {
+  const { maxThreshold = MAX_EXCEEDING_THRESHOLD, minThreshold = MIN_EXCEEDING_THRESHOLD } = opts;
+  const max = maxThreshold === null ? null : expandDecimals(BigInt(maxThreshold), tokenDecimals);
+  const min = parseUnits(minThreshold.toString(), tokenDecimals);
+  const absAmount = bigMath.abs(amount);
+
+  if (absAmount == 0n) {
+    return {
+      symbol: "",
+      value: absAmount,
+    };
+  }
+
+  const symbol = max !== null && absAmount > max ? TRIGGER_PREFIX_ABOVE : absAmount < min ? TRIGGER_PREFIX_BELOW : "";
+  const value = max !== null && absAmount > max ? max : absAmount < min ? min : absAmount;
+
+  return {
+    symbol,
+    value,
+  };
+}
+
+export const limitDecimals = (amount: BigNumberish, maxDecimals?: number) => {
+  let amountStr = amount.toString();
+
+  if (amountStr.includes("e") || amountStr.includes("E")) {
+    const num = Number(amountStr);
+    if (!isNaN(num)) {
+      amountStr = num.toFixed(20).replace(/\.?0+$/, "");
+    }
+  }
+
+  if (maxDecimals === undefined) {
+    return amountStr;
+  }
+  if (maxDecimals === 0) {
+    return amountStr.split(".")[0];
+  }
+  const dotIndex = amountStr.indexOf(".");
+  if (dotIndex !== -1) {
+    let decimals = amountStr.length - dotIndex - 1;
+    if (decimals > maxDecimals) {
+      amountStr = amountStr.substr(0, amountStr.length - (decimals - maxDecimals));
+    }
+  }
+
+  return amountStr;
+};
+
+export const padDecimals = (amount: BigNumberish, minDecimals: number) => {
+  let amountStr = amount.toString();
+  const dotIndex = amountStr.indexOf(".");
+  if (dotIndex !== -1) {
+    const decimals = amountStr.length - dotIndex - 1;
+    if (decimals < minDecimals) {
+      amountStr = amountStr.padEnd(amountStr.length + (minDecimals - decimals), "0");
+    }
+  } else {
+    amountStr = amountStr + "." + "0".repeat(minDecimals);
+  }
+  return amountStr;
+};
+
+export function getPlusOrMinusSymbol(value?: bigint, opts: { showPlusForZero?: boolean } = {}): string {
+  if (value === undefined) {
+    return "";
+  }
+
+  const { showPlusForZero = false } = opts;
+  return value === 0n ? (showPlusForZero ? "+" : "") : value < 0n ? "-" : "+";
+}
+
+export function roundWithDecimals(value: BigNumberish, opts: { displayDecimals: number; decimals: number }): bigint {
+  if (opts.displayDecimals === opts.decimals) {
+    return BigInt(value);
+  }
+
+  let valueString = value.toString();
+  let isNegative = false;
+
+  if (valueString[0] === "-") {
+    valueString = valueString.slice(1);
+    isNegative = true;
+  }
+
+  if (valueString.length < opts.decimals) {
+    valueString = valueString.padStart(opts.decimals, "0");
+  }
+
+  const mainPart = valueString.slice(0, valueString.length - opts.decimals + opts.displayDecimals);
+  const partToRound = valueString.slice(valueString.length - opts.decimals + opts.displayDecimals);
+
+  let mainPartBigInt = BigInt(mainPart);
+
+  let returnValue = mainPartBigInt;
+
+  if (partToRound.length !== 0) {
+    if (Number(partToRound[0]) >= 5) {
+      mainPartBigInt += 1n;
+    }
+
+    returnValue = BigInt(mainPartBigInt.toString() + new Array(partToRound.length).fill("0").join(""));
+  }
+
+  return isNegative ? returnValue * -1n : returnValue;
+}
+
+// TODO: Remove this function
+export function toBigNumberWithDecimals(value: string, decimals: number): bigint {
+  if (!value) return BN_ZERO;
+
+  const parts = value.split(".");
+  const integerPart = parts[0];
+  const decimalPart = parts.length > 1 ? parts[1] : "";
+
+  const paddingZeros = decimals - decimalPart.length;
+
+  if (paddingZeros >= 0) {
+    const result = integerPart + decimalPart + "0".repeat(paddingZeros);
+    return BigInt(result);
+  } else {
+    const result = integerPart + decimalPart.substring(0, decimals);
+    return BigInt(result);
+  }
+}
+
+export const parseValue = (value: string, tokenDecimals: number) => {
+  const pValue = parseFloat(value);
+
+  if (isNaN(pValue) || !isFinite(pValue)) {
+    return undefined;
+  }
+
+  let amount: bigint;
+  try {
+    value = limitDecimals(value, tokenDecimals);
+    amount = parseUnits(value, tokenDecimals);
+  } catch {
+    return undefined;
+  }
+
+  // Cap at a safe maximum to prevent downstream BigInt overflow errors
+  const MAX_ALLOWED = expandDecimals(1, 62);
+  if (amount > MAX_ALLOWED || amount < -MAX_ALLOWED) {
+    return undefined;
+  }
+
+  return toBigInt(amount);
+};
+
+export function roundUpDivision(a: bigint, b: bigint) {
+  return (a + b - 1n) / b;
+}
+
+export function roundToTwoDecimals(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+export function roundToOrder(n: bigint, significantDigits = 1) {
+  const decimals = Math.max(n.toString().length - significantDigits, 0);
+  return (n / expandDecimals(1, decimals)) * expandDecimals(1, decimals);
+}
+
+export function roundBigIntToDecimals(value: bigint, tokenDecimals: number, roundToDecimals: number): bigint {
+  const excessDecimals = tokenDecimals - roundToDecimals;
+  const divisor = BigInt(10 ** excessDecimals);
+  const scaledValue = value / divisor;
+  const remainder = scaledValue % 10n;
+  const roundedValue = remainder >= 5n ? scaledValue + 10n - remainder : scaledValue - remainder;
+  return roundedValue * divisor;
+}
+
+export function minBigNumber(...args: bigint[]) {
+  if (!args.length) return undefined;
+
+  return args.reduce((acc, num) => (num < acc ? num : acc), args[0]);
+}
+
+export function maxbigint(...args: bigint[]) {
+  if (!args.length) return undefined;
+
+  return args.reduce((acc, num) => (num > acc ? num : acc), args[0]);
+}
+
+export function removeTrailingZeros(amount: string | number) {
+  if (typeof amount === "number" || !amount.includes(".") || amount.includes(",") || /^[-+]?0*\.0*$/.test(amount)) {
+    return amount;
+  }
+
+  return amount.replace(/0+$/, "").replace(/\.$/, "");
+}
+
+type SerializedBigIntsInObject<T> = {
+  [P in keyof T]: T[P] extends bigint
+    ? { type: "bigint"; value: bigint }
+    : T[P] extends object
+      ? SerializedBigIntsInObject<T[P]>
+      : T[P];
+};
+
+type DeserializeBigIntInObject<T> = {
+  [P in keyof T]: T[P] extends { type: "bigint"; value: bigint }
+    ? bigint
+    : T[P] extends object
+      ? DeserializeBigIntInObject<T[P]>
+      : T[P];
+};
+
+const NUMERIC_STRING_REGEX = /^-?\d+$/;
+
+export function serializeBigIntsInObject<T extends object>(obj: T): SerializedBigIntsInObject<T> {
+  const result: any = Array.isArray(obj) ? [] : {};
+  for (const key in obj) {
+    const value = obj[key];
+    if (typeof value === "bigint") {
+      result[key] = { type: "bigint", value: String(value) };
+    } else if (value && typeof value === "object") {
+      result[key] = serializeBigIntsInObject(value);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+export function deserializeBigIntsInObject<T extends object>(
+  obj: T,
+  opts?: { handleInts?: boolean }
+): DeserializeBigIntInObject<T> {
+  const handleInts = opts?.handleInts ?? false;
+  const result: any = Array.isArray(obj) ? [] : {};
+
+  for (const key in obj) {
+    const value = obj[key];
+
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      (("type" in value && value.type === "bigint") || ("_type" in value && value._type === "BigNumber"))
+    ) {
+      if ("value" in value && typeof value.value === "string") {
+        result[key] = BigInt(value.value);
+      } else if ("hex" in value && typeof value.hex === "string") {
+        if (value.hex.startsWith("-")) {
+          result[key] = BigInt(value.hex.slice(1)) * -1n;
+        } else {
+          result[key] = BigInt(value.hex);
+        }
+      }
+    } else if (handleInts && typeof value === "string" && NUMERIC_STRING_REGEX.test(value)) {
+      result[key] = BigInt(value);
+    } else if (value && typeof value === "object") {
+      result[key] = deserializeBigIntsInObject(value, opts);
+    } else {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
+export function calculateDisplayDecimals(
+  price?: bigint,
+  decimals = USD_DECIMALS,
+  visualMultiplier = 1,
+  isStable = false
+) {
+  if (price === undefined || price === 0n) return 2;
+  const priceNumber = bigintToNumber(bigMath.abs(price) * BigInt(visualMultiplier), decimals);
+
+  if (isNaN(priceNumber)) return 2;
+  if (isStable) {
+    if (priceNumber >= 0.1) return 2;
+    if (priceNumber >= 0.01) return 3;
+    if (priceNumber >= 0.001) return 4;
+    if (priceNumber >= 0.0001) return 5;
+    if (priceNumber >= 0.00001) return 6;
+    if (priceNumber >= 0.000001) return 7;
+    if (priceNumber >= 0.0000001) return 8;
+    if (priceNumber >= 0.00000001) return 9;
+  } else {
+    if (priceNumber >= 1000) return 2;
+    if (priceNumber >= 100) return 3;
+    if (priceNumber >= 1) return 4;
+    if (priceNumber >= 0.1) return 5;
+    if (priceNumber >= 0.01) return 6;
+    if (priceNumber >= 0.0001) return 7;
+    if (priceNumber >= 0.00001) return 8;
+  }
+
+  return 9;
+}
+
+export function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(value, max));
+}
+
+export function absDiffBps(value: bigint, base: bigint) {
+  if ((value === 0n && base !== 0n) || (value !== 0n && base === 0n)) {
+    return BASIS_POINTS_DIVISOR_BIGINT;
+  }
+
+  if (value === 0n && base === 0n) {
+    return 0n;
+  }
+
+  return bigMath.mulDiv(bigMath.abs(value - base), BASIS_POINTS_DIVISOR_BIGINT, base);
+}

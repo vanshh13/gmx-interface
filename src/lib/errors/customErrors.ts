@@ -1,0 +1,231 @@
+import { decodeErrorResult } from "viem";
+
+import { SignedTokenPermit } from "domain/tokens";
+import { abis } from "sdk/abis";
+
+import {
+  CustomError,
+  CustomErrorName,
+  ErrorData,
+  ErrorLike,
+  extendError,
+  extractErrorDataFromViemError,
+  isCustomError,
+  ParsedCustomError,
+  parseError,
+  tryDecodeCustomError,
+} from ".";
+
+export const INVALID_PERMIT_SIGNATURE_ERROR = "Invalid permit signature";
+export const EXPIRED_PERMIT_DEADLINE_ERROR = "Expired permit deadline";
+export const FAST_EXPRESS_PARAMS_TIMEOUT_ERROR = "fastExpressParams timeout";
+export const SMART_WALLET_CHAIN_UNAVAILABLE_ERROR = "Smart wallet unavailable on verification chain";
+export const SMART_WALLET_WRONG_CHAIN_ERROR = "Smart wallet connected to another chain";
+export const SMART_WALLET_ACCOUNT_CHANGED_ERROR = "Account changed during chain swap";
+
+export function extractErrorRevertData(error: ErrorLike): string | undefined {
+  const data = extractErrorDataFromViemError(error) ?? error.info?.error?.data ?? error.error?.data ?? error.data;
+
+  return typeof data === "string" ? data : undefined;
+}
+
+export function decodeCustomErrorFromError(error: ErrorLike | undefined): ParsedCustomError | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  const customError = error as CustomError;
+
+  if (isCustomError(customError)) {
+    return { name: customError.name, args: customError.args };
+  }
+
+  const revertData = extractErrorRevertData(error);
+
+  return revertData ? tryDecodeCustomError(revertData) : undefined;
+}
+
+export function decodeInnermostCustomErrorFromError(error: ErrorLike | undefined): ParsedCustomError | undefined {
+  let customError = decodeCustomErrorFromError(error);
+
+  while (customError?.name === CustomErrorName.ExternalCallFailed) {
+    const nestedErrorData = customError.args?.data;
+    customError = typeof nestedErrorData === "string" ? tryDecodeCustomError(nestedErrorData) : undefined;
+  }
+
+  return customError;
+}
+
+export function getIsInsufficientExecutionFeeError(
+  error: ErrorLike
+):
+  | { isErrorMatched: false }
+  | { isErrorMatched: true; errorData: ErrorData; args: { minExecutionFee: bigint; executionFee: bigint } } {
+  const parsedError = parseError(error);
+
+  const isErrorMatched = parsedError?.contractError === "InsufficientExecutionFee";
+
+  if (!isErrorMatched || !parsedError) {
+    return {
+      isErrorMatched: false,
+    };
+  }
+
+  const args = { minExecutionFee: parsedError.contractErrorArgs[0], executionFee: parsedError.contractErrorArgs[1] };
+
+  return {
+    isErrorMatched: true,
+    args,
+    errorData: parsedError,
+  };
+}
+
+export function getIsInvalidSignatureError(error: ErrorLike) {
+  const parsedError = parseError(error);
+
+  const isErrorMatched = parsedError?.contractError === "InvalidSignature";
+
+  if (!isErrorMatched || !parsedError) {
+    return {
+      isErrorMatched: false,
+    };
+  }
+
+  return {
+    isErrorMatched: true,
+    errorData: parsedError,
+  };
+}
+
+export function getIsInvalidSubaccountApprovalNonceError(error: ErrorLike) {
+  return parseError(error)?.contractError === "InvalidSubaccountApprovalNonce";
+}
+
+export function getIsPermitSignatureErrorOnSimulation(error: ErrorLike) {
+  return isPermitExternalCallFailedOnSimulation(error, "invalid signature");
+}
+
+export function getIsPermitExpiredDeadlineOnSimulation(error: ErrorLike) {
+  return isPermitExternalCallFailedOnSimulation(error, "expired deadline");
+}
+
+function isPermitExternalCallFailedOnSimulation(error: ErrorLike, errorSubstring: string) {
+  const parsedError = parseError(error);
+
+  if (!parsedError || parsedError.errorContext !== "simulation" || parsedError.contractError !== "ExternalCallFailed") {
+    return false;
+  }
+
+  try {
+    const decodedExternalCallFailed = decodeErrorResult({
+      abi: abis.CustomErrors,
+      data: parsedError.contractErrorArgs[0],
+    });
+
+    const errorArg = decodedExternalCallFailed?.args?.[0];
+
+    return typeof errorArg === "string" && errorArg.includes(errorSubstring);
+  } catch {
+    return false;
+  }
+}
+
+export function getInvalidPermitSignatureError({
+  isValid,
+  error,
+  permit,
+}: {
+  isValid: boolean;
+  error: ErrorData | undefined;
+  permit: SignedTokenPermit;
+}) {
+  return extendError(new Error(INVALID_PERMIT_SIGNATURE_ERROR), {
+    data: {
+      isValid,
+      originalError: error,
+      spender: permit.spender,
+      value: permit.value,
+      deadline: permit.deadline,
+      onchainParams: {
+        name: permit.onchainParams.name,
+        version: permit.onchainParams.version,
+        nonce: permit.onchainParams.nonce,
+      },
+    },
+  });
+}
+
+export function getExpiredPermitDeadlineError({ permit }: { permit: SignedTokenPermit }) {
+  return extendError(new Error(EXPIRED_PERMIT_DEADLINE_ERROR), {
+    data: {
+      spender: permit.spender,
+      value: permit.value,
+      deadline: permit.deadline,
+    },
+  });
+}
+
+const IGNORED_ESTIMATE_GAS_CONTRACT_ERRORS = ["InsufficientMultichainBalance"];
+const IGNORED_ESTIMATE_GAS_MESSAGE_PATTERNS = [
+  "ERC20: transfer amount exceeds balance",
+  "ERC20: transfer amount exceeds allowance",
+];
+
+export function isIgnoredEstimateGasError(error: ErrorLike): boolean {
+  const parsed = parseError(error);
+  if (!parsed) return false;
+
+  if (parsed.contractError && IGNORED_ESTIMATE_GAS_CONTRACT_ERRORS.includes(parsed.contractError)) {
+    return true;
+  }
+
+  if (
+    parsed.errorMessage &&
+    IGNORED_ESTIMATE_GAS_MESSAGE_PATTERNS.some((pattern) => parsed.errorMessage!.includes(pattern))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+const INSUFFICIENT_FEE_MESSAGE_PATTERN = "ERC20: transfer amount exceeds balance";
+
+export function getInsufficientFeeError(
+  errorData: ErrorData | undefined
+): { isErrorMatched: false } | { isErrorMatched: true; tokenAddress: string | undefined } {
+  if (!errorData) {
+    return { isErrorMatched: false };
+  }
+
+  if (errorData.contractError === "InsufficientMultichainBalance") {
+    const tokenArg = errorData.contractErrorArgs?.[1];
+
+    return { isErrorMatched: true, tokenAddress: typeof tokenArg === "string" ? tokenArg : undefined };
+  }
+
+  const isBalanceRevert = [errorData.errorMessage, errorData.data?.message].some(
+    (message) => typeof message === "string" && message.includes(INSUFFICIENT_FEE_MESSAGE_PATTERN)
+  );
+
+  return isBalanceRevert ? { isErrorMatched: true, tokenAddress: undefined } : { isErrorMatched: false };
+}
+
+export function getIsPossibleExternalSwapError(error: ErrorLike) {
+  const parsedError = parseError(error);
+
+  const isExternalCallError = parsedError?.contractError === "ExternalCallFailed";
+
+  const isPayloadRelatedError = parsedError?.errorMessage?.includes("execution reverted");
+
+  return isExternalCallError || isPayloadRelatedError;
+}
+
+export function getIsPriceImpactTooLargeError(error: ErrorLike) {
+  const parsedError = parseError(error);
+
+  return (
+    parsedError?.contractError === "PriceImpactLargerThanOrderSize" ||
+    parsedError?.contractError === "SwapPriceImpactExceedsAmountIn"
+  );
+}

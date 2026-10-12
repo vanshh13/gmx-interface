@@ -1,0 +1,461 @@
+import { Trans } from "@lingui/macro";
+import cx from "classnames";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffectOnce } from "react-use";
+
+import { selectChartToken } from "context/SyntheticsStateContext/selectors/chartSelectors";
+import { selectTradeboxTradeFlags } from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { useChainId } from "lib/chains";
+import { useBreakpoints } from "lib/useBreakpoints";
+import { getToken } from "sdk/configs/tokens";
+
+import TooltipWithPortal from "components/Tooltip/TooltipWithPortal";
+
+import DocsIcon from "img/docs.svg?react";
+import ChevronLeftIcon from "img/ic_chevron_left.svg?react";
+import ChevronRightIcon from "img/ic_chevron_right.svg?react";
+
+import ChartTokenSelector from "../ChartTokenSelector/ChartTokenSelector";
+import { renderNetFeeHeaderTooltipContent } from "../MarketsList/NetFeeHeaderTooltipContent";
+import { NetRate1hTooltip } from "./components/NetRate1hTooltip";
+import { OpenInterestTooltip } from "./components/OpenInterestTooltip";
+import { useChartHeaderFormattedValues } from "./useChartHeaderFormattedValues";
+
+const MIN_FADE_AREA = 24; //px
+const MAX_SCROLL_LEFT_TO_END_AREA = 50; //px
+const MIN_SCROLL_END_SPACE = 5; // px
+
+function ChartHeaderMobile() {
+  const { chartToken } = useSelector(selectChartToken);
+  const { isSwap } = useSelector(selectTradeboxTradeFlags);
+
+  const { chainId } = useChainId();
+  const chartTokenAddress = chartToken?.address;
+
+  const selectedTokenOption = chartTokenAddress ? getToken(chainId, chartTokenAddress) : undefined;
+  const [detailsVisible, setDetailsVisible] = useState(false);
+
+  const {
+    avgPrice,
+    dailyVolume,
+    dayPriceDelta,
+    high24,
+    liquidityLong,
+    liquidityShort,
+    longOIPercentage,
+    longOIValue,
+    low24,
+    netRateLong,
+    netRateShort,
+    shortOIPercentage,
+    shortOIValue,
+  } = useChartHeaderFormattedValues();
+
+  useEffect(() => {
+    if (isSwap) {
+      setDetailsVisible(false);
+    }
+  }, [isSwap]);
+
+  const toggleDetailsVisible = useCallback(() => {
+    setDetailsVisible((prev) => !prev);
+  }, [setDetailsVisible]);
+
+  const details = useMemo(() => {
+    if (!detailsVisible) {
+      return null;
+    }
+
+    if (isSwap) {
+      return (
+        <div className="flex flex-wrap gap-16 min-[440px]:grid min-[440px]:grid-cols-2">
+          <ChartHeaderMobileItem label={<Trans>24h high</Trans>} value={high24} />
+          <ChartHeaderMobileItem label={<Trans>24h low</Trans>} value={low24} />
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex flex-wrap gap-16 min-[440px]:grid min-[440px]:grid-cols-2">
+        <ChartHeaderMobileItem label={<Trans>24h volume</Trans>} value={dailyVolume} />
+
+        <ChartHeaderMobileItem
+          label={
+            <Trans>
+              Open interest (<span className="text-green-500 numbers">{longOIPercentage}</span>/
+              <span className="text-red-500 numbers">{shortOIPercentage}</span>)
+            </Trans>
+          }
+          value={
+            <TooltipWithPortal
+              variant="none"
+              as="div"
+              className="flex items-center gap-8"
+              position="bottom-end"
+              content={<OpenInterestTooltip />}
+            >
+              <div className="flex items-center gap-4 numbers">{longOIValue}</div>
+              <span className="text-typography-inactive">/</span>
+              <div className="flex items-center gap-4 numbers">{shortOIValue}</div>
+            </TooltipWithPortal>
+          }
+        />
+
+        <ChartHeaderMobileItem
+          label={<Trans>Available liquidity</Trans>}
+          value={
+            <div className="flex items-center gap-8">
+              <span className="numbers">{liquidityLong}</span>
+              <span className="text-typography-inactive">/</span>
+              <span className="numbers">{liquidityShort}</span>
+            </div>
+          }
+        />
+
+        <ChartHeaderMobileItem
+          label={
+            <TooltipWithPortal variant="none" renderContent={renderNetFeeHeaderTooltipContent}>
+              <Trans>Net rate / 1h</Trans>
+            </TooltipWithPortal>
+          }
+          value={
+            <TooltipWithPortal
+              variant="none"
+              as="div"
+              className="flex items-center gap-8"
+              position="bottom-end"
+              content={<NetRate1hTooltip />}
+            >
+              <div className="flex items-center gap-4 numbers">{netRateLong}</div>
+              <span className="text-typography-inactive">/</span>
+              <div className="flex items-center gap-4 numbers">{netRateShort}</div>
+            </TooltipWithPortal>
+          }
+        />
+      </div>
+    );
+  }, [
+    dailyVolume,
+    isSwap,
+    liquidityLong,
+    liquidityShort,
+    longOIPercentage,
+    longOIValue,
+    netRateLong,
+    netRateShort,
+    shortOIPercentage,
+    shortOIValue,
+    detailsVisible,
+    high24,
+    low24,
+  ]);
+
+  return (
+    <div className="rounded-8 bg-button-secondary">
+      <div className="flex items-start justify-between max-md:items-center">
+        <div className="inline-flex">
+          <ChartTokenSelector selectedToken={selectedTokenOption} oneRowLabels={false} />
+        </div>
+
+        <div
+          className="flex cursor-pointer flex-row items-start gap-8 p-8"
+          role="button"
+          onClick={toggleDetailsVisible}
+        >
+          <div className="flex flex-col items-end gap-2">
+            <div className="mr-4 text-14 leading-[1.25] numbers">{avgPrice}</div>
+            <div className="ExchangeChart-daily-change text-12 leading-[1.25] numbers">{dayPriceDelta}</div>
+          </div>
+          <span className="shrink-0 cursor-pointer rounded-full border-1/2 border-slate-600 p-8 text-typography-secondary">
+            <DocsIcon className="size-16" />
+          </span>
+        </div>
+      </div>
+
+      {details ? <div className="border-t-1/2 border-t-slate-600 p-16">{details}</div> : null}
+    </div>
+  );
+}
+
+function ChartHeaderDesktop() {
+  const { chartToken } = useSelector(selectChartToken);
+  const { isSwap } = useSelector(selectTradeboxTradeFlags);
+
+  const scrollableRef = useRef<HTMLDivElement | null>(null);
+
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const [scrollRight, setScrollRight] = useState(0);
+  const [maxFadeArea, setMaxFadeArea] = useState(75);
+
+  const { chainId } = useChainId();
+  const chartTokenAddress = chartToken?.address;
+
+  const selectedTokenOption = chartTokenAddress ? getToken(chainId, chartTokenAddress) : undefined;
+
+  const setScrolls = useCallback(() => {
+    const scrollable = scrollableRef.current;
+    if (!scrollable) {
+      return;
+    }
+
+    if (scrollable.scrollWidth > scrollable.clientWidth) {
+      setScrollLeft(scrollable.scrollLeft);
+      const right = scrollable.scrollWidth - scrollable.clientWidth - scrollable.scrollLeft;
+      setScrollRight(right < MIN_SCROLL_END_SPACE ? 0 : right);
+      setMaxFadeArea(scrollable.clientWidth / 10);
+    } else {
+      setScrollLeft(0);
+      setScrollRight(0);
+    }
+  }, [scrollableRef]);
+
+  useEffectOnce(() => {
+    setScrolls();
+
+    window.addEventListener("resize", setScrolls);
+    scrollableRef.current?.addEventListener("scroll", setScrolls);
+
+    return () => {
+      window.removeEventListener("resize", setScrolls);
+      scrollableRef.current?.removeEventListener("scroll", setScrolls);
+    };
+  });
+
+  const leftStyles = useMemo(() => {
+    return {
+      width: `${Math.max(MIN_FADE_AREA, Math.min(scrollLeft + 8, maxFadeArea))}px`,
+    };
+  }, [scrollLeft, maxFadeArea]);
+
+  const rightStyles = useMemo(() => {
+    return {
+      width: `${Math.max(MIN_FADE_AREA, Math.min(scrollRight + 8, maxFadeArea))}px`,
+    };
+  }, [scrollRight, maxFadeArea]);
+
+  const {
+    avgPrice,
+    dailyVolume,
+    dayPriceDelta,
+    high24,
+    liquidityLong,
+    liquidityShort,
+    longOIPercentage,
+    longOIValue,
+    low24,
+    netRateLong,
+    netRateShort,
+    shortOIPercentage,
+    shortOIValue,
+    info,
+  } = useChartHeaderFormattedValues();
+
+  useEffect(() => {
+    if (info) {
+      setScrolls();
+    }
+  }, [info, setScrolls]);
+
+  const additionalInfo = useMemo(() => {
+    if (isSwap) {
+      return (
+        <>
+          <ChartHeaderItem label={<Trans>24h high</Trans>} value={high24} />
+          <ChartHeaderItem label={<Trans>24h low</Trans>} value={low24} />
+        </>
+      );
+    }
+
+    return (
+      <>
+        <ChartHeaderItem label={<Trans>24h volume</Trans>} value={dailyVolume} />
+
+        <ChartHeaderItem
+          label={
+            <Trans>
+              Open interest (<span className="text-green-500 numbers">{longOIPercentage}</span>/
+              <span className="text-red-500 numbers">{shortOIPercentage}</span>)
+            </Trans>
+          }
+          value={
+            <TooltipWithPortal variant="none" as="div" position="bottom-end" content={<OpenInterestTooltip />}>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-4 numbers">{longOIValue}</div>
+                <span className="text-typography-inactive">/</span>
+                <div className="flex items-center gap-4 numbers">{shortOIValue}</div>
+              </div>
+            </TooltipWithPortal>
+          }
+        />
+
+        <ChartHeaderItem
+          label={<Trans>Available liquidity</Trans>}
+          value={
+            <div className="flex items-center gap-4">
+              <span className="numbers">{liquidityLong}</span>
+              <span className="text-typography-inactive">/</span>
+              <span className="numbers">{liquidityShort}</span>
+            </div>
+          }
+        />
+
+        <ChartHeaderItem
+          label={
+            <TooltipWithPortal variant="none" renderContent={renderNetFeeHeaderTooltipContent}>
+              <Trans>Net rate / 1h</Trans>
+            </TooltipWithPortal>
+          }
+          value={
+            <TooltipWithPortal
+              variant="none"
+              as="div"
+              className="Chart-header-value flex flex-row items-center gap-8"
+              position="bottom-end"
+              content={<NetRate1hTooltip />}
+            >
+              <div className="flex items-center gap-4">
+                <div className="numbers">{netRateLong}</div>
+                <span className="text-typography-inactive">/</span>
+                <div className="numbers">{netRateShort}</div>
+              </div>
+            </TooltipWithPortal>
+          }
+        />
+      </>
+    );
+  }, [
+    dailyVolume,
+    isSwap,
+    liquidityLong,
+    liquidityShort,
+    longOIPercentage,
+    longOIValue,
+    netRateLong,
+    netRateShort,
+    shortOIPercentage,
+    shortOIValue,
+    high24,
+    low24,
+  ]);
+
+  const scrollTo = useCallback(
+    (dir: 1 | -1) => {
+      if (!scrollableRef.current) {
+        return;
+      }
+
+      let nextNonVisibleElement: Element | undefined;
+
+      const { left: containerLeft, width: containerWidth } = scrollableRef.current.getBoundingClientRect();
+      const containerRight = containerLeft + containerWidth;
+
+      for (const child of scrollableRef.current.children) {
+        const { left: childLeft, right: childRight, width: childWidth } = child.getBoundingClientRect();
+        const childVisibleLeft = Math.max(childLeft, containerLeft);
+        const childVisibleRight = Math.min(childRight, containerRight);
+        const isVisible = childVisibleRight - childVisibleLeft === childWidth;
+
+        if (dir === 1 && childLeft > containerLeft && !isVisible) {
+          nextNonVisibleElement = child;
+          break;
+        } else if (dir === -1 && childRight < containerRight && !isVisible) {
+          nextNonVisibleElement = child;
+        }
+      }
+
+      if (!nextNonVisibleElement) {
+        return;
+      }
+
+      let proposedScrollLeft = dir * nextNonVisibleElement.getBoundingClientRect().width;
+      const nextLeftScroll = scrollableRef.current.scrollLeft + proposedScrollLeft;
+
+      /**
+       * This part is to prevent scrolling to visible area of element but leaving a small margin to the end (MAX_SCROLL_LEFT_TO_END_AREA),
+       * it's better to scroll to the end in such cases
+       */
+      if (
+        (dir === 1 && containerWidth - nextLeftScroll < MAX_SCROLL_LEFT_TO_END_AREA) ||
+        (dir === -1 && nextLeftScroll < MAX_SCROLL_LEFT_TO_END_AREA)
+      ) {
+        proposedScrollLeft = dir * containerWidth;
+      }
+
+      scrollableRef.current.scrollBy({
+        left: proposedScrollLeft,
+        behavior: "smooth",
+      });
+      setScrolls();
+    },
+    [scrollableRef, setScrolls]
+  );
+
+  const scrollToLeft = useCallback(() => scrollTo(-1), [scrollTo]);
+  const scrollToRight = useCallback(() => scrollTo(1), [scrollTo]);
+
+  return (
+    <div className="flex gap-16 overflow-hidden">
+      <div className="flex shrink-0 items-center justify-start">
+        <ChartTokenSelector selectedToken={selectedTokenOption} oneRowLabels={true} />
+      </div>
+      <div className="relative flex overflow-hidden">
+        <div className="pointer-events-none absolute z-40 flex h-full w-full flex-row justify-between">
+          <div
+            className={cx("Chart-top-scrollable-fade-left", {
+              "!pointer-events-none opacity-0": scrollLeft <= 0,
+              "opacity-100": scrollLeft > 0,
+            })}
+            style={leftStyles}
+            onClick={scrollToLeft}
+          >
+            {scrollLeft > 0 && <ChevronLeftIcon className="size-16 text-typography-secondary" />}
+          </div>
+          <div
+            className={cx("Chart-top-scrollable-fade-right", {
+              "!pointer-events-none opacity-0": scrollRight <= 0,
+              "opacity-100": scrollRight > 0,
+            })}
+            style={rightStyles}
+            onClick={scrollToRight}
+          >
+            {scrollRight > 0 && <ChevronRightIcon className="size-16 text-typography-secondary" />}
+          </div>
+        </div>
+        <div className={cx("flex gap-20 overflow-x-auto scrollbar-hide")} ref={scrollableRef}>
+          <div className="flex flex-col justify-center gap-2">
+            <div className="text-body-medium numbers">{avgPrice}</div>
+            <div className="text-body-small numbers">{dayPriceDelta}</div>
+          </div>
+          {additionalInfo}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const ChartHeaderItem = ({ label, value }: { label: ReactNode; value: ReactNode }) => {
+  return (
+    <div className="flex flex-col justify-center gap-2">
+      <div className="whitespace-nowrap text-[11px] font-medium uppercase tracking-[0.08em] text-typography-secondary">
+        {label}
+      </div>
+      <div className="text-body-medium numbers">{value}</div>
+    </div>
+  );
+};
+
+const ChartHeaderMobileItem = ({ label, value }: { label: ReactNode; value: ReactNode }) => {
+  return (
+    <div className="flex flex-col gap-8 text-12 leading-[1.25]">
+      <div className="font-medium capitalize text-typography-secondary">{label}</div>
+      <div className="flex items-center text-typography-primary numbers">{value}</div>
+    </div>
+  );
+};
+
+export default function ChartHeader() {
+  const { isMobile } = useBreakpoints();
+
+  return isMobile ? <ChartHeaderMobile /> : <ChartHeaderDesktop />;
+}

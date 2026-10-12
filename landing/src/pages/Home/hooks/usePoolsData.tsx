@@ -1,0 +1,229 @@
+import { gql } from "@apollo/client";
+import { useMemo } from "react";
+import useSWR from "swr";
+
+import { getServerUrl } from "config/backend";
+import type { ContractsChainId } from "config/chains";
+import { getSubsquidGraphClient } from "lib/indexers";
+import { PerformanceInfo, useOracleKeeperFetcher } from "lib/oracleKeeperFetcher";
+import { mergeFreshness, useSWRWithFreshness, type Freshness } from "lib/useSWRWithFreshness";
+import { MarketInfo } from "sdk/codegen/subsquid";
+import { ARBITRUM, AVALANCHE } from "sdk/configs/chainIds";
+
+type UsdByChain = Record<number, bigint>;
+
+export type PoolsData = {
+  glvApy: number;
+  gmApy: number;
+  totalLiquidity: bigint;
+  openInterestByChain: UsdByChain;
+  openInterestFreshness: Freshness;
+  totalDepositedUsers: number;
+};
+
+// combined by the requests used
+export function usePoolsData(): Partial<PoolsData> {
+  const { data: arbitrumPerformance } = usePerformanceByChainId(ARBITRUM);
+  const { data: avalanchePerformance } = usePerformanceByChainId(AVALANCHE);
+  const { data: arbitrumApys } = useApysByChainId(ARBITRUM);
+  const { data: avalancheApys } = useApysByChainId(AVALANCHE);
+
+  const positionStats = usePositionStats();
+  const marketInfos = useMarketInfos();
+
+  const { sortedAggregatedMarketInfos, totalLiquidity, openInterestByChain } = marketInfos.data ?? {};
+
+  const glvApy = useMemo(() => {
+    if (arbitrumPerformance && avalanchePerformance && arbitrumApys && avalancheApys) {
+      let result = 0;
+      const aggregatedPerformance = [...arbitrumPerformance, ...avalanchePerformance];
+      for (const performance of aggregatedPerformance) {
+        const performanceApy = parseFloat(performance.uniswapV2Performance);
+        if (performance.entity === "Glv" && performanceApy > result) {
+          result = performanceApy;
+        }
+      }
+      if (result < 0.1) {
+        const glvApys = {
+          ...arbitrumApys.glvs,
+          ...avalancheApys.glvs,
+        };
+
+        for (const glvKey of Object.keys(glvApys)) {
+          const glv = glvApys[glvKey];
+          if (glv.apy > result) {
+            result = glv.apy;
+          }
+        }
+      }
+      return { glvApy: result };
+    }
+    return {};
+  }, [arbitrumPerformance, avalanchePerformance, arbitrumApys, avalancheApys]);
+
+  // Helper - aggregated performance from arbitrum and avalanche for optimization
+  const aggregatedPerformance = useMemo(() => {
+    if (!arbitrumPerformance || !avalanchePerformance) {
+      return null;
+    }
+    const result: {
+      arbitrum: Record<string, PerformanceInfo & { performanceApy: number }>;
+      avalanche: Record<string, PerformanceInfo & { performanceApy: number }>;
+    } = {
+      arbitrum: {},
+      avalanche: {},
+    };
+    for (const performance of arbitrumPerformance) {
+      if (performance.entity === "Market") {
+        const performanceApy = parseFloat(performance.uniswapV2Performance);
+        result.arbitrum[performance.address] = { ...performance, performanceApy };
+      }
+    }
+    for (const performance of avalanchePerformance) {
+      if (performance.entity === "Market") {
+        const performanceApy = parseFloat(performance.uniswapV2Performance);
+        result.avalanche[performance.address] = { ...performance, performanceApy };
+      }
+    }
+    return result;
+  }, [arbitrumPerformance, avalanchePerformance]);
+
+  // GM APY
+  const gmApy = useMemo(() => {
+    if (sortedAggregatedMarketInfos && aggregatedPerformance && arbitrumApys && avalancheApys) {
+      let gmApy = 0;
+      for (const marketIndex in sortedAggregatedMarketInfos) {
+        const market = sortedAggregatedMarketInfos[marketIndex];
+        const marketApy =
+          market.chainId === ARBITRUM
+            ? aggregatedPerformance.arbitrum[market.id]?.performanceApy ?? 0
+            : aggregatedPerformance.avalanche[market.id]?.performanceApy ?? 0;
+        if (Number(marketIndex) < 20 && marketApy > gmApy) {
+          gmApy = marketApy;
+        }
+      }
+      // If the GM APY is less than 0.1, we need to calculate the GM APY based on the market APYs
+      if (gmApy <= 0.1) {
+        for (const market of sortedAggregatedMarketInfos) {
+          const marketApy =
+            market.chainId === ARBITRUM
+              ? arbitrumApys.markets[market.id]?.apy ?? 0
+              : avalancheApys.markets[market.id]?.apy ?? 0;
+          if (marketApy > gmApy) {
+            gmApy = marketApy;
+          }
+        }
+      }
+      return { gmApy };
+    }
+    return {};
+  }, [sortedAggregatedMarketInfos, aggregatedPerformance, arbitrumApys, avalancheApys]);
+  const result: Partial<PoolsData> = {
+    ...gmApy,
+    ...glvApy,
+    totalLiquidity: totalLiquidity,
+    openInterestByChain:
+      positionStats.data && openInterestByChain
+        ? {
+            [ARBITRUM]: positionStats.data[ARBITRUM] + openInterestByChain[ARBITRUM],
+            [AVALANCHE]: positionStats.data[AVALANCHE] + openInterestByChain[AVALANCHE],
+          }
+        : undefined,
+    openInterestFreshness: mergeFreshness(positionStats.freshness, marketInfos.freshness),
+    totalDepositedUsers: marketInfos.data?.totalDepositedUsers,
+  };
+  return result;
+}
+
+function useApysByChainId(chainId: number) {
+  const fetcher = useOracleKeeperFetcher(chainId as ContractsChainId);
+  return useSWR(["apys", chainId], async () => {
+    const res = await fetcher.fetchApys("90d");
+    return res;
+  });
+}
+
+const marketInfoQuery = {
+  query: gql`
+    query MarketInfos {
+      marketInfos(orderBy: poolValue_DESC, where: { isDisabled_eq: false }, limit: 1000) {
+        poolValue
+        longOpenInterestUsd
+        shortOpenInterestUsd
+        id
+      }
+      platformStats(limit: 1) {
+        depositedUsers
+      }
+    }
+  `,
+};
+
+function useMarketInfos() {
+  const arbitrumClient = getSubsquidGraphClient(ARBITRUM)!;
+  const avalancheClient = getSubsquidGraphClient(AVALANCHE)!;
+  return useSWRWithFreshness(["marketInfos"], async () => {
+    const arbitrumReq = arbitrumClient?.query(marketInfoQuery);
+    const avalancheReq = avalancheClient?.query(marketInfoQuery);
+    const [arbitrumRes, avalancheRes] = await Promise.all([arbitrumReq, avalancheReq]);
+    const arbitrumMarketInfos = arbitrumRes.data?.marketInfos;
+    const avalancheMarketInfos = avalancheRes.data?.marketInfos;
+    const arbitrumPlatformStats = arbitrumRes.data?.platformStats[0];
+    const avalanchePlatformStats = avalancheRes.data?.platformStats[0];
+    let totalLiquidity = 0n;
+    const openInterestByChain: UsdByChain = { [ARBITRUM]: 0n, [AVALANCHE]: 0n };
+    const sortedAggregatedMarketInfos: (MarketInfo & { chainId: number })[] = [];
+    let arbIndex = 0;
+    let avaxIndex = 0;
+    while (arbIndex < arbitrumMarketInfos.length || avaxIndex < avalancheMarketInfos.length) {
+      const arbMarketInfo = arbitrumMarketInfos[arbIndex];
+      const avaxMarketInfo = avalancheMarketInfos[avaxIndex];
+      const arbPoolValue = arbMarketInfo ? BigInt(arbMarketInfo.poolValue) : null;
+      const avaxPoolValue = avaxMarketInfo ? BigInt(avaxMarketInfo.poolValue) : null;
+      if (avaxPoolValue === null || (arbPoolValue !== null && arbPoolValue > avaxPoolValue)) {
+        sortedAggregatedMarketInfos.push({ ...arbMarketInfo, chainId: ARBITRUM });
+        openInterestByChain[ARBITRUM] +=
+          BigInt(arbMarketInfo.longOpenInterestUsd ?? 0n) + BigInt(arbMarketInfo.shortOpenInterestUsd ?? 0n);
+        totalLiquidity += BigInt(arbMarketInfo.poolValue);
+        arbIndex++;
+      } else {
+        sortedAggregatedMarketInfos.push({ ...avaxMarketInfo, chainId: AVALANCHE });
+        openInterestByChain[AVALANCHE] +=
+          BigInt(avaxMarketInfo.longOpenInterestUsd ?? 0n) + BigInt(avaxMarketInfo.shortOpenInterestUsd ?? 0n);
+        totalLiquidity += BigInt(avaxMarketInfo.poolValue);
+        avaxIndex++;
+      }
+    }
+    return {
+      sortedAggregatedMarketInfos,
+      totalLiquidity,
+      openInterestByChain,
+      totalDepositedUsers: arbitrumPlatformStats.depositedUsers + avalanchePlatformStats.depositedUsers,
+    };
+  });
+}
+
+function usePerformanceByChainId(chainId: number) {
+  const fetcher = useOracleKeeperFetcher(chainId as ContractsChainId);
+  return useSWR(["performance", chainId], async () => {
+    const res = await fetcher.fetchPerformanceAnnualized("90d");
+    return res;
+  });
+}
+
+function usePositionStats() {
+  return useSWRWithFreshness(["positionStats"], async (): Promise<UsdByChain> => {
+    const arbitrumReq = fetchPositionStatsByChainId(ARBITRUM);
+    const avalancheReq = fetchPositionStatsByChainId(AVALANCHE);
+    const [arbitrumRes, avalancheRes] = await Promise.all([arbitrumReq, avalancheReq]);
+    return {
+      [ARBITRUM]: BigInt(arbitrumRes.totalLongPositionSizes) + BigInt(arbitrumRes.totalShortPositionSizes),
+      [AVALANCHE]: BigInt(avalancheRes.totalLongPositionSizes) + BigInt(avalancheRes.totalShortPositionSizes),
+    };
+  });
+}
+
+function fetchPositionStatsByChainId(chainId: number) {
+  const url = getServerUrl(chainId, "/position_stats");
+  return fetch(url).then((res) => res.json());
+}

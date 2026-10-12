@@ -1,0 +1,254 @@
+import { t } from "@lingui/macro";
+import { useLingui } from "@lingui/react";
+import cx from "classnames";
+import { ReactNode, useCallback, useState } from "react";
+import { Link, useLocation } from "react-router-dom";
+
+import { useTheme } from "context/ThemeContext/ThemeContext";
+import { useMegaethPointsActive } from "domain/synthetics/common/useMegaethPointsActive";
+import { useLocalStorageSerializeKey } from "lib/localStorage";
+
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import ModalWithPortal from "components/Modal/ModalWithPortal";
+import LanguageModalContent from "components/NetworkDropdown/LanguageModalContent";
+
+import DashboardIcon from "img/dashboard.svg?react";
+import DatabaseIcon from "img/database.svg?react";
+import DocsIcon from "img/docs.svg?react";
+import EcosystemIcon from "img/ecosystem.svg?react";
+import AnnouncementsIcon from "img/ic_announcement.svg?react";
+import EarnIcon from "img/ic_earn.svg?react";
+import ReferralsIcon from "img/ic_referrals.svg?react";
+import LeaderboardIcon from "img/leaderboard.svg?react";
+import logoIcon from "img/logo-icon.svg";
+import LogoText from "img/logo-text.svg?react";
+import sparkleIcon from "img/sparkle.svg";
+import TradeIcon from "img/trade.svg?react";
+
+import { BottomMenuSection } from "./BottomMenuSection";
+import { CryptoPriceTicker } from "./CryptoPriceTicker";
+
+function SideNav({ className }: { className?: string }) {
+  const [isCollapsed, setIsCollapsed] = useLocalStorageSerializeKey("is-side-nav-collapsed", false);
+  const [isLanguageModalOpen, setIsLanguageModalOpen] = useState(false);
+  const { theme, setThemeMode } = useTheme();
+  const { i18n } = useLingui();
+
+  const handleCollapseToggle = useCallback(() => {
+    setIsCollapsed(!isCollapsed);
+  }, [isCollapsed, setIsCollapsed]);
+
+  const handleOpenLanguageModal = useCallback(() => {
+    setIsLanguageModalOpen(true);
+  }, []);
+
+  const handleCloseLanguageModal = useCallback(() => {
+    setIsLanguageModalOpen(false);
+  }, []);
+
+  const handleThemeToggle = useCallback(() => {
+    setThemeMode(theme === "dark" ? "light" : "dark");
+  }, [setThemeMode, theme]);
+
+  return (
+    <>
+      <nav
+        className={cx("flex h-full shrink-0 flex-col bg-slate-950", className, {
+          "w-[172px] max-xl:w-[144px]": !isCollapsed,
+        })}
+      >
+        <div className={cx("flex w-full", { "justify-center": isCollapsed })}>
+          <LogoSection isCollapsed={isCollapsed} />
+        </div>
+
+        <div className="flex flex-1 flex-col justify-between">
+          <MenuSection isCollapsed={isCollapsed} />
+
+          <BottomMenuSection
+            isCollapsed={isCollapsed}
+            isDarkTheme={theme === "dark"}
+            onCollapseToggle={handleCollapseToggle}
+            onLanguageClick={handleOpenLanguageModal}
+            onThemeToggle={handleThemeToggle}
+          />
+        </div>
+      </nav>
+      <ModalWithPortal
+        className="language-popup"
+        isVisible={isLanguageModalOpen}
+        setIsVisible={setIsLanguageModalOpen}
+        label={t`Select language`}
+      >
+        <LanguageModalContent currentLanguage={i18n.locale} onClose={handleCloseLanguageModal} />
+      </ModalWithPortal>
+    </>
+  );
+}
+
+export const DocsNavItem = ({ isCollapsed }: { isCollapsed: boolean | undefined }) => (
+  <NavItem icon={<DocsIcon />} label={t`Docs`} isCollapsed={isCollapsed} to="https://docs.gmx.io/" external />
+);
+
+export function LogoSection({ isCollapsed }: { isCollapsed: boolean | undefined }) {
+  return (
+    <Link
+      to="/"
+      className={cx("flex cursor-pointer items-center justify-center gap-5 pb-16 pt-10 text-typography-primary", {
+        "pl-12 pr-20": !isCollapsed,
+      })}
+    >
+      <img src={logoIcon} alt={t`GMX logo`} />
+      {!isCollapsed ? <LogoText /> : null}
+    </Link>
+  );
+}
+
+export interface NavItemProps {
+  icon: ReactNode;
+  label: ReactNode;
+  ariaLabel?: string;
+  isActive?: boolean;
+  isCollapsed: boolean | undefined;
+  onClick?: () => void;
+  to?: string;
+  external?: boolean;
+}
+
+export function NavItem({
+  icon,
+  label,
+  ariaLabel,
+  isActive = false,
+  isCollapsed = false,
+  onClick,
+  to,
+  external,
+}: NavItemProps) {
+  const button = (
+    <button
+      aria-label={ariaLabel}
+      className={cx("group cursor-pointer select-none py-1 text-left", { "w-full": !isCollapsed })}
+      onClick={onClick}
+    >
+      <div
+        className={cx(
+          `relative flex cursor-pointer items-center gap-8
+          rounded-8 px-12 py-10 text-typography-secondary group-hover:bg-blue-400/20 group-hover:text-blue-400
+          dark:group-hover:bg-slate-700 dark:group-hover:text-typography-primary`,
+          {
+            "bg-blue-400/20 !text-blue-400 dark:bg-slate-700 dark:!text-typography-primary": isActive,
+            "w-full": !isCollapsed,
+          }
+        )}
+      >
+        <div className="flex size-20 shrink-0 items-center justify-center [&>svg]:w-full">{icon}</div>
+        <span className={cx("text-body-medium font-medium tracking-[-1.2%]", { hidden: isCollapsed })}>{label}</span>
+
+        <div
+          className={cx(
+            `absolute left-0 top-0 z-30 hidden items-center gap-8 rounded-8
+            bg-slate-800 text-blue-400 dark:text-typography-primary`,
+            { "group-hover:flex": isCollapsed }
+          )}
+        >
+          <div className="flex items-center gap-8 rounded-8 bg-blue-400/20 px-12 py-10 dark:bg-slate-700">
+            <div className="flex size-20 shrink-0 items-center justify-center">{icon}</div>
+            <span className={cx("text-body-medium whitespace-nowrap font-medium tracking-[-1.2%]")}>{label}</span>
+          </div>
+        </div>
+      </div>
+    </button>
+  );
+
+  const content = to ? (
+    external ? (
+      <ExternalLink className="w-full !no-underline" href={to}>
+        {button}
+      </ExternalLink>
+    ) : (
+      <Link to={to}>{button}</Link>
+    )
+  ) : (
+    button
+  );
+
+  return <li className="p-0 first:-mt-4">{content}</li>;
+}
+
+export function MenuSection({
+  isCollapsed,
+  onMenuItemClick,
+}: {
+  isCollapsed: boolean | undefined;
+  onMenuItemClick?: () => void;
+}) {
+  const isMegaethPointsActive = useMegaethPointsActive();
+
+  const withMegaethSparkle = (label: string) =>
+    isMegaethPointsActive ? (
+      <span className="inline-flex items-center gap-4">
+        {label}
+        <img className="h-10" src={sparkleIcon} alt="" />
+      </span>
+    ) : (
+      label
+    );
+
+  const mainNavItems = [
+    {
+      icon: <TradeIcon className="size-20" />,
+      label: withMegaethSparkle(t`Trade`),
+      key: "trade",
+      to: "/trade",
+    },
+    { icon: <EarnIcon className="size-20" />, label: t`Earn`, key: "earn", to: "/earn" },
+    {
+      icon: <DatabaseIcon className="size-20" />,
+      label: withMegaethSparkle(t`Pools`),
+      key: "pools",
+      to: "/pools",
+    },
+    { icon: <DashboardIcon className="size-20" />, label: t`Stats`, key: "stats", to: "/stats" },
+    {
+      icon: <AnnouncementsIcon className="size-20" />,
+      label: t`Crypto News`,
+      key: "crypto-news",
+      to: "/news",
+    },
+    {
+      icon: <ReferralsIcon className="size-20" />,
+      label: withMegaethSparkle(t`Referrals`),
+      key: "referrals",
+      to: "/referrals",
+    },
+    { icon: <LeaderboardIcon className="size-20" />, label: t`Leaderboard`, key: "leaderboard", to: "/leaderboard" },
+    { icon: <EcosystemIcon className="size-20" />, label: t`Ecosystem`, key: "ecosystem", to: "/ecosystem" },
+    {
+      icon: <AnnouncementsIcon className="size-20" />,
+      label: t`Announcements`,
+      key: "announcements",
+      to: "/announcements",
+    },
+  ];
+
+  const { pathname } = useLocation();
+
+  return (
+    <ul className="flex list-none flex-col px-0">
+      {mainNavItems.map((item) => (
+        <NavItem
+          key={item.key}
+          icon={item.icon}
+          label={item.label}
+          isActive={pathname === item.to || pathname.startsWith(`${item.to}/`)}
+          isCollapsed={isCollapsed}
+          to={item.to}
+          onClick={onMenuItemClick}
+        />
+      ))}
+      <CryptoPriceTicker isCollapsed={isCollapsed} />
+    </ul>
+  );
+}
+
+export default SideNav;

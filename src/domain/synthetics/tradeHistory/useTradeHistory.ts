@@ -1,0 +1,548 @@
+import { gql } from "@apollo/client";
+import merge from "lodash/merge";
+import { useMemo } from "react";
+import { SWRConfiguration } from "swr";
+import useInfiniteSwr, { SWRInfiniteResponse } from "swr/infinite";
+import type { Address } from "viem";
+
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useMarketsInfoData, useTokensData } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import { OrderType } from "domain/synthetics/orders";
+import { definedOrThrow } from "lib/guards";
+import { getSubsquidGraphClient } from "lib/indexers";
+import { EMPTY_ARRAY } from "lib/objects";
+import { Query as SubsquidQuery, TradeAction as SubsquidTradeAction } from "sdk/codegen/subsquid";
+import { GraphQlFilters, buildFiltersBody, queryPaginated } from "sdk/utils/indexers";
+import { TradeAction, TradeActionType } from "sdk/utils/tradeHistory/types";
+
+import { MarketFilterLongShortItemData } from "components/TableMarketFilter/MarketFilterLongShort";
+
+import { processRawTradeActions } from "./processTradeActions";
+
+export type TradeHistoryResult = {
+  tradeActions?: TradeAction[];
+  totalCount?: number;
+  isLoading: boolean;
+  error: Error | undefined;
+  hasMorePages: boolean;
+  pageIndex: number;
+  setPageIndex: (...args: Parameters<SWRInfiniteResponse["setSize"]>) => void;
+};
+
+export type RawTradeActionsResult = {
+  tradeActions: SubsquidTradeAction[];
+  totalCount?: number;
+};
+
+export const TRADE_ACTION_FIELDS = `
+    id
+    eventName
+
+    srcChainId
+    account
+    marketAddress
+    swapPath
+    initialCollateralTokenAddress
+    positionKey
+    positionLifecycleId
+    positionSizeInUsd
+    positionSizeInTokens
+
+    initialCollateralDeltaAmount
+    sizeDeltaUsd
+    sizeDeltaInTokens
+    triggerPrice
+    contractTriggerPrice
+    acceptablePrice
+    executionPrice
+    minOutputAmount
+    executionAmountOut
+
+    swapImpactUsd
+    collateralTotalCostAmount
+    priceImpactUsd
+    priceImpactDiffUsd
+    positionFeeAmount
+    traderDiscountAmount
+    borrowingFeeAmount
+    fundingFeeAmount
+    swapFeeUsd
+    uiFeeFactor
+    liquidationFeeAmount
+    minCollateralFactorForLiquidation
+    pnlUsd
+    basePnlUsd
+
+    collateralTokenPriceMax
+    collateralTokenPriceMin
+
+    indexTokenPriceMin
+    indexTokenPriceMax
+
+    orderType
+    orderKey
+    isLong
+    shouldUnwrapNativeToken
+    twapGroupId
+    numberOfParts
+    totalImpactUsd
+    proportionalPendingImpactUsd
+    decreasePositionSwapType
+
+    reason
+    reasonBytes
+    timestamp
+    transactionHash
+`;
+
+export function useTradeHistory(
+  chainId: number,
+  p: {
+    account: string | null | undefined;
+    forAllAccounts?: boolean;
+    pageSize: number;
+    fromTxTimestamp?: number;
+    toTxTimestamp?: number;
+    marketsDirectionsFilter?: MarketFilterLongShortItemData[];
+    refreshInterval?: number;
+    positionLifecycleId?: string;
+    orderEventCombinations?: {
+      eventName?: TradeActionType;
+      orderType?: OrderType[];
+      isDepositOrWithdraw?: boolean;
+      isTwap?: boolean;
+    }[];
+  }
+): TradeHistoryResult {
+  const {
+    pageSize,
+    account,
+    forAllAccounts,
+    fromTxTimestamp,
+    toTxTimestamp,
+    marketsDirectionsFilter,
+    orderEventCombinations,
+    refreshInterval,
+    positionLifecycleId,
+  } = p;
+  const marketsInfoData = useMarketsInfoData();
+  const tokensData = useTokensData();
+  const { showDebugValues } = useSettings();
+
+  const client = getSubsquidGraphClient(chainId);
+
+  const getKey = (index: number) => {
+    if (chainId && client && (account || forAllAccounts)) {
+      return [
+        chainId,
+        "useTradeHistory",
+        account,
+        forAllAccounts,
+        fromTxTimestamp,
+        toTxTimestamp,
+        orderEventCombinations,
+        positionLifecycleId,
+        marketsDirectionsFilter,
+        index,
+        pageSize,
+      ] as const;
+    }
+    return null;
+  };
+
+  const swrParams: SWRConfiguration = {};
+  // SWR resets global options if pass undefined explicitly
+  if (refreshInterval) {
+    swrParams.refreshInterval = refreshInterval;
+  }
+
+  const {
+    data,
+    error,
+    size: pageIndex,
+    setSize: setPageIndex,
+  } = useInfiniteSwr(getKey, {
+    fetcher: async (key) => {
+      const pageIndex = key.at(-2) as number;
+
+      const actions = await fetchRawTradeActions({
+        chainId,
+        pageIndex,
+        pageSize,
+        // Count is the same across pages; fetch it once.
+        includeTotalCount: pageIndex === 0,
+        marketsDirectionsFilter,
+        forAllAccounts,
+        account,
+        fromTxTimestamp,
+        toTxTimestamp,
+        orderEventCombinations,
+        positionLifecycleId,
+        showDebugValues,
+      });
+
+      return actions;
+    },
+    ...swrParams,
+  });
+
+  const hasPopulatedData = data !== undefined && data.every((p) => p !== undefined);
+  const isLoading = (!error && !hasPopulatedData) || !marketsInfoData || !tokensData;
+
+  const tradeActions = useMemo(() => {
+    const allRawData = data?.flatMap((page) => page?.tradeActions ?? []);
+
+    return processRawTradeActions({
+      chainId,
+      rawActions: allRawData,
+      marketsInfoData,
+      tokensData,
+      marketsDirectionsFilter,
+    });
+  }, [data, marketsInfoData, tokensData, marketsDirectionsFilter, chainId]);
+
+  const totalCount = data?.find((page) => page?.totalCount !== undefined)?.totalCount;
+  const loadedRawActionsCount = data?.reduce((count, page) => count + (page?.tradeActions.length ?? 0), 0) ?? 0;
+  const hasMorePages =
+    totalCount !== undefined ? loadedRawActionsCount < totalCount : data?.at(-1)?.tradeActions.length === pageSize;
+
+  return {
+    tradeActions,
+    totalCount,
+    isLoading,
+    error,
+    hasMorePages,
+    pageIndex,
+    setPageIndex,
+  };
+}
+
+export async function fetchRawTradeActions({
+  chainId,
+  pageIndex,
+  pageSize,
+  includeTotalCount = true,
+  marketsDirectionsFilter = EMPTY_ARRAY,
+  forAllAccounts,
+  account,
+  fromTxTimestamp,
+  toTxTimestamp,
+  orderEventCombinations,
+  positionLifecycleId,
+  orderKeys,
+  transactionHashes,
+  showDebugValues,
+  abortSignal,
+}: {
+  chainId: number;
+  pageIndex: number;
+  pageSize: number;
+  includeTotalCount?: boolean;
+  marketsDirectionsFilter: MarketFilterLongShortItemData[] | undefined;
+  forAllAccounts: boolean | undefined;
+  account: string | null | undefined;
+  fromTxTimestamp: number | undefined;
+  toTxTimestamp: number | undefined;
+  orderEventCombinations:
+    | {
+        eventName?: TradeActionType | undefined;
+        orderType?: OrderType[] | undefined;
+        isDepositOrWithdraw?: boolean | undefined;
+        isTwap?: boolean | undefined;
+      }[]
+    | undefined;
+  positionLifecycleId?: string;
+  orderKeys?: string[];
+  transactionHashes?: string[];
+  showDebugValues?: boolean;
+  abortSignal?: AbortSignal;
+}): Promise<RawTradeActionsResult | undefined> {
+  const client = getSubsquidGraphClient(chainId);
+  definedOrThrow(client);
+
+  const offset = pageIndex * pageSize;
+  const limit = pageSize;
+
+  const nonSwapRelevantDefinedFilters: MarketFilterLongShortItemData[] = marketsDirectionsFilter
+    .filter((filter) => filter.direction !== "swap" && filter.marketAddress !== "any")
+    .map((filter) => ({
+      marketAddress: filter.marketAddress as Address,
+      direction: filter.direction,
+      collateralAddress: filter.collateralAddress as Address,
+    }));
+
+  const hasNonSwapRelevantDefinedMarkets = nonSwapRelevantDefinedFilters.length > 0;
+
+  const pureDirectionFilters = marketsDirectionsFilter
+    .filter((filter) => filter.direction !== "any" && filter.marketAddress === "any")
+    .map((filter) => ({
+      marketAddress: filter.marketAddress.toLowerCase() as "any",
+      direction: filter.direction,
+    }));
+  const hasPureDirectionFilters = pureDirectionFilters.length > 0;
+
+  const swapRelevantDefinedMarkets = marketsDirectionsFilter
+    .filter((filter) => (filter.direction === "any" || filter.direction === "swap") && filter.marketAddress !== "any")
+    .map((filter) => filter.marketAddress as Address | "any");
+
+  const hasSwapRelevantDefinedMarkets = swapRelevantDefinedMarkets.length > 0;
+
+  const mergedCombinations = orderEventCombinations?.flatMap((combination) =>
+    (combination.orderType || []).map((orderType) => ({ ...combination, orderType }))
+  );
+
+  const filtersStr = buildFiltersBody({
+    AND: [
+      {
+        account_eq: forAllAccounts || positionLifecycleId ? undefined : account,
+        timestamp_gte: fromTxTimestamp,
+        timestamp_lte: toTxTimestamp,
+        positionLifecycleId_eq: positionLifecycleId,
+        orderKey_in: orderKeys,
+        transactionHash_in: transactionHashes,
+        // Settle executions are indexed as zero-size decreases; they belong to the Claims tab, not here.
+        isFundingFeeSettle_eq: false,
+      },
+      {
+        OR: !hasPureDirectionFilters
+          ? undefined
+          : pureDirectionFilters.map((filter) =>
+              filter.direction === "swap"
+                ? {
+                    orderType_in: [OrderType.LimitSwap, OrderType.MarketSwap],
+                  }
+                : {
+                    isLong_eq: filter.direction === "long",
+                    orderType_not_in: [OrderType.LimitSwap, OrderType.MarketSwap],
+                  }
+            ),
+      },
+      {
+        OR: [
+          // For non-swap orders
+          {
+            AND: !hasNonSwapRelevantDefinedMarkets
+              ? undefined
+              : [
+                  {
+                    orderType_not_in: [OrderType.LimitSwap, OrderType.MarketSwap],
+                  },
+                  {
+                    OR: nonSwapRelevantDefinedFilters.map((filter) => ({
+                      marketAddress_eq: filter.marketAddress === "any" ? undefined : filter.marketAddress,
+                      isLong_eq: filter.direction === "any" ? undefined : filter.direction === "long",
+                      // Collateral filtering is done outside of graphql on the client
+                    })),
+                  },
+                ],
+          },
+          // For defined markets on swap orders
+          {
+            AND: !hasSwapRelevantDefinedMarkets
+              ? undefined
+              : [
+                  {
+                    orderType_in: [OrderType.LimitSwap, OrderType.MarketSwap],
+                  },
+                  {
+                    OR: [
+                      // Source token is not in swap path so we add it to the or filter
+                      {
+                        marketAddress_in: swapRelevantDefinedMarkets,
+                      } as GraphQlFilters,
+                    ].concat(
+                      swapRelevantDefinedMarkets.map((marketAddress) => ({
+                        swapPath_containsAll: [marketAddress],
+                      })) || []
+                    ),
+                  },
+                ],
+          },
+        ],
+      },
+      {
+        OR: mergedCombinations?.map((combination) => {
+          let sizeDeltaUsdCondition = {};
+
+          if (
+            combination.orderType !== undefined &&
+            [OrderType.MarketDecrease, OrderType.MarketIncrease].includes(combination.orderType)
+          ) {
+            if (combination.isDepositOrWithdraw) {
+              sizeDeltaUsdCondition = { sizeDeltaUsd_eq: 0 };
+            } else {
+              sizeDeltaUsdCondition = { sizeDeltaUsd_not_eq: 0 };
+            }
+          }
+
+          return merge(
+            {
+              eventName_eq: combination.eventName,
+              orderType_eq: combination.orderType,
+              twapGroupId_isNull: !combination.isTwap,
+            },
+            sizeDeltaUsdCondition
+          );
+        }),
+      },
+      {
+        // We do not show create liquidation orders in the trade history, thus we filter it out
+        // ... && not (liquidation && orderCreated) === ... && (not liquidation || not orderCreated)
+        OR: [{ orderType_not_eq: OrderType.Liquidation }, { eventName_not_eq: TradeActionType.OrderCreated }],
+      },
+      // not request market increase, market decrease, market swap, (deposit, withdraw are included in increase, decrease)
+      ...(showDebugValues
+        ? []
+        : [
+            {
+              OR: [{ orderType_not_eq: OrderType.MarketIncrease }, { eventName_not_eq: TradeActionType.OrderCreated }],
+            },
+            {
+              OR: [{ orderType_not_eq: OrderType.MarketDecrease }, { eventName_not_eq: TradeActionType.OrderCreated }],
+            },
+            {
+              OR: [{ orderType_not_eq: OrderType.MarketSwap }, { eventName_not_eq: TradeActionType.OrderCreated }],
+            },
+          ]),
+    ],
+  });
+
+  const whereClause = `where: ${filtersStr}`;
+
+  const connectionQuery = includeTotalCount
+    ? `tradeActionsConnection(orderBy: [timestamp_DESC, id_DESC], ${whereClause}) {
+          totalCount
+        }`
+    : "";
+
+  const query = gql(`{
+        ${connectionQuery}
+
+        tradeActions(
+            offset: ${offset},
+            limit: ${limit},
+            orderBy: [timestamp_DESC, id_DESC],
+            ${whereClause}
+        ) {
+            ${TRADE_ACTION_FIELDS}
+        }
+      }`);
+
+  const result = await client!.query({
+    query,
+    fetchPolicy: "no-cache",
+    context: abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+  });
+
+  const rawTradeActions = (result.data?.tradeActions || []) as SubsquidTradeAction[];
+  const totalCount = result.data?.tradeActionsConnection?.totalCount;
+
+  return {
+    tradeActions: rawTradeActions,
+    totalCount,
+  };
+}
+
+const TWAP_GROUP_IDS_PER_REQUEST = 100;
+
+export type TwapPartTradeAction = Pick<SubsquidTradeAction, "id" | "eventName" | "timestamp" | "twapGroupId">;
+
+// Fetches every executed action of the given TWAP groups, so part numbers can be derived from
+// the complete group instead of the actions that happen to fall inside an export window.
+// The account filter is required: twapGroupId alone has no index and scans the whole table.
+export async function fetchTwapGroupExecutedActions({
+  chainId,
+  account,
+  twapGroupIds,
+  abortSignal,
+}: {
+  chainId: number;
+  account: string;
+  twapGroupIds: string[];
+  abortSignal?: AbortSignal;
+}): Promise<TwapPartTradeAction[]> {
+  const client = getSubsquidGraphClient(chainId);
+  definedOrThrow(client);
+
+  const actions: TwapPartTradeAction[] = [];
+
+  for (let chunkStart = 0; chunkStart < twapGroupIds.length; chunkStart += TWAP_GROUP_IDS_PER_REQUEST) {
+    const chunk = twapGroupIds.slice(chunkStart, chunkStart + TWAP_GROUP_IDS_PER_REQUEST);
+    const filtersStr = buildFiltersBody({
+      account_eq: account,
+      twapGroupId_in: chunk,
+      eventName_eq: TradeActionType.OrderExecuted,
+    });
+
+    const chunkActions = await queryPaginated<TwapPartTradeAction>(async (limit, offset) => {
+      const query = gql(`{
+        tradeActions(
+            offset: ${offset},
+            limit: ${limit},
+            orderBy: [timestamp_ASC, id_ASC],
+            where: ${filtersStr}
+        ) {
+            id
+            eventName
+            timestamp
+            twapGroupId
+        }
+      }`);
+
+      const result = await client.query({
+        query,
+        fetchPolicy: "no-cache",
+        context: abortSignal ? { fetchOptions: { signal: abortSignal } } : undefined,
+      });
+      return (result.data?.tradeActions ?? []) as TwapPartTradeAction[];
+    });
+
+    actions.push(...chunkActions);
+  }
+
+  return actions;
+}
+
+// Unexecuted increases can have their own lifecycle id, so use the position slot's open lifecycle.
+export async function fetchPositionLifecycleId({
+  chainId,
+  positionKey,
+  increasedAtTime,
+}: {
+  chainId: number;
+  positionKey: string;
+  increasedAtTime: bigint;
+}): Promise<string | undefined> {
+  const client = getSubsquidGraphClient(chainId);
+
+  if (!client) {
+    return undefined;
+  }
+
+  const query = gql`
+    query PositionLifecycle($positionKey: String!, $chainId: String!) {
+      positionLifecycleById(id: $positionKey) {
+        currentLifecycleId
+        isOpen
+      }
+      processorStatusById(id: $chainId) {
+        lastParsedBlockTimestamp
+      }
+    }
+  `;
+
+  const result = await client.query<Pick<SubsquidQuery, "positionLifecycleById" | "processorStatusById">>({
+    query,
+    variables: { positionKey, chainId: String(chainId) },
+    fetchPolicy: "no-cache",
+  });
+  const lifecycle = result.data?.positionLifecycleById;
+  const processorStatus = result.data?.processorStatusById;
+
+  // A stale open lifecycle may belong to the position before a close and reopen.
+  if (!processorStatus || processorStatus.lastParsedBlockTimestamp < increasedAtTime) {
+    return undefined;
+  }
+
+  return lifecycle?.isOpen ? lifecycle.currentLifecycleId ?? undefined : undefined;
+}

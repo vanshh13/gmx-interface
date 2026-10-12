@@ -1,0 +1,324 @@
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { useMemo, useState } from "react";
+
+import {
+  GMX_ACCOUNT_PSEUDO_CHAIN_ID,
+  type AnyChainId,
+  type ContractsChainId,
+  type GmxAccountPseudoChainId,
+  type SourceChainId,
+} from "config/chains";
+import { PLATFORM_TOKEN_DECIMALS } from "context/PoolsDetailsContext/selectors";
+import { getGlvOrMarketAddress } from "domain/synthetics/markets";
+import { isGlvAddress, isGlvInfo } from "domain/synthetics/markets/glv";
+import { GlvOrMarketInfo, GmPaySource } from "domain/synthetics/markets/types";
+import { getGlvOrMarketIconSymbol, getMarketIndexName } from "domain/synthetics/markets/utils";
+import { convertToUsd } from "domain/tokens";
+import { formatBalanceAmount } from "lib/numbers";
+import { EMPTY_ARRAY } from "lib/objects";
+import { getTokenSymbolByMarket } from "sdk/configs/markets";
+import { getToken } from "sdk/configs/tokens";
+import { getMarketPoolName } from "sdk/utils/markets";
+
+import { SelectedPoolLabel } from "components/GmSwap/GmSwapBox/SelectedPool";
+import { SlideModal } from "components/Modal/SlideModal";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import { ButtonRowScrollFadeContainer } from "components/TableScrollFade/TableScrollFade";
+import Tabs from "components/Tabs/Tabs";
+import type { RegularOption } from "components/Tabs/types";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+
+import ChevronDownIcon from "img/ic_chevron_down.svg?react";
+
+import "./TokenSelector.scss";
+
+type Props = {
+  chainId: ContractsChainId;
+  srcChainId: SourceChainId | undefined;
+
+  label?: string;
+  className?: string;
+
+  paySource: GmPaySource;
+  onSelectTokenAddress: (srcChainId: AnyChainId | GmxAccountPseudoChainId) => void;
+
+  marketInfo: GlvOrMarketInfo | undefined;
+  marketTokenPrice: bigint | undefined;
+  tokenBalancesData: Partial<Record<AnyChainId | GmxAccountPseudoChainId, bigint>>;
+  hideTabs?: boolean;
+};
+
+export function MultichainMarketTokenSelector({
+  chainId,
+  srcChainId,
+  onSelectTokenAddress: propsOnSelectTokenAddress,
+  paySource,
+  className,
+  label,
+  marketInfo,
+  marketTokenPrice,
+  tokenBalancesData,
+  hideTabs,
+}: Props) {
+  const [isModalVisible, setIsModalVisible] = useState(false);
+  const [activeFilter, setActiveFilter] = useState<"all" | "wallet" | "gmxAccount">("all");
+
+  const { tokens, hasGmxAccountBalance, hasWalletBalance } = useMemo((): {
+    tokens: DisplayToken[];
+    hasGmxAccountBalance: boolean;
+    hasWalletBalance: boolean;
+  } => {
+    let tokens: DisplayToken[] = EMPTY_ARRAY;
+    let hasGmxAccountBalance = false;
+    let hasWalletBalance = false;
+
+    if (!marketInfo) {
+      return { tokens, hasGmxAccountBalance, hasWalletBalance };
+    }
+
+    tokens = Object.entries(tokenBalancesData)
+      .filter(([tokenChainIdRaw, balance]) => {
+        const tokenChainId = parseInt(tokenChainIdRaw);
+
+        if (balance === 0n) {
+          return false;
+        }
+
+        if (tokenChainId === GMX_ACCOUNT_PSEUDO_CHAIN_ID) {
+          hasGmxAccountBalance = true;
+        } else {
+          hasWalletBalance = true;
+        }
+
+        return true;
+      })
+      .map(([chainId, balance]: [string, bigint | undefined]): DisplayToken | undefined => {
+        if (balance === undefined) {
+          return undefined;
+        }
+        const symbol = getGlvOrMarketIconSymbol(marketInfo);
+        const indexTokenAddress = isGlvInfo(marketInfo) ? marketInfo.glvToken.address : marketInfo.indexToken.address;
+
+        return {
+          address: getGlvOrMarketAddress(marketInfo),
+          balance,
+          balanceUsd: convertToUsd(balance, PLATFORM_TOKEN_DECIMALS, marketTokenPrice) ?? 0n,
+          chainId: parseInt(chainId) as AnyChainId | GmxAccountPseudoChainId,
+          symbol,
+          swapOnlyName: marketInfo.isSpotOnly ? `GM: ${getMarketIndexName(marketInfo)}` : undefined,
+          indexTokenAddress,
+          longTokenAddress: marketInfo.longToken.address,
+          shortTokenAddress: marketInfo.shortToken.address,
+        };
+      })
+      .filter((token): token is DisplayToken => token !== undefined);
+
+    return { tokens, hasGmxAccountBalance, hasWalletBalance };
+  }, [marketInfo, marketTokenPrice, tokenBalancesData]);
+
+  const showNetworksFilter = !hideTabs && hasGmxAccountBalance && hasWalletBalance;
+
+  const filteredTokens = useMemo(() => {
+    if (!showNetworksFilter || activeFilter === "all") {
+      return tokens;
+    }
+
+    return tokens.filter((token) => {
+      const isGmxAccount = token.chainId === GMX_ACCOUNT_PSEUDO_CHAIN_ID;
+      return activeFilter === "gmxAccount" ? isGmxAccount : !isGmxAccount;
+    });
+  }, [activeFilter, showNetworksFilter, tokens]);
+
+  const glvOrGm = isGlvInfo(marketInfo) ? "GLV" : "GM";
+
+  const NETWORKS_FILTER = useMemo<RegularOption<"all" | "wallet" | "gmxAccount">[]>(() => {
+    const wildCard: RegularOption<"all"> = {
+      value: "all",
+      label: (
+        <span className="whitespace-nowrap">
+          <Trans>All</Trans>
+        </span>
+      ),
+    };
+
+    const wallet: RegularOption<"wallet"> = {
+      value: "wallet",
+      label: (
+        <span className="whitespace-nowrap">
+          <Trans>Wallet</Trans>
+        </span>
+      ),
+    };
+
+    const gmxAccount: RegularOption<"gmxAccount"> = {
+      value: "gmxAccount",
+      label: (
+        <span className="whitespace-nowrap">
+          <Trans>GMX Account</Trans>
+        </span>
+      ),
+    };
+
+    return [wildCard, wallet, gmxAccount];
+  }, []);
+
+  const onSelectTokenAddress = (tokenChainId: AnyChainId | GmxAccountPseudoChainId) => {
+    setIsModalVisible(false);
+    propsOnSelectTokenAddress(tokenChainId);
+  };
+
+  return (
+    <div
+      className={cx("TokenSelector text-20 leading-1 tracking-wide", className)}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SlideModal
+        qa={"market-token-selector-modal"}
+        className="TokenSelector-modal text-body-medium text-typography-primary"
+        isVisible={isModalVisible}
+        setIsVisible={setIsModalVisible}
+        label={label}
+        headerContent={
+          showNetworksFilter ? (
+            <div className="pb-12">
+              <ButtonRowScrollFadeContainer>
+                <Tabs
+                  options={NETWORKS_FILTER}
+                  selectedValue={activeFilter}
+                  onChange={setActiveFilter}
+                  type="inline"
+                  qa="network-filter"
+                  regularOptionClassname="shrink-0"
+                />
+              </ButtonRowScrollFadeContainer>
+            </div>
+          ) : null
+        }
+        contentPadding={false}
+      >
+        {filteredTokens.length === 0 && marketInfo ? (
+          <div className="flex grow items-center justify-center p-adaptive text-center text-typography-secondary">
+            <Trans>No {glvOrGm} in your wallet or GMX Account</Trans>
+          </div>
+        ) : (
+          <AvailableToTradeTokenList
+            chainId={chainId}
+            onSelectTokenAddress={onSelectTokenAddress}
+            tokens={filteredTokens}
+          />
+        )}
+      </SlideModal>
+      <div
+        data-qa={"market-token-selector"}
+        className="group/hoverable flex cursor-pointer items-center whitespace-nowrap hover:text-blue-300"
+        onClick={() => setIsModalVisible(true)}
+      >
+        {marketInfo && (
+          <span className="inline-flex items-center">
+            <TokenIcon
+              className="mr-5"
+              symbol={getGlvOrMarketIconSymbol(marketInfo)}
+              displaySize={20}
+              chainIdBadge={
+                paySource === "sourceChain"
+                  ? srcChainId
+                  : paySource === "gmxAccount"
+                    ? GMX_ACCOUNT_PSEUDO_CHAIN_ID
+                    : undefined
+              }
+            />
+            <SelectedPoolLabel glvOrMarketInfo={marketInfo} />
+          </span>
+        )}
+
+        <ChevronDownIcon className="text-body-large size-16 text-typography-secondary group-hover/hoverable:text-blue-300" />
+      </div>
+    </div>
+  );
+}
+
+type DisplayToken = {
+  address: string;
+  symbol: string;
+  swapOnlyName: string | undefined;
+  indexTokenAddress: string | undefined;
+  longTokenAddress: string;
+  shortTokenAddress: string;
+  balance: bigint;
+  balanceUsd: bigint;
+  chainId: AnyChainId | GmxAccountPseudoChainId;
+};
+
+function AvailableToTradeTokenList({
+  chainId,
+  onSelectTokenAddress,
+  tokens,
+}: {
+  chainId: ContractsChainId;
+  onSelectTokenAddress: (tokenChainId: AnyChainId | GmxAccountPseudoChainId) => void;
+  tokens: DisplayToken[];
+}) {
+  return (
+    <div>
+      {tokens.map((token) => {
+        return (
+          <div
+            key={token.chainId ?? "settlement-chain"}
+            className="flex cursor-pointer items-center justify-between px-adaptive py-8 gmx-hover:bg-fill-surfaceElevated50"
+            onClick={() => onSelectTokenAddress(token.chainId)}
+          >
+            <div className="text-body-large flex items-center gap-8">
+              <TokenIcon symbol={token.symbol} className="size-40" displaySize={40} chainIdBadge={token.chainId} />
+
+              <div>
+                <div>
+                  {isGlvAddress(chainId, token.address) ? (
+                    t`GLV`
+                  ) : token.swapOnlyName ? (
+                    token.swapOnlyName
+                  ) : (
+                    <>
+                      {getTokenSymbolByMarket(chainId, token.address, "index")}
+                      <span className="text-slate-100">{t`/USD`}</span>
+                    </>
+                  )}
+                </div>
+                <div className="text-body-small text-slate-100">
+                  [
+                  {getMarketPoolName({
+                    longToken: getToken(chainId, token.longTokenAddress),
+                    shortToken: getToken(chainId, token.shortTokenAddress),
+                  })}
+                  ]
+                </div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-body-large">
+                {token.balance > 0n &&
+                  formatBalanceAmount(
+                    token.balance,
+                    PLATFORM_TOKEN_DECIMALS,
+                    isGlvAddress(chainId, token.address) ? "GLV" : "GM",
+                    {
+                      isStable: false,
+                    }
+                  )}
+                {token.balance == 0n && "-"}
+              </div>
+
+              <span className="text-body-small text-slate-100">
+                {token.balanceUsd > 0n && (
+                  <div>
+                    (<UsdValue usd={token.balanceUsd} displayDecimals={2} />)
+                  </div>
+                )}
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}

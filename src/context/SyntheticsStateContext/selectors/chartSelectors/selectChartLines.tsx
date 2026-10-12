@@ -1,0 +1,88 @@
+import { t } from "@lingui/macro";
+
+import { USD_DECIMALS } from "config/factors";
+import {
+  selectChainId,
+  selectPositionsInfoData,
+  selectTokensData,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { createSelector } from "context/SyntheticsStateContext/utils";
+import { getTokenData } from "domain/synthetics/tokens";
+import { calculateDisplayDecimals, formatAmount } from "lib/numbers";
+import { EMPTY_ARRAY } from "lib/objects";
+import { convertTokenAddress, getTokenVisualMultiplier } from "sdk/configs/tokens";
+import { getMarketIndexName } from "sdk/utils/markets";
+
+import { StaticChartLine } from "components/TVChartContainer/types";
+
+import { selectChartToken } from ".";
+
+export const selectChartLines = createSelector<StaticChartLine[]>((q) => {
+  const chainId = q(selectChainId);
+  const { chartToken } = q(selectChartToken);
+  const positionsInfo = q(selectPositionsInfoData);
+
+  const chartTokenAddress = chartToken?.address;
+
+  if (!chartTokenAddress) {
+    return EMPTY_ARRAY;
+  }
+
+  const filteredPositions = Object.values(positionsInfo || {}).filter(
+    (position) =>
+      position.marketInfo &&
+      convertTokenAddress(chainId, position.marketInfo.indexTokenAddress, "wrapped") ===
+        convertTokenAddress(chainId, chartTokenAddress, "wrapped")
+  );
+
+  const positionLines = filteredPositions.flatMap((position) => {
+    const longOrShortText = position.isLong ? t`Long` : t`Short`;
+    const token = q((state) => getTokenData(selectTokensData(state), position.marketInfo?.indexTokenAddress, "native"));
+    const marketIndexName = getMarketIndexName(position.marketInfo!) ?? "";
+    const tokenVisualMultiplier = token?.visualMultiplier;
+    const priceDecimal = calculateDisplayDecimals(position.entryPrice, USD_DECIMALS, tokenVisualMultiplier);
+    const positionTitle = `${longOrShortText} ${marketIndexName}`;
+
+    const liquidationPrice = formatAmount(
+      position?.liquidationPrice,
+      USD_DECIMALS,
+      priceDecimal,
+      undefined,
+      undefined,
+      tokenVisualMultiplier
+    );
+
+    const lines: StaticChartLine[] = [
+      {
+        id: `${position.key}-entry`,
+        title: positionTitle,
+        price: parseFloat(
+          formatAmount(position.entryPrice, USD_DECIMALS, priceDecimal, undefined, undefined, tokenVisualMultiplier)
+        ),
+        positionData: {
+          positionKey: position.key,
+          pnl: position.pnlAfterFees,
+          sizeInUsd: position.sizeInUsd,
+          sizeInTokens: position.sizeInTokens / BigInt(tokenVisualMultiplier ?? 1),
+          isLong: position.isLong,
+          marketIndexName,
+          tokenSymbol: `${getTokenVisualMultiplier(position.indexToken)}${position.indexToken.symbol}`,
+          tokenDecimals: position.indexToken.decimals,
+        },
+      },
+    ];
+
+    if (liquidationPrice && liquidationPrice !== "NA") {
+      lines.push({
+        id: `${position.key}-liquidation`,
+        title: `${positionTitle} · ${t`liquidation`}`,
+        price: parseFloat(liquidationPrice),
+        lineType: "liquidation",
+      });
+    }
+
+    return lines;
+  });
+
+  return positionLines;
+});

@@ -1,0 +1,92 @@
+import { Trans } from "@lingui/macro";
+import range from "lodash/range";
+import { useCallback, useState } from "react";
+
+import { useReferrerTier, setAffiliateTier as contractSetAffiliateTier } from "domain/referrals";
+import { useChainId } from "lib/chains";
+import useWallet from "lib/wallets/useWallet";
+
+import AppPageLayout from "components/AppPageLayout/AppPageLayout";
+import Button from "components/Button/Button";
+import Select from "components/Select/Select";
+
+import "./ReferralsTier.scss";
+
+export default function ReferralsTier() {
+  const { active, signer } = useWallet();
+  const { chainId } = useChainId();
+
+  const [affiliate, setAffiliate] = useState<string>("");
+  const [affiliateTier, setAffiliateTier] = useState<number>(1);
+  const { referrerTier: currentAffiliateTier } = useReferrerTier(chainId, affiliate);
+
+  const onConfirmation = useCallback(() => {
+    if (affiliate) {
+      contractSetAffiliateTier(chainId, affiliate, affiliateTier, signer, {
+        sentMsg: "Transaction sent!",
+        failMsg: "Transaction failed.",
+      });
+    }
+  }, [affiliate, affiliateTier, chainId, signer]);
+
+  function renderForm() {
+    if (!active) return null;
+
+    return (
+      <div className="ReferralsTier-form">
+        <div className="ReferralsTier-row">
+          <label className="ReferralsTier-label">
+            <Trans>Affiliate address:</Trans>
+          </label>
+          <input
+            type="text"
+            className="ReferralsTier-input"
+            value={affiliate}
+            onChange={(evt) => setAffiliate(evt.target.value)}
+          />
+        </div>
+        {currentAffiliateTier !== undefined && (
+          <>
+            <div className="ReferralsTier-row">
+              <label className="ReferralsTier-label">
+                <Trans>Current tier:</Trans>
+              </label>
+              <strong>{currentAffiliateTier === undefined ? undefined : String(currentAffiliateTier + 1n)}</strong>
+            </div>
+            <div className="ReferralsTier-row">
+              <label className="ReferralsTier-label">
+                <Trans>New tier:</Trans>
+              </label>
+              <Select
+                onChange={(evt) => setAffiliateTier(Number(evt.target.value))}
+                value={affiliateTier}
+                options={range(1, 4).map((tier: number, i: number) => ({ value: i, label: tier }))}
+              />
+            </div>
+            <div className="ReferralsTier-row">
+              <Button variant="primary" onClick={onConfirmation}>
+                <Trans>Save tier</Trans>
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <AppPageLayout title="Referrals Tier">
+      <div className="page-layout default-container">
+        <h1>
+          <Trans>Referrals tier</Trans>
+        </h1>
+        {!active && (
+          <div>
+            <Trans>Wallet not connected</Trans>
+          </div>
+        )}
+        {renderForm()}
+      </div>
+    </AppPageLayout>
+  );
+}

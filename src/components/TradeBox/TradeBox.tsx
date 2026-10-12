@@ -1,0 +1,1415 @@
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useKey, useLatest, usePrevious } from "react-use";
+import { zeroAddress } from "viem";
+
+import { GMX_ACCOUNT_PSEUDO_CHAIN_ID } from "config/chains";
+import { BASIS_POINTS_DIVISOR, USD_DECIMALS } from "config/factors";
+import { isSettlementChain } from "config/multichain";
+import { useConnectModal } from "context/ConnectModalContext/ConnectModalContext";
+import { useSettings } from "context/SettingsContext/SettingsContextProvider";
+import { useTokensData } from "context/SyntheticsStateContext/hooks/globalsHooks";
+import { selectChartHeaderInfo } from "context/SyntheticsStateContext/selectors/chartSelectors";
+import {
+  selectGmxAccountGasPaymentToken,
+  selectSettlementChainGasPaymentToken,
+} from "context/SyntheticsStateContext/selectors/expressSelectors";
+import {
+  selectChainId,
+  selectGasLimits,
+  selectGasPrice,
+  selectL1ExpressOrderGasReference,
+  selectMarketsInfoData,
+  selectSrcChainId,
+  selectSubaccountState,
+} from "context/SyntheticsStateContext/selectors/globalSelectors";
+import {
+  selectExpressOrdersEnabled,
+  selectGasPaymentTokenAddress,
+  selectGmxAccountGasPaymentTokenAddress,
+  selectSetExpressOrdersEnabled,
+  selectShowDebugValues,
+} from "context/SyntheticsStateContext/selectors/settingsSelectors";
+import {
+  selectTradeboxAllowedSlippage,
+  selectTradeboxAvailableTokensOptions,
+  selectTradeboxChooseSuitableMarket,
+  selectTradeboxDecreasePositionAmounts,
+  selectTradeboxExecutionFee,
+  selectTradeboxFees,
+  selectTradeboxFormState,
+  selectTradeboxFromToken,
+  selectTradeboxHasPendingInput,
+  selectTradeboxIncreasePositionAmounts,
+  selectTradeboxIsWrapOrUnwrap,
+  selectTradeboxKeepLeverage,
+  selectTradeboxLeverage,
+  selectTradeboxMarkPrice,
+  selectTradeboxMaxAllowedLeverage,
+  selectTradeboxNextPositionValues,
+  selectTradeboxOffHoursLiqRisk,
+  selectTradeboxExistingPositionForPreview,
+  selectTradeboxSelectedPosition,
+  selectTradeboxSelectedPositionKey,
+  selectTradeboxSetDefaultAllowedSwapSlippageBps,
+  selectTradeboxSetKeepLeverage,
+  selectTradeboxSetSelectedAllowedSwapSlippageBps,
+  selectTradeboxSwapAmounts,
+  selectTradeboxSwapTokens,
+  selectTradeboxTradeFlags,
+  selectTradeboxTradeRatios,
+} from "context/SyntheticsStateContext/selectors/tradeboxSelectors";
+import {
+  selectTradeboxIncreaseFreshPositionWarning,
+  selectTradeboxIncreaseLiquidationRiskWarning,
+  selectTradeboxIncreaseMaxLeverageAlert,
+} from "context/SyntheticsStateContext/selectors/tradeboxSelectors/selectTradeboxTradeErrors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { toastEnableExpress } from "domain/multichain/toastEnableExpress";
+import { useGmxAccountShowDepositButton } from "domain/multichain/useGmxAccountShowDepositButton";
+import { getNetworkFeeGasPaymentParams } from "domain/synthetics/express/validateMultichainExpressSubmit";
+import { getNetworkFeeSource } from "domain/synthetics/fees/networkFeeSource";
+import { getExpressExecutionFeeAmount, getExpressGasPrice } from "domain/synthetics/fees/utils/executionFee";
+import { getMarketIndexName, MarketInfo, OFF_HOURS_DOCS_URL } from "domain/synthetics/markets";
+import { formatLeverage, formatLiquidationPriceParts } from "domain/synthetics/positions";
+import { convertToUsd, getBalanceByBalanceType, TokenBalanceType } from "domain/synthetics/tokens";
+import { getTwapRecommendation } from "domain/synthetics/trade/twapRecommendation";
+import { useCloseSizeInput } from "domain/synthetics/trade/useCloseSizeInput";
+import { useMaxAutoCancelOrdersState } from "domain/synthetics/trade/useMaxAutoCancelOrdersState";
+import { usePriceImpactWarningState } from "domain/synthetics/trade/usePriceImpactWarningState";
+import { MissedCoinsPlace } from "domain/synthetics/userFeedback";
+import { Token } from "domain/tokens";
+import { useMaxAvailableAmount } from "domain/tokens/useMaxAvailableAmount";
+import { useLocalizedMap } from "lib/i18n";
+import { throttleLog } from "lib/logging";
+import {
+  calculateDisplayDecimals,
+  formatAmount,
+  formatAmountFree,
+  formatBalanceAmount,
+  formatDeltaUsd,
+  formatDeltaUsdParts,
+  formatPercentage,
+  formatTokenAmount,
+  formatTokenAmountWithUsdParts,
+  formatUsd,
+  numberParts,
+  parseValue,
+} from "lib/numbers";
+import { EMPTY_ARRAY, getByKey } from "lib/objects";
+import { useBlockAutoReload } from "lib/pwa/blockAutoReload";
+import { useCursorInside } from "lib/useCursorInside";
+import { sendTradeBoxInteractionStartedEvent } from "lib/userAnalytics";
+import { useWalletIconUrls } from "lib/wallets/getWalletIconUrls";
+import useWallet from "lib/wallets/useWallet";
+import { getRelayerFeeToken } from "sdk/configs/express";
+import { NATIVE_TOKEN_ADDRESS } from "sdk/configs/tokens";
+import { estimateOrderOraclePriceCount } from "sdk/utils/fees/estimateOraclePriceCount";
+import {
+  estimateBatchMinGasPaymentTokenAmount,
+  estimateExecuteIncreaseOrderGasLimit,
+  estimateExecuteSwapOrderGasLimit,
+  getExecutionFee,
+} from "sdk/utils/fees/executionFee";
+import { getMaxNegativeImpactBps } from "sdk/utils/fees/priceImpact";
+import { TradeMode } from "sdk/utils/trade/types";
+
+import { useIsActiveForm } from "components/ActiveFormScope/ActiveFormScope";
+import { AlertInfoCard } from "components/AlertInfo/AlertInfoCard";
+import Button from "components/Button/Button";
+import BuyInputSection from "components/BuyInputSection/BuyInputSection";
+import ExternalLink from "components/ExternalLink/ExternalLink";
+import { MarketSelector } from "components/MarketSelector/MarketSelector";
+import { LeverageValue } from "components/NumericValue/LeverageValue";
+import { NumericValue } from "components/NumericValue/NumericValue";
+import { UsdPriceValue } from "components/NumericValue/UsdPriceValue";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import { SyntheticsInfoRow } from "components/SyntheticsInfoRow";
+import Tabs from "components/Tabs/Tabs";
+import ToggleSwitch from "components/ToggleSwitch/ToggleSwitch";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+import TokenWithIcon from "components/TokenIcon/TokenWithIcon";
+import { MultichainTokenSelector } from "components/TokenSelector/MultichainTokenSelector";
+import TokenSelector from "components/TokenSelector/TokenSelector";
+import Tooltip from "components/Tooltip/Tooltip";
+import { TradeboxMarginFields } from "components/TradeboxMarginFields";
+import { MarginPercentageSlider } from "components/TradeboxMarginFields/MarginPercentageSlider";
+import { TradeInputField, DisplayMode } from "components/TradeboxMarginFields/TradeInputField";
+import { TradeboxPoolWarnings } from "components/TradeboxPoolWarnings/TradeboxPoolWarnings";
+import { ValueTransition } from "components/ValueTransition/ValueTransition";
+
+import ArrowDownIcon from "img/ic_arrow_down.svg?react";
+
+import { useIsCurtainOpen } from "./Curtain";
+import { ExpressTradingWarningCard } from "./ExpressTradingWarningCard";
+import { FreshPositionIncreaseWarningCard } from "./FreshPositionIncreaseWarningCard";
+import { LiquidatableIncreaseWarningCard } from "./LiquidatableIncreaseWarningCard";
+import { MarginDepositSuggestionCard } from "./MarginDepositSuggestionCard";
+import { ResultingMarginAlertCard } from "./ResultingMarginWarningCard";
+import { useMultichainTokens } from "../GmxAccountModal/hooks";
+import { HighPriceImpactOrFeesWarningCard } from "../HighPriceImpactOrFeesWarningCard/HighPriceImpactOrFeesWarningCard";
+import TradeInfoIcon from "../TradeInfoIcon/TradeInfoIcon";
+import TwapRows from "../TwapRows/TwapRows";
+import { useDecreaseOrdersThatWillBeExecuted } from "./hooks/useDecreaseOrdersThatWillBeExecuted";
+import { useTradeboxAcceptablePriceImpactValues } from "./hooks/useTradeboxAcceptablePriceImpactValues";
+import { useTradeboxTPSLReset } from "./hooks/useTradeboxTPSLReset";
+import { useTradeboxButtonState } from "./hooks/useTradeButtonState";
+import { tradeModeLabels, tradeTypeLabels } from "./tradeboxConstants";
+import { TradeBoxAdvancedGroups } from "./TradeBoxRows/AdvancedDisplayRows";
+import { useCollateralWarnings } from "./TradeBoxRows/CollateralSelectorField";
+import { MinReceiveRow } from "./TradeBoxRows/MinReceiveRow";
+import { PriceImpactFeesRow } from "./TradeBoxRows/PriceImpactFeesRow";
+import { TPSLGroup } from "./TradeBoxRows/TPSLRows";
+
+import "./TradeBox.scss";
+
+const TRADEBOX_INPUT_PLACEHOLDER = "0.00";
+
+export function TradeBox({ isMobile, activeFormId }: { isMobile: boolean; activeFormId: string }) {
+  const localizedTradeModeLabels = useLocalizedMap(tradeModeLabels);
+  const localizedTradeTypeLabels = useLocalizedMap(tradeTypeLabels);
+
+  const setDefaultAllowedSwapSlippageBps = useSelector(selectTradeboxSetDefaultAllowedSwapSlippageBps);
+  const setSelectedAllowedSwapSlippageBps = useSelector(selectTradeboxSetSelectedAllowedSwapSlippageBps);
+
+  const availableTokenOptions = useSelector(selectTradeboxAvailableTokensOptions);
+  const chartHeaderInfo = useSelector(selectChartHeaderInfo);
+  const formRef = useRef<HTMLFormElement>(null);
+  const isCursorInside = useCursorInside(formRef);
+  const showDebugValues = useSelector(selectShowDebugValues);
+
+  const allowedSlippage = useSelector(selectTradeboxAllowedSlippage);
+
+  const { infoTokens, sortedLongAndShortTokens, sortedAllMarkets } = availableTokenOptions;
+  const swapTokens = useSelector(selectTradeboxSwapTokens);
+  const tokensData = useTokensData();
+  const { tokenChainDataArray: multichainTokens } = useMultichainTokens();
+  const marketsInfoData = useSelector(selectMarketsInfoData);
+  const tradeFlags = useSelector(selectTradeboxTradeFlags);
+  const { isLong, isSwap, isIncrease, isPosition, isLimit, isTrigger, isTwap } = tradeFlags;
+  const isWrapOrUnwrap = useSelector(selectTradeboxIsWrapOrUnwrap);
+
+  const chainId = useSelector(selectChainId);
+  const gasLimits = useSelector(selectGasLimits);
+  const gasPrice = useSelector(selectGasPrice);
+
+  const srcChainId = useSelector(selectSrcChainId);
+  const { account, active } = useWallet();
+  const { openConnectModal } = useConnectModal();
+
+  const walletIconUrls = useWalletIconUrls();
+
+  const { shouldDisableValidationForTesting: shouldDisableValidation } = useSettings();
+
+  const nativeToken = getByKey(tokensData, NATIVE_TOKEN_ADDRESS);
+
+  const [_, setExternalIsCurtainOpen] = useIsCurtainOpen();
+
+  const {
+    fromTokenInputValue,
+    setFromTokenInputValue: setFromTokenInputValueRaw,
+    toTokenInputValue,
+    setToTokenInputValue: setToTokenInputValueRaw,
+    setFromTokenAddress: onSelectFromTokenAddress,
+    isFromTokenGmxAccount,
+    setIsFromTokenGmxAccount,
+    setTradeMode: onSelectTradeMode,
+    focusedInput,
+    setFocusedInput,
+    setCloseSizeInputValue,
+    triggerPriceInputValue,
+    setTriggerPriceInputValue,
+    triggerRatioInputValue,
+    setTriggerRatioInputValue,
+    leverageOption,
+    setLeverageOption,
+    isSwitchTokensAllowed,
+    switchTokenAddresses,
+    tradeMode,
+    tradeType,
+    collateralToken,
+    fromTokenAddress,
+    marketInfo,
+    toTokenAddress,
+    availableTradeModes,
+    duration,
+    numberOfParts,
+    setNumberOfParts,
+    setDuration,
+    limitPriceWarningHidden,
+    setLimitPriceWarningHidden,
+    marginDepositSuggestionHidden,
+    setMarginDepositSuggestionHidden,
+  } = useSelector(selectTradeboxFormState);
+
+  const hasPendingInput = useSelector(selectTradeboxHasPendingInput);
+  useBlockAutoReload(hasPendingInput);
+
+  const isTwapModeAvailable = useMemo(
+    () =>
+      availableTradeModes.some((mode) =>
+        Array.isArray(mode) ? mode.some((nestedMode) => nestedMode === TradeMode.Twap) : mode === TradeMode.Twap
+      ),
+    [availableTradeModes]
+  );
+
+  const fromToken = useSelector(selectTradeboxFromToken);
+  const toToken = getByKey(tokensData, toTokenAddress);
+  const toTokenBalance = getBalanceByBalanceType(
+    toToken,
+    isFromTokenGmxAccount ? TokenBalanceType.GmxAccount : TokenBalanceType.Wallet
+  );
+  const fromTokenAmount = fromToken ? parseValue(fromTokenInputValue || "0", fromToken.decimals) ?? 0n : 0n;
+  const fromTokenPrice = fromToken?.prices.minPrice;
+  const fromUsd = convertToUsd(fromTokenAmount, fromToken?.decimals, fromTokenPrice);
+  const toTokenDisplayAmount = toToken ? parseValue(toTokenInputValue || "0", toToken.decimals) ?? 0n : 0n;
+  const toUsd = convertToUsd(toTokenDisplayAmount, toToken?.decimals, toToken?.prices?.maxPrice);
+
+  const markPrice = useSelector(selectTradeboxMarkPrice);
+  const swapAmounts = useSelector(selectTradeboxSwapAmounts);
+  const increaseAmounts = useSelector(selectTradeboxIncreasePositionAmounts);
+  const decreaseAmounts = useSelector(selectTradeboxDecreasePositionAmounts);
+  const selectedPositionKey = useSelector(selectTradeboxSelectedPositionKey);
+  const selectedPosition = useSelector(selectTradeboxSelectedPosition);
+  const existingPositionForPreview = useSelector(selectTradeboxExistingPositionForPreview);
+  const showIncreaseLiquidationRiskWarning = useSelector(selectTradeboxIncreaseLiquidationRiskWarning);
+  const showIncreaseFreshPositionWarning = useSelector(selectTradeboxIncreaseFreshPositionWarning);
+  const increaseMaxLeverageAlert = useSelector(selectTradeboxIncreaseMaxLeverageAlert);
+
+  const closeSizeHook = useCloseSizeInput({
+    positionSizeInUsd: selectedPosition?.sizeInUsd,
+    positionSizeInTokens: selectedPosition?.sizeInTokens,
+    indexTokenDecimals: toToken?.decimals ?? 18,
+    indexTokenSymbol: toToken?.symbol ?? "",
+    onCloseSizeUsdChange: setCloseSizeInputValue,
+  });
+
+  const leverage = useSelector(selectTradeboxLeverage);
+  const nextPositionValues = useSelector(selectTradeboxNextPositionValues);
+  const offHoursLiqRisk = useSelector(selectTradeboxOffHoursLiqRisk);
+  const showOffHoursWarning = offHoursLiqRisk.shouldWarn;
+  const fees = useSelector(selectTradeboxFees);
+  const expressOrdersEnabled = useSelector(selectExpressOrdersEnabled);
+  const setExpressOrdersEnabled = useSelector(selectSetExpressOrdersEnabled);
+  const settlementChainGasPaymentTokenData = useSelector(selectSettlementChainGasPaymentToken);
+  const gmxAccountGasPaymentTokenData = useSelector(selectGmxAccountGasPaymentToken);
+  const settlementChainGasPaymentTokenAddress = useSelector(selectGasPaymentTokenAddress);
+  const gmxAccountGasPaymentTokenAddress = useSelector(selectGmxAccountGasPaymentTokenAddress);
+  const { subaccount } = useSelector(selectSubaccountState);
+  const { shouldShowDepositButton } = useGmxAccountShowDepositButton();
+  const { setIsSettingsVisible, isLeverageSliderEnabled } = useSettings();
+
+  const executionFee = useSelector(selectTradeboxExecutionFee);
+  const { markRatio } = useSelector(selectTradeboxTradeRatios);
+
+  const maxAllowedLeverage = useSelector(selectTradeboxMaxAllowedLeverage);
+
+  const decreaseOrdersThatWillBeExecuted = useDecreaseOrdersThatWillBeExecuted();
+  const gasPaymentTokenData = isFromTokenGmxAccount
+    ? gmxAccountGasPaymentTokenData
+    : settlementChainGasPaymentTokenData;
+  const gasPaymentTokenAddress = isFromTokenGmxAccount
+    ? gmxAccountGasPaymentTokenAddress
+    : settlementChainGasPaymentTokenAddress;
+
+  const priceImpactWarningState = usePriceImpactWarningState({
+    collateralNetPriceImpact: fees?.collateralNetPriceImpact,
+    swapPriceImpact: fees?.swapPriceImpact,
+    swapProfitFee: fees?.swapProfitFee,
+    executionFeeUsd: executionFee?.feeUsd,
+    willDecreaseOrdersBeExecuted: decreaseOrdersThatWillBeExecuted.length > 0,
+    externalSwapFeeItem: fees?.externalSwapFee,
+    tradeFlags,
+    payUsd: fromUsd,
+  });
+
+  const twapRecommendation = getTwapRecommendation(
+    isIncrease
+      ? {
+          enabled: isPosition && !isSwap && !isTwap && isTwapModeAvailable,
+          sizeDeltaUsd: increaseAmounts?.sizeDeltaUsd,
+          priceImpactPrecise: fees?.increasePositionPriceImpact?.precisePercentage,
+        }
+      : {
+          enabled: isPosition && isTrigger && !isTwap && isTwapModeAvailable,
+          sizeDeltaUsd: decreaseAmounts?.sizeDeltaUsd,
+          priceImpactPrecise: fees?.decreasePositionPriceImpact?.precisePercentage,
+        }
+  );
+
+  const setIsDismissedRef = useLatest(priceImpactWarningState.setIsDismissed);
+
+  const setFromTokenInputValue = useCallback(
+    (value: string, resetPriceImpactAndSwapSlippage?: boolean) => {
+      setFromTokenInputValueRaw(value);
+
+      if (resetPriceImpactAndSwapSlippage) {
+        setIsDismissedRef.current(false);
+
+        setDefaultAllowedSwapSlippageBps(undefined);
+        setSelectedAllowedSwapSlippageBps(undefined);
+      }
+    },
+    [setFromTokenInputValueRaw, setIsDismissedRef, setDefaultAllowedSwapSlippageBps, setSelectedAllowedSwapSlippageBps]
+  );
+
+  const setToTokenInputValue = useCallback(
+    (value: string, shouldResetPriceImpactAndSwapSlippage: boolean) => {
+      setToTokenInputValueRaw(value);
+      if (shouldResetPriceImpactAndSwapSlippage) {
+        setIsDismissedRef.current(false);
+
+        setDefaultAllowedSwapSlippageBps(undefined);
+        setSelectedAllowedSwapSlippageBps(undefined);
+      }
+    },
+    [setIsDismissedRef, setToTokenInputValueRaw, setDefaultAllowedSwapSlippageBps, setSelectedAllowedSwapSlippageBps]
+  );
+
+  const { warning: maxAutoCancelOrdersWarning } = useMaxAutoCancelOrdersState({
+    positionKey: selectedPositionKey,
+    isCreatingNewAutoCancel: isTrigger,
+  });
+
+  const isActiveForm = useIsActiveForm(activeFormId);
+
+  const submitButtonState = useTradeboxButtonState({
+    account,
+    setToTokenInputValue,
+    canSwitchGasPaymentToken: isActiveForm,
+  });
+
+  const wrappedOnSubmit = useCallback(async () => {
+    await submitButtonState.onSubmit();
+    if (isMobile) {
+      setExternalIsCurtainOpen(false);
+    }
+  }, [submitButtonState, isMobile, setExternalIsCurtainOpen]);
+
+  const expressOrdersEnabledForMax = expressOrdersEnabled && fromTokenAddress !== zeroAddress && !isWrapOrUnwrap;
+
+  const expressGasPaymentParams = submitButtonState.expressParams?.gasPaymentParams;
+  const expressGasPaymentTokenAmount =
+    expressOrdersEnabledForMax && expressGasPaymentParams?.gasPaymentTokenAddress === gasPaymentTokenAddress
+      ? expressGasPaymentParams.gasPaymentTokenAmount
+      : undefined;
+
+  const gasPaymentTokenForMax = expressOrdersEnabledForMax ? gasPaymentTokenData : nativeToken;
+  const gasPaymentTokenAmountForMax = expressOrdersEnabledForMax
+    ? expressGasPaymentTokenAmount
+    : submitButtonState.totalExecutionFee?.feeTokenAmount;
+
+  const l1ExpressOrderGasReference = useSelector(selectL1ExpressOrderGasReference);
+  const relayerFeeToken = getByKey(tokensData, getRelayerFeeToken(chainId).address);
+
+  const fallbackFeeTokenAmountForMax = useMemo(() => {
+    if ((!isSwap && !isIncrease) || !gasLimits || gasPrice === undefined || !tokensData) return undefined;
+    const estimatedGasLimit = isSwap
+      ? estimateExecuteSwapOrderGasLimit(gasLimits, { swapsCount: 0, callbackGasLimit: 0n })
+      : estimateExecuteIncreaseOrderGasLimit(gasLimits, { swapsCount: 0 });
+    const oraclePriceCount = estimateOrderOraclePriceCount(0);
+    const executionFee = getExecutionFee(chainId, gasLimits, tokensData, estimatedGasLimit, gasPrice, oraclePriceCount);
+
+    if (!expressOrdersEnabledForMax) {
+      return executionFee?.feeTokenAmount;
+    }
+
+    return executionFee && gasPaymentTokenData && relayerFeeToken
+      ? estimateBatchMinGasPaymentTokenAmount({
+          chainId,
+          gasPaymentToken: gasPaymentTokenData,
+          relayFeeToken: relayerFeeToken,
+          isGmxAccount: isFromTokenGmxAccount,
+          gasPrice: getExpressGasPrice(chainId, gasPrice),
+          gasLimits,
+          l1Reference: l1ExpressOrderGasReference,
+          tokensData,
+          createOrdersCount: 1,
+          updateOrdersCount: 0,
+          cancelOrdersCount: 0,
+          executionFeeAmount: getExpressExecutionFeeAmount(chainId, executionFee),
+        })
+      : undefined;
+  }, [
+    isSwap,
+    isIncrease,
+    gasLimits,
+    gasPrice,
+    tokensData,
+    chainId,
+    expressOrdersEnabledForMax,
+    gasPaymentTokenData,
+    relayerFeeToken,
+    isFromTokenGmxAccount,
+    l1ExpressOrderGasReference,
+  ]);
+
+  const isMaxAmountLoading = expressOrdersEnabledForMax && submitButtonState.isExpressLoading;
+
+  const fromTokenBalance = getBalanceByBalanceType(
+    fromToken,
+    isFromTokenGmxAccount ? TokenBalanceType.GmxAccount : TokenBalanceType.Wallet
+  );
+  const reserveTokenForMax = isFromTokenGmxAccount
+    ? gmxAccountGasPaymentTokenData
+    : expressOrdersEnabled
+      ? gasPaymentTokenData
+      : undefined;
+
+  const {
+    maxAvailableAmount,
+    formattedMaxAvailableAmount,
+    formattedKeepGasAmount,
+    maxActions,
+    gasPaymentTokenWarningContent,
+  } = useMaxAvailableAmount({
+    fromToken,
+    fromTokenBalance,
+    fromTokenAmount,
+    isLoading: isMaxAmountLoading,
+    feeToken: gasPaymentTokenForMax,
+    feeTokenAmount: gasPaymentTokenAmountForMax,
+    fallbackFeeTokenAmount: fallbackFeeTokenAmountForMax,
+    reserveToken: reserveTokenForMax,
+    isGmxAccount: isFromTokenGmxAccount,
+  });
+
+  const onMaxClick = useCallback(() => {
+    if (maxAvailableAmount > 0n) {
+      setFocusedInput("from");
+      setFromTokenInputValue(formattedMaxAvailableAmount, true);
+    }
+  }, [maxAvailableAmount, formattedMaxAvailableAmount, setFocusedInput, setFromTokenInputValue]);
+
+  const onKeepGasClick = useCallback(() => {
+    if (formattedKeepGasAmount !== undefined) {
+      setFocusedInput("from");
+      setFromTokenInputValue(formattedKeepGasAmount, true);
+    }
+  }, [formattedKeepGasAmount, setFocusedInput, setFromTokenInputValue]);
+
+  const payMaxActionsProps =
+    fromTokenBalance !== undefined && fromTokenBalance > 0n
+      ? { state: maxActions, onMax: onMaxClick, onKeepGas: onKeepGasClick }
+      : undefined;
+
+  useTradeboxAcceptablePriceImpactValues();
+  useTradeboxTPSLReset(priceImpactWarningState.setIsDismissed);
+
+  const prevIsISwap = usePrevious(isSwap);
+
+  useEffect(
+    function updateInputAmounts() {
+      if (!fromToken || !toToken || (!isSwap && !isIncrease)) {
+        return;
+      }
+
+      // reset input values when switching between swap and position tabs
+      if (prevIsISwap !== undefined && isSwap !== prevIsISwap) {
+        setFocusedInput("from");
+
+        setFromTokenInputValue("", true);
+        return;
+      }
+
+      if (isSwap && swapAmounts) {
+        if (focusedInput === "from") {
+          const newToValue = swapAmounts.amountOut > 0 ? formatAmountFree(swapAmounts.amountOut, toToken.decimals) : "";
+          setToTokenInputValue(newToValue, false);
+        } else {
+          const newFromValue =
+            swapAmounts.amountIn > 0 ? formatAmountFree(swapAmounts.amountIn, fromToken.decimals) : "";
+          setFromTokenInputValue(newFromValue, false);
+        }
+      }
+
+      if (isIncrease && increaseAmounts) {
+        const visualMultiplier = BigInt(toToken.visualMultiplier ?? 1);
+        if (focusedInput === "from") {
+          // Skip backfill when increaseAmounts hasn't recalculated yet (prevents slider snap-back)
+          if (increaseAmounts.initialCollateralAmount !== fromTokenAmount) {
+            return;
+          }
+
+          setToTokenInputValue(
+            increaseAmounts.indexTokenAmount > 0
+              ? formatAmountFree(increaseAmounts.indexTokenAmount / visualMultiplier, toToken.decimals)
+              : "",
+            false
+          );
+        } else {
+          setFromTokenInputValue(
+            increaseAmounts.initialCollateralAmount > 0
+              ? formatAmountFree(increaseAmounts.initialCollateralAmount, fromToken.decimals)
+              : "",
+            false
+          );
+        }
+      }
+    },
+    [
+      focusedInput,
+      fromToken,
+      fromTokenAmount,
+      increaseAmounts,
+      isIncrease,
+      isSwap,
+      prevIsISwap,
+      setFocusedInput,
+      setFromTokenInputValue,
+      setToTokenInputValue,
+      swapAmounts,
+      toToken,
+    ]
+  );
+
+  useEffect(
+    function resetTriggerPrice() {
+      setTriggerPriceInputValue("");
+    },
+    [setTriggerPriceInputValue, toTokenAddress, tradeMode]
+  );
+
+  useEffect(
+    function validateLeverageOption() {
+      if (leverageOption && leverageOption > maxAllowedLeverage / BASIS_POINTS_DIVISOR) {
+        setLeverageOption(maxAllowedLeverage / BASIS_POINTS_DIVISOR);
+      }
+    },
+    [leverageOption, maxAllowedLeverage, setLeverageOption]
+  );
+
+  useEffect(
+    function tradeBoxInteractionStartedEffect() {
+      if (fromTokenInputValue.length > 0) {
+        let pair = "";
+
+        if (isSwap) {
+          pair = `${fromToken?.symbol}/${toToken?.symbol}`;
+        } else if (marketInfo) {
+          pair = marketInfo.name;
+        }
+
+        let sizeDeltaUsd: bigint | undefined = undefined;
+        let amountUsd: bigint | undefined = undefined;
+        let priceImpactDeltaUsd = 0n;
+        let priceImpactPercentage = 0n;
+
+        if (isIncrease && increaseAmounts) {
+          sizeDeltaUsd = increaseAmounts.sizeDeltaUsd;
+          priceImpactDeltaUsd = increaseAmounts.positionPriceImpactDeltaUsd;
+          priceImpactPercentage = fees?.increasePositionPriceImpact?.precisePercentage ?? 0n;
+        } else if (isSwap && swapAmounts) {
+          amountUsd = swapAmounts.usdOut;
+          priceImpactDeltaUsd = swapAmounts.swapStrategy.swapPathStats?.totalSwapPriceImpactDeltaUsd ?? 0n;
+          priceImpactPercentage = fees?.swapPriceImpact?.precisePercentage ?? 0n;
+        } else if (isTrigger && decreaseAmounts) {
+          sizeDeltaUsd = decreaseAmounts.sizeDeltaUsd;
+          priceImpactDeltaUsd = decreaseAmounts.totalPendingImpactDeltaUsd;
+          priceImpactPercentage = fees?.totalPendingImpact?.precisePercentage ?? 0n;
+        }
+
+        const openInterestPercent = isLong
+          ? chartHeaderInfo?.longOpenInterestPercentage
+          : chartHeaderInfo?.shortOpenInterestPercentage;
+        const fundingRate1h = isLong ? chartHeaderInfo?.fundingRateLong : chartHeaderInfo?.fundingRateShort;
+
+        if (!pair) {
+          return;
+        }
+
+        sendTradeBoxInteractionStartedEvent({
+          pair,
+          sizeDeltaUsd,
+          priceImpactDeltaUsd,
+          priceImpactPercentage,
+          fundingRate1h,
+          isExpress: expressOrdersEnabled,
+          isExpress1CT: Boolean(subaccount),
+          openInterestPercent,
+          tradeType,
+          tradeMode,
+          amountUsd,
+        });
+      }
+    },
+    [
+      chartHeaderInfo?.fundingRateLong,
+      chartHeaderInfo?.fundingRateShort,
+      chartHeaderInfo?.longOpenInterestPercentage,
+      chartHeaderInfo?.shortOpenInterestPercentage,
+      decreaseAmounts,
+      expressOrdersEnabled,
+      fees?.increasePositionPriceImpact?.precisePercentage,
+      fees?.totalPendingImpact?.precisePercentage,
+      fees?.swapPriceImpact?.precisePercentage,
+      fromToken?.symbol,
+      fromTokenInputValue.length,
+      increaseAmounts,
+      isIncrease,
+      isLong,
+      isSwap,
+      isTrigger,
+      marketInfo,
+      subaccount,
+      swapAmounts,
+      toToken?.symbol,
+      tradeMode,
+      tradeType,
+    ]
+  );
+
+  useEffect(
+    function gasPaymentTokenChangedEffect() {
+      const handleGasPaymentTokenChanged = () => {
+        setFromTokenInputValue("", true);
+      };
+      window.addEventListener("gasPaymentTokenChanged", handleGasPaymentTokenChanged);
+
+      return () => {
+        window.removeEventListener("gasPaymentTokenChanged", handleGasPaymentTokenChanged);
+      };
+    },
+    [setFromTokenInputValue]
+  );
+
+  const onSwitchTokens = useCallback(() => {
+    setFocusedInput((old) => (old === "from" ? "to" : "from"));
+    switchTokenAddresses();
+    setFromTokenInputValue(toTokenInputValue || "", true);
+    setToTokenInputValue(fromTokenInputValue || "", true);
+  }, [
+    fromTokenInputValue,
+    setFocusedInput,
+    setFromTokenInputValue,
+    setToTokenInputValue,
+    switchTokenAddresses,
+    toTokenInputValue,
+  ]);
+
+  const onSelectToTokenAddress = useSelector(selectTradeboxChooseSuitableMarket);
+
+  if (showDebugValues) {
+    const swapPathStats = swapAmounts?.swapStrategy.swapPathStats || increaseAmounts?.swapStrategy.swapPathStats;
+
+    if (swapPathStats) {
+      // eslint-disable-next-line no-console
+      throttleLog("Swap Path", {
+        steps: swapPathStats.swapSteps,
+        path: swapPathStats.swapPath.map((marketAddress) => marketsInfoData?.[marketAddress]?.name).join(" -> "),
+        priceImpact: swapPathStats.swapSteps.map((step) => formatDeltaUsd(step.priceImpactDeltaUsd)).join(" -> "),
+        usdOut: swapPathStats.swapSteps.map((step) => formatUsd(step.usdOut)).join(" -> "),
+      });
+    }
+  }
+
+  const handleFromInputTokenChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      setFocusedInput("from");
+      setFromTokenInputValue(event.target.value, true);
+    },
+    [setFocusedInput, setFromTokenInputValue]
+  );
+  const handleToInputTokenChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      setFocusedInput("to");
+      setToTokenInputValue(event.target.value, true);
+    },
+    [setFocusedInput, setToTokenInputValue]
+  );
+  const handleSelectFromTokenAddress = useCallback(
+    (tokenAddress: string, isGmxAccount: boolean) => {
+      if (isGmxAccount && !expressOrdersEnabled) {
+        setExpressOrdersEnabled(true);
+
+        toastEnableExpress(() => setIsSettingsVisible(true));
+      }
+
+      onSelectFromTokenAddress(tokenAddress);
+      setIsFromTokenGmxAccount(isGmxAccount);
+    },
+    [
+      expressOrdersEnabled,
+      onSelectFromTokenAddress,
+      setExpressOrdersEnabled,
+      setIsFromTokenGmxAccount,
+      setIsSettingsVisible,
+    ]
+  );
+  const handleSelectToTokenAddress = useCallback(
+    (token: Token) => onSelectToTokenAddress(token.address),
+    [onSelectToTokenAddress]
+  );
+  const handleTriggerPriceInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => setTriggerPriceInputValue(e.target.value),
+    [setTriggerPriceInputValue]
+  );
+
+  const setMarkPriceAsTriggerPrice = useCallback(() => {
+    if (markPrice === undefined) {
+      return;
+    }
+
+    setTriggerPriceInputValue(
+      formatAmount(
+        markPrice,
+        USD_DECIMALS,
+        calculateDisplayDecimals(markPrice, undefined, toToken?.visualMultiplier),
+        undefined,
+        undefined,
+        toToken?.visualMultiplier
+      )
+    );
+  }, [markPrice, setTriggerPriceInputValue, toToken?.visualMultiplier]);
+
+  const handleTriggerMarkPriceClick = useCallback(
+    () => setTriggerRatioInputValue(formatAmount(markRatio?.ratio, USD_DECIMALS, 10)),
+    [markRatio?.ratio, setTriggerRatioInputValue]
+  );
+  const handleTriggerRatioInputChange = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      setTriggerRatioInputValue(e.target.value);
+    },
+    [setTriggerRatioInputValue]
+  );
+
+  const handleSelectMarket = useCallback(
+    (indexName: string, marketInfo: MarketInfo) => onSelectToTokenAddress(marketInfo.indexToken.address),
+    [onSelectToTokenAddress]
+  );
+
+  const handleFormSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!isCursorInside && (!submitButtonState.disabled || shouldDisableValidation)) {
+        wrappedOnSubmit();
+      }
+    },
+    [isCursorInside, wrappedOnSubmit, submitButtonState, shouldDisableValidation]
+  );
+
+  const payUsd = isIncrease ? increaseAmounts?.initialCollateralUsd : fromUsd;
+
+  function renderTokenInputs() {
+    return (
+      <>
+        <BuyInputSection
+          topLeftLabel={t`Pay`}
+          bottomLeftValue={payUsd !== undefined ? <UsdValue usd={payUsd} roundMode="floor" /> : ""}
+          bottomRightValue={
+            fromToken && fromToken.balance !== undefined && fromToken.balance > 0n ? (
+              <>
+                {formatBalanceAmount(fromToken.balance, fromToken.decimals, undefined, {
+                  isStable: fromToken.isStable,
+                })}{" "}
+                <span className="text-typography-secondary">{fromToken.symbol}</span>
+              </>
+            ) : undefined
+          }
+          inputValue={fromTokenInputValue}
+          onInputValueChange={handleFromInputTokenChange}
+          maxActions={payMaxActionsProps}
+          qa="pay"
+          maxDecimals={fromToken?.decimals}
+          placeholder={TRADEBOX_INPUT_PLACEHOLDER}
+        >
+          {fromTokenAddress &&
+            (!isSettlementChain(chainId) ? (
+              <TokenSelector
+                label={t`Pay`}
+                chainId={chainId}
+                tokenAddress={fromTokenAddress}
+                onSelectToken={(token) => {
+                  handleSelectFromTokenAddress(token.address, false);
+                }}
+                tokens={swapTokens}
+                infoTokens={infoTokens}
+                showSymbolImage={true}
+                showTokenImgInDropdown={true}
+                missedCoinsPlace={MissedCoinsPlace.payToken}
+                extendedSortSequence={sortedLongAndShortTokens}
+                qa="collateral-selector"
+              />
+            ) : (
+              <MultichainTokenSelector
+                isConnected={active}
+                openConnectModal={openConnectModal}
+                walletIconUrls={walletIconUrls}
+                chainId={chainId}
+                srcChainId={srcChainId}
+                label={t`Pay`}
+                tokenAddress={fromTokenAddress}
+                payChainId={isFromTokenGmxAccount ? GMX_ACCOUNT_PSEUDO_CHAIN_ID : undefined}
+                onSelectTokenAddress={handleSelectFromTokenAddress}
+                extendedSortSequence={sortedLongAndShortTokens}
+                qa="collateral-selector"
+                tokensData={tokensData}
+                multichainTokens={multichainTokens}
+              />
+            ))}
+        </BuyInputSection>
+
+        {isSwap && (
+          <>
+            <div className="relative">
+              {!isTwap && (
+                <button
+                  type="button"
+                  disabled={!isSwitchTokensAllowed}
+                  className={cx(
+                    `absolute -top-19 left-1/2 flex size-36 -translate-x-1/2 cursor-pointer
+                    items-center justify-center rounded-full bg-slate-600 text-typography-secondary`,
+                    {
+                      "hover:bg-[var(--color-fill-surfaceHover)] hover:bg-[linear-gradient(0deg,var(--color-slate-600),var(--color-slate-600))] hover:bg-blend-overlay":
+                        isSwitchTokensAllowed,
+                    }
+                  )}
+                  onClick={onSwitchTokens}
+                  data-qa="swap-ball"
+                >
+                  <ArrowDownIcon className="block" />
+                </button>
+              )}
+              <BuyInputSection
+                topLeftLabel={isTwap ? t`Receive (approximate)` : t`Receive`}
+                bottomLeftValue={
+                  !isTwap && swapAmounts?.usdOut !== undefined ? (
+                    <UsdValue usd={focusedInput === "from" ? swapAmounts.usdOut : toUsd} />
+                  ) : undefined
+                }
+                bottomRightValue={
+                  !isTwap && toToken && toTokenBalance !== undefined && toTokenBalance > 0n ? (
+                    <span className="inline-flex items-center">
+                      {isFromTokenGmxAccount && (
+                        <TokenIcon
+                          symbol={toToken.symbol}
+                          displaySize={14}
+                          chainIdBadge={GMX_ACCOUNT_PSEUDO_CHAIN_ID}
+                          className="mr-4"
+                        />
+                      )}
+                      {formatBalanceAmount(toTokenBalance, toToken.decimals, toToken.symbol, {
+                        isStable: toToken.isStable,
+                      })}
+                    </span>
+                  ) : undefined
+                }
+                inputValue={toTokenInputValue}
+                onInputValueChange={handleToInputTokenChange}
+                qa="swap-receive"
+                isDisabled={isTwap}
+                maxDecimals={toToken?.decimals}
+                placeholder={TRADEBOX_INPUT_PLACEHOLDER}
+              >
+                {toTokenAddress && (
+                  <TokenSelector
+                    label={t`Receive`}
+                    chainId={chainId}
+                    tokenAddress={toTokenAddress}
+                    onSelectToken={handleSelectToTokenAddress}
+                    tokens={swapTokens}
+                    infoTokens={infoTokens}
+                    showSymbolImage={true}
+                    showBalances={true}
+                    showTokenImgInDropdown={true}
+                    extendedSortSequence={sortedLongAndShortTokens}
+                    chainIdBadge={isFromTokenGmxAccount ? GMX_ACCOUNT_PSEUDO_CHAIN_ID : undefined}
+                    qa="receive-selector"
+                  />
+                )}
+              </BuyInputSection>
+            </div>
+          </>
+        )}
+
+        {isIncrease && (
+          <BuyInputSection
+            topLeftLabel={localizedTradeTypeLabels[tradeType!]}
+            bottomLeftValue={
+              increaseAmounts?.sizeDeltaUsd !== undefined ? (
+                <UsdValue usd={increaseAmounts?.sizeDeltaUsd} fallbackToZero />
+              ) : (
+                ""
+              )
+            }
+            bottomRightLabel={t`Leverage`}
+            bottomRightValue={
+              <LeverageValue
+                leverage={isLeverageSliderEnabled ? leverage : increaseAmounts?.estimatedLeverage}
+                fallback="-"
+              />
+            }
+            inputValue={toTokenInputValue}
+            onInputValueChange={handleToInputTokenChange}
+            qa="buy"
+            maxDecimals={toToken?.decimals}
+            placeholder={TRADEBOX_INPUT_PLACEHOLDER}
+          >
+            {toTokenAddress && (
+              <MarketSelector
+                chainId={chainId}
+                label={localizedTradeTypeLabels[tradeType!]}
+                selectedIndexName={toToken ? getMarketIndexName({ indexToken: toToken, isSpotOnly: false }) : undefined}
+                selectedMarketLabel={
+                  toToken && (
+                    <div className="flex items-center">
+                      <TokenIcon className="mr-4" symbol={toToken.symbol} displaySize={20} />
+                      <span>{getMarketIndexName({ indexToken: toToken, isSpotOnly: false })}</span>
+                    </div>
+                  )
+                }
+                markets={sortedAllMarkets ?? EMPTY_ARRAY}
+                isSideMenu
+                missedCoinsPlace={MissedCoinsPlace.marketDropdown}
+                onSelectMarket={(_indexName, marketInfo) => onSelectToTokenAddress(marketInfo.indexToken.address)}
+              />
+            )}
+          </BuyInputSection>
+        )}
+      </>
+    );
+  }
+
+  function renderDecreaseSizeInput() {
+    const closeDisplayMode: DisplayMode = closeSizeHook.showSizeInTokens ? "token" : "usd";
+    const handleCloseDisplayModeChange = (mode: DisplayMode) => {
+      if ((mode === "token") !== closeSizeHook.showSizeInTokens) {
+        closeSizeHook.handleSizeToggle();
+      }
+    };
+
+    const closeAlternateValue = (() => {
+      if (closeDisplayMode === "token") {
+        return <UsdValue usd={closeSizeHook.closeSizeUsd} />;
+      }
+      if (!selectedPosition || !toToken || selectedPosition.sizeInUsd === 0n) {
+        return "0";
+      }
+      const closeSizeInTokens =
+        (closeSizeHook.closeSizeUsd * selectedPosition.sizeInTokens) / selectedPosition.sizeInUsd;
+      const visualMultiplier = BigInt(toToken.visualMultiplier ?? 1);
+      return formatTokenAmount(closeSizeInTokens / visualMultiplier, toToken.decimals, toToken.symbol);
+    })();
+
+    return (
+      <>
+        <TradeInputField
+          label={t`Close`}
+          inputValue={closeSizeHook.closeSizeInput}
+          onInputValueChange={closeSizeHook.handleInputChange}
+          displayMode={closeDisplayMode}
+          onDisplayModeChange={handleCloseDisplayModeChange}
+          tokenSymbol={toToken?.symbol}
+          alternateValue={closeAlternateValue}
+          rightHeadline={
+            selectedPosition?.sizeInUsd ? (
+              <button
+                type="button"
+                className="flex items-center gap-4 text-typography-secondary hover:text-typography-primary"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeSizeHook.setMaxCloseSize();
+                }}
+              >
+                {t`Max:`} <span className="numbers">{closeSizeHook.formattedMaxCloseSize}</span>
+              </button>
+            ) : undefined
+          }
+          qa="close"
+          maxDecimals={closeSizeHook.showSizeInTokens ? toToken?.decimals ?? 18 : USD_DECIMALS}
+        />
+        {selectedPosition && selectedPosition.sizeInUsd > 0n && (
+          <MarginPercentageSlider value={closeSizeHook.closePercentage} onChange={closeSizeHook.handleSliderChange} />
+        )}
+      </>
+    );
+  }
+
+  function renderTriggerPriceInput() {
+    const priceLabel = isLimit ? (tradeMode === TradeMode.Limit ? t`Limit price` : t`Stop price`) : t`Trigger price`;
+
+    return (
+      <BuyInputSection
+        topLeftLabel={priceLabel}
+        topRightLabel={t`Mark`}
+        topRightValue={<UsdPriceValue price={markPrice} visualMultiplier={toToken?.visualMultiplier} />}
+        onClickTopRightLabel={setMarkPriceAsTriggerPrice}
+        inputValue={triggerPriceInputValue}
+        onInputValueChange={handleTriggerPriceInputChange}
+        qa="trigger-price"
+        maxDecimals={USD_DECIMALS}
+        placeholder={TRADEBOX_INPUT_PLACEHOLDER}
+      >
+        {t`USD`}
+      </BuyInputSection>
+    );
+  }
+
+  function renderTriggerRatioInput() {
+    return (
+      <BuyInputSection
+        topLeftLabel={t`Limit price`}
+        topRightLabel={t`Mark`}
+        topRightValue={formatAmount(markRatio?.ratio, USD_DECIMALS, 4)}
+        onClickTopRightLabel={handleTriggerMarkPriceClick}
+        inputValue={triggerRatioInputValue}
+        onInputValueChange={handleTriggerRatioInputChange}
+        qa="trigger-price"
+        maxDecimals={USD_DECIMALS}
+        placeholder={TRADEBOX_INPUT_PLACEHOLDER}
+      >
+        {markRatio && (
+          <>
+            <TokenWithIcon symbol={markRatio.smallestToken.symbol} displaySize={20} /> <Trans>per</Trans>{" "}
+            <TokenWithIcon symbol={markRatio.largestToken.symbol} displaySize={20} />
+          </>
+        )}
+      </BuyInputSection>
+    );
+  }
+
+  useKey(
+    "Enter",
+    () => {
+      if (isCursorInside && (!submitButtonState.disabled || shouldDisableValidation)) {
+        wrappedOnSubmit();
+      }
+    },
+    {},
+    [submitButtonState.disabled, shouldDisableValidation, isCursorInside, wrappedOnSubmit]
+  );
+
+  const buttonContent = (
+    <Button
+      qa="confirm-trade-button"
+      variant="primary-action"
+      className="w-full [text-decoration:inherit]"
+      onClick={wrappedOnSubmit}
+      disabled={submitButtonState.disabled && !shouldDisableValidation}
+    >
+      {submitButtonState.text}
+    </Button>
+  );
+  const button = submitButtonState.tooltipContent ? (
+    <Tooltip
+      className="w-full"
+      content={submitButtonState.tooltipContent}
+      handle={buttonContent}
+      isHandlerDisabled={submitButtonState.disabled && !shouldDisableValidation}
+      handleClassName="w-full"
+      position="bottom"
+      variant="none"
+      contentClassName="w-full"
+    />
+  ) : (
+    buttonContent
+  );
+
+  let nextLiqPriceFormatted = useMemo(() => {
+    if (isTrigger && decreaseAmounts?.isFullClose) {
+      return "-";
+    }
+
+    if (isIncrease && (increaseAmounts === undefined || increaseAmounts.sizeDeltaUsd === 0n)) {
+      if (existingPositionForPreview) {
+        return undefined;
+      } else {
+        return "-";
+      }
+    }
+
+    return formatLiquidationPriceParts(nextPositionValues?.nextLiqPrice, {
+      visualMultiplier: toToken?.visualMultiplier,
+    });
+  }, [
+    isTrigger,
+    decreaseAmounts?.isFullClose,
+    isIncrease,
+    increaseAmounts,
+    nextPositionValues?.nextLiqPrice,
+    toToken?.visualMultiplier,
+    existingPositionForPreview,
+  ]);
+
+  const keepLeverage = useSelector(selectTradeboxKeepLeverage);
+  const keepLeverageChecked = decreaseAmounts?.isFullClose ? false : keepLeverage ?? false;
+  const setKeepLeverage = useSelector(selectTradeboxSetKeepLeverage);
+
+  const tabsOptions = useMemo(() => {
+    const modeToOptions = (mode: TradeMode) => ({
+      value: mode,
+      label: localizedTradeModeLabels[mode],
+    });
+
+    return availableTradeModes.map((mode) =>
+      Array.isArray(mode)
+        ? {
+            label: t`More`,
+            options: mode.map(modeToOptions),
+          }
+        : modeToOptions(mode as TradeMode)
+    );
+  }, [availableTradeModes, localizedTradeModeLabels]);
+
+  const collateralWarnings = useCollateralWarnings();
+
+  const [twapRecommendationDismissed, setTwapRecommendationDismissed] = useState(false);
+
+  return (
+    <form className="flex flex-col gap-8" onSubmit={handleFormSubmit} ref={formRef}>
+      <div className="flex flex-col gap-12 rounded-b-8 bg-slate-900 pb-16">
+        <div className="flex items-center justify-between">
+          <Tabs
+            options={tabsOptions}
+            selectedValue={tradeMode}
+            onChange={onSelectTradeMode}
+            qa="trade-mode"
+            className="w-full px-12"
+            rightContent={<TradeInfoIcon isMobile={isMobile} tradeType={tradeType} tradePlace="tradebox" />}
+            regularOptionClassname="!px-0"
+            tabsWrapperClassName="gap-12"
+          />
+        </div>
+        <div className="flex flex-col gap-12 px-12">
+          <div className="text-body-medium flex grow flex-col gap-14">
+            <div className="flex flex-col gap-4">
+              {isSwap && renderTokenInputs()}
+              {isIncrease && (
+                <TradeboxMarginFields
+                  onSelectFromTokenAddress={handleSelectFromTokenAddress}
+                  fromTokenInputValue={fromTokenInputValue}
+                  setFromTokenInputValue={setFromTokenInputValue}
+                  setFocusedInput={setFocusedInput}
+                  toTokenInputValue={toTokenInputValue}
+                  setToTokenInputValue={setToTokenInputValue}
+                  triggerPriceInputValue={triggerPriceInputValue}
+                  onTriggerPriceInputChange={handleTriggerPriceInputChange}
+                  maxAvailableAmount={maxAvailableAmount}
+                  maxActions={maxActions}
+                  onKeepGasClick={onKeepGasClick}
+                  onMarkPriceClick={setMarkPriceAsTriggerPrice}
+                />
+              )}
+              {isTrigger && renderDecreaseSizeInput()}
+              {isSwap && isLimit && renderTriggerRatioInput()}
+              {isTrigger && renderTriggerPriceInput()}
+            </div>
+
+            {isTrigger && (
+              <SyntheticsInfoRow
+                label={t`Market`}
+                value={
+                  <MarketSelector
+                    chainId={chainId}
+                    label={t`Market`}
+                    selectedIndexName={
+                      toToken ? getMarketIndexName({ indexToken: toToken, isSpotOnly: false }) : undefined
+                    }
+                    markets={sortedAllMarkets ?? EMPTY_ARRAY}
+                    isSideMenu
+                    onSelectMarket={handleSelectMarket}
+                  />
+                }
+              />
+            )}
+
+            {isPosition ? (
+              <>
+                <TradeboxPoolWarnings />
+
+                {collateralWarnings}
+              </>
+            ) : null}
+
+            {isTwap && (
+              <TwapRows
+                duration={duration}
+                numberOfParts={numberOfParts}
+                setNumberOfParts={setNumberOfParts}
+                setDuration={setDuration}
+                sizeUsd={isSwap ? payUsd : increaseAmounts?.sizeDeltaUsd}
+                marketInfo={marketInfo}
+                type={isSwap ? "swap" : "increase"}
+                isLong={isLong}
+              />
+            )}
+          </div>
+        </div>
+        <div className="flex flex-col gap-14 px-12 pt-12">
+          {isPosition && isTrigger && selectedPosition && selectedPosition?.leverage !== undefined && (
+            <ToggleSwitch
+              isChecked={keepLeverageChecked}
+              setIsChecked={setKeepLeverage}
+              disabled={decreaseAmounts?.isFullClose}
+            >
+              <span className="text-14 text-typography-secondary">
+                <Trans>Keep leverage at {formatLeverage(selectedPosition.leverage)}</Trans>
+              </span>
+            </ToggleSwitch>
+          )}
+
+          {!isTrigger && !isSwap && !isTwap && <TPSLGroup />}
+          {maxAutoCancelOrdersWarning}
+
+          {priceImpactWarningState.shouldShowWarning && (
+            <HighPriceImpactOrFeesWarningCard
+              priceImpactWarningState={priceImpactWarningState}
+              swapPriceImpact={fees?.swapPriceImpact}
+              swapProfitFee={fees?.swapProfitFee}
+              executionFeeUsd={executionFee?.feeUsd}
+              externalSwapFeeItem={fees?.externalSwapFee}
+              maxNegativeImpactBps={marketInfo ? getMaxNegativeImpactBps(marketInfo) : undefined}
+            />
+          )}
+
+          {submitButtonState.bannerErrorContent && (
+            <AlertInfoCard type="error" hideClose>
+              {submitButtonState.bannerErrorContent}
+            </AlertInfoCard>
+          )}
+
+          <ExpressTradingWarningCard
+            expressParams={submitButtonState.expressParams}
+            payTokenAddress={!tradeFlags.isTrigger ? fromTokenAddress : undefined}
+            isWrapOrUnwrap={!tradeFlags.isTrigger && isWrapOrUnwrap}
+            disabled={shouldShowDepositButton}
+            isGmxAccount={isFromTokenGmxAccount}
+            showExternalSwapWarnings={tradeFlags.isSwap || tradeFlags.isIncrease}
+          />
+          {twapRecommendation && !twapRecommendationDismissed && (
+            <AlertInfoCard onClose={() => setTwapRecommendationDismissed(true)}>
+              <span>
+                <span
+                  className="cursor-pointer font-medium text-blue-300"
+                  onClick={() => onSelectTradeMode(TradeMode.Twap)}
+                >
+                  <Trans>Use a TWAP order</Trans>
+                </span>{" "}
+                <Trans> for lower net price impact</Trans>
+              </span>
+            </AlertInfoCard>
+          )}
+          {isSwap && isLimit && !isTwap && !limitPriceWarningHidden && (
+            <AlertInfoCard onClose={() => setLimitPriceWarningHidden(true)}>
+              <Trans>
+                Execution price may differ from limit price due to fees and price impact. You'll receive at least the
+                minimum amount shown.{" "}
+                <ExternalLink href="https://docs.gmx.io/docs/trading/order-types/#limit-orders" newTab>
+                  Read more
+                </ExternalLink>
+                .
+              </Trans>
+            </AlertInfoCard>
+          )}
+          {increaseMaxLeverageAlert && <ResultingMarginAlertCard level={increaseMaxLeverageAlert} />}
+          {!marginDepositSuggestionHidden && (
+            <MarginDepositSuggestionCard onClose={() => setMarginDepositSuggestionHidden(true)} />
+          )}
+          {showIncreaseLiquidationRiskWarning && (
+            <LiquidatableIncreaseWarningCard positionKey={selectedPosition?.key} />
+          )}
+          {showIncreaseFreshPositionWarning && <FreshPositionIncreaseWarningCard />}
+          {gasPaymentTokenWarningContent && (
+            <AlertInfoCard hideClose type="warning">
+              {gasPaymentTokenWarningContent}
+            </AlertInfoCard>
+          )}
+          {showOffHoursWarning && (
+            <AlertInfoCard hideClose type="warning">
+              <div className="flex flex-col gap-8">
+                <div>
+                  <Trans>
+                    Off-hours risk: when this market moves to off-hours mode, this position may be close to liquidation.
+                    Consider lowering leverage or adding margin.
+                  </Trans>
+                </div>
+                <div>
+                  <Trans>Off-hours: daily 20:45–22:15 UTC (weekends Fri 20:45 → Sun 22:15 UTC).</Trans>
+                </div>
+                <ExternalLink href={OFF_HOURS_DOCS_URL} newTab>
+                  <Trans>Read more</Trans>
+                </ExternalLink>
+              </div>
+            </AlertInfoCard>
+          )}
+
+          <div>{button}</div>
+        </div>
+      </div>
+
+      <div className={cx("flex flex-col gap-14 rounded-8 bg-slate-900", isTwap ? "p-4" : "p-12 pb-16")}>
+        {isSwap && !isTwap && <MinReceiveRow allowedSlippage={allowedSlippage} />}
+        {isTrigger && selectedPosition && decreaseAmounts?.receiveUsd !== undefined && (
+          <SyntheticsInfoRow
+            label={t`Receive`}
+            value={
+              <NumericValue
+                parts={formatTokenAmountWithUsdParts(
+                  decreaseAmounts.receiveTokenAmount,
+                  decreaseAmounts.receiveUsd,
+                  collateralToken?.symbol,
+                  collateralToken?.decimals
+                )}
+              />
+            }
+            valueClassName="numbers"
+          />
+        )}
+
+        {isTrigger && (
+          <SyntheticsInfoRow
+            label={t`PnL`}
+            value={
+              <ValueTransition
+                from={numberParts(
+                  formatDeltaUsdParts(decreaseAmounts?.estimatedPnl),
+                  " (",
+                  formatPercentage(decreaseAmounts?.estimatedPnlPercentage, { signed: true }),
+                  ")"
+                )}
+                to={
+                  decreaseAmounts?.sizeDeltaUsd && decreaseAmounts.sizeDeltaUsd > 0
+                    ? numberParts(
+                        formatDeltaUsdParts(nextPositionValues?.nextPnl),
+                        " (",
+                        formatPercentage(nextPositionValues?.nextPnlPercentage, { signed: true }),
+                        ")"
+                      )
+                    : undefined
+                }
+              />
+            }
+          />
+        )}
+        {!(isTrigger && !selectedPosition) && !isSwap && !isTwap && (
+          <SyntheticsInfoRow
+            label={t`Liquidation price`}
+            value={
+              <ValueTransition
+                from={
+                  existingPositionForPreview
+                    ? formatLiquidationPriceParts(existingPositionForPreview.liquidationPrice, {
+                        visualMultiplier: toToken?.visualMultiplier,
+                      })
+                    : undefined
+                }
+                to={nextLiqPriceFormatted}
+              />
+            }
+          />
+        )}
+        {!isTwap && <PriceImpactFeesRow />}
+        <TradeBoxAdvancedGroups
+          slippageInputId={submitButtonState.slippageInputId}
+          gasPaymentParams={getNetworkFeeGasPaymentParams({
+            expressParams: submitButtonState.expressParams,
+            tokensData,
+          })}
+          totalExecutionFee={submitButtonState.totalExecutionFee}
+          feeSource={getNetworkFeeSource({ isGmxAccount: isFromTokenGmxAccount })}
+        />
+      </div>
+    </form>
+  );
+}

@@ -1,0 +1,383 @@
+import { Trans } from "@lingui/macro";
+import { useEffect, useMemo, useState } from "react";
+
+import { getServerUrl } from "config/backend";
+import { ARBITRUM, AVALANCHE, MEGAETH } from "config/chains";
+import { USD_DECIMALS } from "config/factors";
+import { useGmxPrice, useTotalGmxStaked } from "domain/legacy";
+import { useProtocolStatsFeesInfo } from "domain/protocolStats/useProtocolStatsFeesInfo";
+import {
+  getProtocolStatsNetworkFreshness,
+  useProtocolStatsSummary,
+} from "domain/protocolStats/useProtocolStatsSummary";
+import { parseProtocolStatsUsd } from "domain/protocolStats/utils";
+import { useV1FeesInfo, useVolumeInfo } from "domain/stats";
+import { usePositionsTotalMargin } from "domain/synthetics/positions/usePositionsTotalMargin";
+import useV2Stats from "domain/synthetics/stats/useV2Stats";
+import { useChainId } from "lib/chains";
+import { arrayURLFetcher } from "lib/fetcher";
+import { GLP_DECIMALS, GMX_DECIMALS } from "lib/legacy";
+import { expandDecimals } from "lib/numbers";
+import { sumKnownBigInts } from "lib/sumBigInts";
+import { mergeFreshness, useSWRWithFreshness } from "lib/useSWRWithFreshness";
+import useWallet from "lib/wallets/useWallet";
+import { bigMath } from "sdk/utils/bigmath";
+
+import { AppCard, AppCardSection, AppCardSplit } from "components/AppCard/AppCard";
+import ChainsStatsTooltip from "components/StatsTooltip/ChainsStatsTooltip";
+import { getStaleEntries } from "components/StatsTooltip/summarizeChainsStats";
+
+import { ACTIVE_CHAIN_IDS } from "./DashboardV2";
+import { getFormattedFeesDuration } from "./getFormattedFeesDuration";
+import { getPositionStats } from "./getPositionStats";
+import type { ChainStats } from "./useDashboardChainStatsMulticall";
+
+const SOLANA_ENTRY = "Solana";
+
+export function OverviewCard({
+  statsArbitrum,
+  statsAvalanche,
+}: {
+  statsArbitrum?: ChainStats;
+  statsAvalanche?: ChainStats;
+}) {
+  const { active, signer } = useWallet();
+  const { chainId } = useChainId();
+
+  const v2ArbitrumOverview = useV2Stats(ARBITRUM);
+  const v2AvalancheOverview = useV2Stats(AVALANCHE);
+  const v2MegaethOverview = useV2Stats(MEGAETH);
+  const gmtradeSummary = useProtocolStatsSummary({ networks: ["solana"] });
+  const gmtradeOverview = gmtradeSummary.data?.byNetwork.solana;
+  const gmtradeFreshness = getProtocolStatsNetworkFreshness(gmtradeSummary, "solana");
+  const gmtradeStaleEntries = getStaleEntries([gmtradeFreshness, SOLANA_ENTRY]);
+  const gmtradeFees = useProtocolStatsFeesInfo({ networks: ["solana"] });
+  const feesStaleEntries = getStaleEntries([mergeFreshness(gmtradeFreshness, gmtradeFees.freshness), SOLANA_ENTRY]);
+
+  const positionStats = useSWRWithFreshness(
+    ACTIVE_CHAIN_IDS.map((chainId) => getServerUrl(chainId, "/position_stats")),
+    arrayURLFetcher
+  );
+  const positionStatsInfo = getPositionStats(positionStats.data);
+  const positionsStaleEntries = getStaleEntries(
+    [positionStats.freshness, "Arbitrum", "Avalanche"],
+    [gmtradeFreshness, SOLANA_ENTRY]
+  );
+
+  const v1ArbitrumFees = useV1FeesInfo(ARBITRUM);
+  const v1AvalancheFees = useV1FeesInfo(AVALANCHE);
+
+  const { gmxPrice } = useGmxPrice(chainId, { arbitrum: chainId === ARBITRUM ? signer : undefined }, active);
+
+  let { [AVALANCHE]: stakedGmxAvalanche, [ARBITRUM]: stakedGmxArbitrum } = useTotalGmxStaked();
+
+  const arbitrumPositionsMarginUsd = usePositionsTotalMargin(ARBITRUM);
+  const avalanchePositionsMarginUsd = usePositionsTotalMargin(AVALANCHE);
+  const megaethPositionsMarginUsd = usePositionsTotalMargin(MEGAETH);
+
+  // #region TVL and GLP Pool
+  const glpTvlArbitrum = statsArbitrum?.glp.aum;
+  const glpTvlAvalanche = statsAvalanche?.glp.aum;
+
+  const glpSupplyArbitrum = statsArbitrum?.reader?.tokenBalancesWithSupplies?.glpSupply;
+  const glpSupplyAvalanche = statsAvalanche?.reader?.tokenBalancesWithSupplies?.glpSupply;
+
+  const glpPriceArbitrum =
+    glpTvlArbitrum !== undefined && glpTvlArbitrum > 0n && glpSupplyArbitrum !== undefined
+      ? bigMath.mulDiv(glpTvlArbitrum, expandDecimals(1, GLP_DECIMALS), glpSupplyArbitrum)
+      : expandDecimals(1, USD_DECIMALS);
+
+  const glpPriceAvalanche =
+    glpTvlAvalanche !== undefined && glpTvlAvalanche > 0n && glpSupplyAvalanche !== undefined
+      ? bigMath.mulDiv(glpTvlAvalanche, expandDecimals(1, GLP_DECIMALS), glpSupplyAvalanche)
+      : expandDecimals(1, USD_DECIMALS);
+
+  const glpMarketCapArbitrum =
+    glpSupplyArbitrum !== undefined
+      ? bigMath.mulDiv(glpPriceArbitrum, glpSupplyArbitrum, expandDecimals(1, GLP_DECIMALS))
+      : undefined;
+
+  const glpMarketCapAvalanche =
+    glpSupplyAvalanche !== undefined
+      ? bigMath.mulDiv(glpPriceAvalanche, glpSupplyAvalanche, expandDecimals(1, GLP_DECIMALS))
+      : undefined;
+
+  const gmTvlArbitrum = v2ArbitrumOverview.totalGMLiquidity;
+  const gmTvlAvalanche = v2AvalancheOverview.totalGMLiquidity;
+  const gmTvlMegaeth = v2MegaethOverview.totalGMLiquidity;
+  const gmTvlGmtrade = parseProtocolStatsUsd(gmtradeOverview?.tvl?.pools);
+  // the store carries position collateral the way the EVM figures do, which the pool value on its own leaves out
+  const displayTvlGmtrade = parseProtocolStatsUsd(gmtradeOverview?.tvl?.store) ?? gmTvlGmtrade;
+
+  const getStakedGmxUsd = (stakedGmx: bigint | undefined) =>
+    gmxPrice !== undefined && stakedGmx !== undefined
+      ? bigMath.mulDiv(gmxPrice, stakedGmx, expandDecimals(1, GMX_DECIMALS))
+      : undefined;
+
+  // GMX staked + GLP pools + GM pools + position collateral, each network from its own inputs only
+  const displayTvlArbitrum = sumKnownBigInts(
+    getStakedGmxUsd(stakedGmxArbitrum),
+    glpMarketCapArbitrum,
+    gmTvlArbitrum,
+    arbitrumPositionsMarginUsd
+  );
+  const displayTvlAvalanche = sumKnownBigInts(
+    getStakedGmxUsd(stakedGmxAvalanche),
+    glpMarketCapAvalanche,
+    gmTvlAvalanche,
+    avalanchePositionsMarginUsd
+  );
+  const displayTvlMegaeth = sumKnownBigInts(gmTvlMegaeth, megaethPositionsMarginUsd);
+
+  // #endregion TVL and GLP Pool
+
+  // #region Daily Volume
+  const v1DailyVolumeInfo = useVolumeInfo();
+  const v1ArbitrumDailyVolume = v1DailyVolumeInfo?.[ARBITRUM];
+  const v1AvalancheDailyVolume = v1DailyVolumeInfo?.[AVALANCHE];
+
+  const gmtradeDailyVolume = parseProtocolStatsUsd(gmtradeOverview?.volume24h?.total);
+
+  // #endregion Daily Volume
+
+  // #region Open Interest
+  const v1ArbitrumOpenInterest = positionStatsInfo?.[ARBITRUM]?.openInterest;
+  const v1AvalancheOpenInterest = positionStatsInfo?.[AVALANCHE]?.openInterest;
+  const v2ArbitrumOpenInterest = v2ArbitrumOverview.openInterest;
+  const v2AvalancheOpenInterest = v2AvalancheOverview.openInterest;
+  const v2MegaethOpenInterest = v2MegaethOverview.openInterest;
+  const gmtradeOpenInterest = parseProtocolStatsUsd(gmtradeOverview?.openInterest?.total);
+
+  // #endregion Open Interest
+
+  // #region Long Position Sizes
+  const v1ArbitrumLongPositionSizes = positionStatsInfo?.[ARBITRUM]?.totalLongPositionSizes;
+  const v1AvalancheLongPositionSizes = positionStatsInfo?.[AVALANCHE]?.totalLongPositionSizes;
+
+  const v2ArbitrumLongPositionSizes = v2ArbitrumOverview.totalLongPositionSizes;
+  const v2AvalancheLongPositionSizes = v2AvalancheOverview.totalLongPositionSizes;
+  const v2MegaethLongPositionSizes = v2MegaethOverview.totalLongPositionSizes;
+  const gmtradeLongPositionSizes = parseProtocolStatsUsd(gmtradeOverview?.openInterest?.long);
+
+  // #endregion Long Position Sizes
+
+  // #region Short Position Sizes
+  const v1ArbitrumShortPositionSizes = positionStatsInfo?.[ARBITRUM]?.totalShortPositionSizes;
+  const v1AvalancheShortPositionSizes = positionStatsInfo?.[AVALANCHE]?.totalShortPositionSizes;
+
+  const v2ArbitrumShortPositionSizes = v2ArbitrumOverview.totalShortPositionSizes;
+  const v2AvalancheShortPositionSizes = v2AvalancheOverview.totalShortPositionSizes;
+  const v2MegaethShortPositionSizes = v2MegaethOverview.totalShortPositionSizes;
+  const gmtradeShortPositionSizes = parseProtocolStatsUsd(gmtradeOverview?.openInterest?.short);
+
+  // #endregion Short Position Sizes
+
+  // #region Fees
+  const v1ArbitrumEpochFees = v1ArbitrumFees?.epochFees;
+  const v1AvalancheEpochFees = v1AvalancheFees?.epochFees;
+
+  const v2ArbitrumEpochFees = v2ArbitrumOverview?.epochFees;
+  const v2AvalancheEpochFees = v2AvalancheOverview?.epochFees;
+  const v2MegaethEpochFees = v2MegaethOverview?.epochFees;
+  const gmtradeEpochFees = gmtradeFees.data?.epochFees;
+
+  // #endregion Fees
+
+  const dailyVolumeEntries = useMemo(
+    () => ({
+      Arbitrum: sumKnownBigInts(v2ArbitrumOverview?.dailyVolume, v1ArbitrumDailyVolume),
+      Avalanche: sumKnownBigInts(v2AvalancheOverview?.dailyVolume, v1AvalancheDailyVolume),
+      MegaETH: v2MegaethOverview?.dailyVolume,
+      [SOLANA_ENTRY]: gmtradeDailyVolume,
+    }),
+    [
+      gmtradeDailyVolume,
+      v1ArbitrumDailyVolume,
+      v1AvalancheDailyVolume,
+      v2ArbitrumOverview?.dailyVolume,
+      v2AvalancheOverview?.dailyVolume,
+      v2MegaethOverview?.dailyVolume,
+    ]
+  );
+
+  const openInterestEntries = useMemo(
+    () => ({
+      Arbitrum: sumKnownBigInts(v2ArbitrumOpenInterest, v1ArbitrumOpenInterest),
+      Avalanche: sumKnownBigInts(v2AvalancheOpenInterest, v1AvalancheOpenInterest),
+      MegaETH: v2MegaethOpenInterest,
+      [SOLANA_ENTRY]: gmtradeOpenInterest,
+    }),
+    [
+      v1ArbitrumOpenInterest,
+      v1AvalancheOpenInterest,
+      v2ArbitrumOpenInterest,
+      v2AvalancheOpenInterest,
+      v2MegaethOpenInterest,
+      gmtradeOpenInterest,
+    ]
+  );
+
+  const totalLongPositionSizesEntries = useMemo(
+    () => ({
+      Arbitrum: sumKnownBigInts(v2ArbitrumLongPositionSizes, v1ArbitrumLongPositionSizes),
+      Avalanche: sumKnownBigInts(v2AvalancheLongPositionSizes, v1AvalancheLongPositionSizes),
+      MegaETH: v2MegaethLongPositionSizes,
+      [SOLANA_ENTRY]: gmtradeLongPositionSizes,
+    }),
+    [
+      v1ArbitrumLongPositionSizes,
+      v1AvalancheLongPositionSizes,
+      v2ArbitrumLongPositionSizes,
+      v2AvalancheLongPositionSizes,
+      v2MegaethLongPositionSizes,
+      gmtradeLongPositionSizes,
+    ]
+  );
+
+  const totalShortPositionSizesEntries = useMemo(
+    () => ({
+      Arbitrum: sumKnownBigInts(v2ArbitrumShortPositionSizes, v1ArbitrumShortPositionSizes),
+      Avalanche: sumKnownBigInts(v2AvalancheShortPositionSizes, v1AvalancheShortPositionSizes),
+      MegaETH: v2MegaethShortPositionSizes,
+      [SOLANA_ENTRY]: gmtradeShortPositionSizes,
+    }),
+    [
+      v1ArbitrumShortPositionSizes,
+      v1AvalancheShortPositionSizes,
+      v2ArbitrumShortPositionSizes,
+      v2AvalancheShortPositionSizes,
+      v2MegaethShortPositionSizes,
+      gmtradeShortPositionSizes,
+    ]
+  );
+
+  const epochFeesEntries = useMemo(
+    () => ({
+      Arbitrum: sumKnownBigInts(v2ArbitrumEpochFees, v1ArbitrumEpochFees),
+      Avalanche: sumKnownBigInts(v2AvalancheEpochFees, v1AvalancheEpochFees),
+      MegaETH: v2MegaethEpochFees,
+      [SOLANA_ENTRY]: gmtradeEpochFees,
+    }),
+    [
+      v1ArbitrumEpochFees,
+      v1AvalancheEpochFees,
+      v2ArbitrumEpochFees,
+      v2AvalancheEpochFees,
+      v2MegaethEpochFees,
+      gmtradeEpochFees,
+    ]
+  );
+
+  const tvlEntries = useMemo(
+    () => ({
+      Arbitrum: displayTvlArbitrum,
+      Avalanche: displayTvlAvalanche,
+      MegaETH: displayTvlMegaeth,
+      [SOLANA_ENTRY]: displayTvlGmtrade,
+    }),
+    [displayTvlArbitrum, displayTvlAvalanche, displayTvlMegaeth, displayTvlGmtrade]
+  );
+
+  const gmPoolEntries = useMemo(
+    () => ({
+      Arbitrum: gmTvlArbitrum,
+      Avalanche: gmTvlAvalanche,
+      MegaETH: gmTvlMegaeth,
+      [SOLANA_ENTRY]: gmTvlGmtrade,
+    }),
+    [gmTvlArbitrum, gmTvlAvalanche, gmTvlMegaeth, gmTvlGmtrade]
+  );
+
+  const [formattedDuration, setFormattedDuration] = useState(() => getFormattedFeesDuration());
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setFormattedDuration(getFormattedFeesDuration());
+    }, 1000 * 60);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <AppCard>
+      <AppCardSection className="text-body-large font-medium">
+        <Trans>Overview</Trans>
+      </AppCardSection>
+      <AppCardSplit
+        className="max-lg:flex-col"
+        leftClassName="max-lg:border-r-0 max-lg:border-b"
+        right={
+          <AppCardSection className="pb-24">
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>Fees for the past</Trans> {formattedDuration}
+              </div>
+              <div>
+                <ChainsStatsTooltip entries={epochFeesEntries} staleEntries={feesStaleEntries} />
+              </div>
+            </div>
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>TVL</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip
+                  entries={tvlEntries}
+                  staleEntries={gmtradeStaleEntries}
+                  caption={<Trans>TVL includes GMX staked, GM pools, and position collateral</Trans>}
+                />
+              </div>
+            </div>
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>GM pools</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip
+                  entries={gmPoolEntries}
+                  staleEntries={gmtradeStaleEntries}
+                  caption={<Trans>Total value of tokens in GM pools</Trans>}
+                />
+              </div>
+            </div>
+          </AppCardSection>
+        }
+        left={
+          <AppCardSection className="pb-24">
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>24h volume</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip entries={dailyVolumeEntries} staleEntries={gmtradeStaleEntries} />
+              </div>
+            </div>
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>Open interest</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip entries={openInterestEntries} staleEntries={positionsStaleEntries} />
+              </div>
+            </div>
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>Long positions</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip entries={totalLongPositionSizesEntries} staleEntries={positionsStaleEntries} />
+              </div>
+            </div>
+            <div className="App-card-row">
+              <div className="label">
+                <Trans>Short positions</Trans>
+              </div>
+              <div>
+                <ChainsStatsTooltip entries={totalShortPositionSizesEntries} staleEntries={positionsStaleEntries} />
+              </div>
+            </div>
+          </AppCardSection>
+        }
+      ></AppCardSplit>
+    </AppCard>
+  );
+}

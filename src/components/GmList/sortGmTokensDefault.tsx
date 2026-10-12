@@ -1,0 +1,71 @@
+import { MultichainMarketTokensBalances } from "domain/multichain/types";
+import type { GlvAndGmMarketsInfoData } from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { convertToUsd } from "domain/synthetics/tokens";
+import { ProgressiveTokenData, ProgressiveTokensData } from "sdk/utils/tokens/types";
+
+/**
+ * Sorts GM tokens by:
+ * 1. Pinned addresses first
+ * 2. User owned wallet balance descending
+ * 3. Simply descending on TVL in dollars for the pool
+ */
+export function sortGmTokensDefault({
+  marketsInfoData,
+  marketTokensData,
+  multichainMarketTokensBalances,
+  pinnedAddresses = [],
+}: {
+  marketsInfoData: GlvAndGmMarketsInfoData;
+  marketTokensData: ProgressiveTokensData;
+  multichainMarketTokensBalances: MultichainMarketTokensBalances | undefined;
+  pinnedAddresses?: string[];
+}) {
+  if (marketsInfoData === undefined || marketTokensData === undefined) {
+    return [];
+  }
+
+  const tokens: { tokenData: ProgressiveTokenData; isPinned: boolean; totalSupplyUsd: bigint; balanceUsd: bigint }[] =
+    [];
+
+  for (const market of Object.values(marketsInfoData)) {
+    if (market.isDisabled) {
+      continue;
+    }
+
+    const marketTokenData = isGlvInfo(market) ? market.glvToken : marketTokensData[market.marketTokenAddress];
+
+    if (!marketTokenData) {
+      continue;
+    }
+
+    const totalSupplyUsd =
+      convertToUsd(marketTokenData.totalSupply, marketTokenData.decimals, marketTokenData.prices?.minPrice) ?? 0n;
+
+    const balanceUsd = multichainMarketTokensBalances?.[marketTokenData.address]?.totalBalanceUsd ?? 0n;
+
+    tokens.push({
+      tokenData: marketTokenData,
+      isPinned: pinnedAddresses.includes(marketTokenData.address),
+      totalSupplyUsd: totalSupplyUsd,
+      balanceUsd: balanceUsd,
+    });
+  }
+
+  // Sort by user balance first (descending), then by TVL (descending)
+  tokens.sort((a, b) => {
+    if (a.isPinned !== b.isPinned) {
+      return a.isPinned ? -1 : 1;
+    }
+
+    // Compare balances directly - tokens with higher balance come first
+    if (a.balanceUsd !== b.balanceUsd) {
+      return a.balanceUsd > b.balanceUsd ? -1 : 1;
+    }
+
+    // If balances are equal, sort by total supply descending
+    return a.totalSupplyUsd > b.totalSupplyUsd ? -1 : 1;
+  });
+
+  return tokens.map((token) => token.tokenData);
+}

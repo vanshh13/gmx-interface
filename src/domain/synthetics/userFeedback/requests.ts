@@ -1,0 +1,43 @@
+import debounce from "lodash/debounce";
+
+import { USD_DECIMALS } from "config/factors";
+import { formatAmountForMetrics, metrics, MissedCoinEvent } from "lib/metrics";
+
+import { MissedCoinsPlace } from "./types";
+import { COIN_REGEXP } from "./utils";
+
+export const sendMissedCoinSearchDebounced = debounce(
+  ({
+    searchText,
+    totalVolume,
+    monthVolume,
+    place,
+    mode,
+  }: {
+    searchText: string;
+    totalVolume: bigint | undefined;
+    monthVolume: bigint | undefined;
+    place: MissedCoinsPlace;
+    mode?: "perp" | "swap";
+    account?: string;
+  }) => {
+    const coin = searchText.trim().toUpperCase();
+
+    if (coin.length === 0 || coin.length > 10 || !coin.match(COIN_REGEXP)) {
+      return;
+    }
+
+    metrics.pushEvent<MissedCoinEvent>({
+      event: "missedCoin.search",
+      isError: false,
+      data: {
+        coin,
+        totalVolume: formatAmountForMetrics(totalVolume ? totalVolume : 0n, USD_DECIMALS, "toSecondOrderInt"),
+        monthVolume: formatAmountForMetrics(monthVolume ? monthVolume : 0n, USD_DECIMALS, "toSecondOrderInt"),
+        place,
+        mode,
+      },
+    });
+  },
+  500
+);

@@ -1,0 +1,39 @@
+import { i18n } from "@lingui/core";
+import { I18nProvider } from "@lingui/react";
+import { useEffect } from "react";
+import { BrowserRouter as Router } from "react-router-dom";
+import { SWRConfig } from "swr";
+
+import { ThemeProvider } from "context/ThemeContext/ThemeContext";
+import { useOracleKeeperFetcher } from "lib/oracleKeeperFetcher";
+import { ARBITRUM } from "sdk/configs/chainIds";
+
+import SEO from "components/Seo/SEO";
+
+import { LandingRoutes } from "./LandingRoutes";
+
+export default function App() {
+  const fetcher = useOracleKeeperFetcher(ARBITRUM);
+  useEffect(() => {
+    const metrics = import("lib/metrics/Metrics");
+    metrics.then((m) => {
+      m.metrics.setFetcher(fetcher);
+    });
+  }, [fetcher]);
+
+  return (
+    <Router>
+      <SWRConfig>
+        <I18nProvider i18n={i18n as any}>
+          <ThemeProvider>
+            <SEO>
+              <div className="overflow-hidden proportional-nums text-white">
+                <LandingRoutes />
+              </div>
+            </SEO>
+          </ThemeProvider>
+        </I18nProvider>
+      </SWRConfig>
+    </Router>
+  );
+}

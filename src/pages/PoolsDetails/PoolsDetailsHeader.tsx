@@ -1,0 +1,315 @@
+import { Menu } from "@headlessui/react";
+import { t, Trans } from "@lingui/macro";
+import cx from "classnames";
+import { useCallback, useState } from "react";
+
+import { USD_DECIMALS } from "config/factors";
+import {
+  PLATFORM_TOKEN_DECIMALS,
+  selectPoolsDetailsCanBridgeInMarket,
+  selectPoolsDetailsCanBridgeOutMarket,
+} from "context/PoolsDetailsContext/selectors";
+import { selectMultichainMarketTokenBalances } from "context/PoolsDetailsContext/selectors/selectMultichainMarketTokenBalances";
+import { selectMultichainMarketTokensBalancesIsLoading } from "context/SyntheticsStateContext/selectors/globalSelectors";
+import { useSelector } from "context/SyntheticsStateContext/utils";
+import { getHasBalanceOutsideWallet } from "domain/multichain/getHasBalanceOutsideWallet";
+import { getMarketBadge, getMarketIndexName, getMarketPoolName } from "domain/synthetics/markets";
+import { isGlvInfo } from "domain/synthetics/markets/glv";
+import { GlvOrMarketInfo } from "domain/synthetics/markets/types";
+import { useGmMarketsApy } from "domain/synthetics/markets/useGmMarketsApy";
+import { PoolsTimeRange } from "domain/synthetics/markets/usePoolsTimeRange";
+import { useUserEarnings } from "domain/synthetics/markets/useUserEarnings";
+import { convertToUsd, TokenData } from "domain/synthetics/tokens";
+import type { UsdgLaunchBoost } from "domain/synthetics/usdgLaunchBoost/utils";
+import { useChainId } from "lib/chains";
+import { formatBalanceAmount } from "lib/numbers";
+import { getByKey } from "lib/objects";
+import { useBreakpoints } from "lib/useBreakpoints";
+import { getNormalizedTokenSymbol } from "sdk/configs/tokens";
+
+import { AprInfo } from "components/AprInfo/AprInfo";
+import { BridgeInModal } from "components/BridgeModal/BridgeInModal";
+import { BridgeOutModal } from "components/BridgeModal/BridgeOutModal";
+import Button from "components/Button/Button";
+import { EarningAttributionNote, EarningValue } from "components/EarningValue/EarningValue";
+import {
+  MultichainBalanceTooltip,
+  useHasMultichainBreakdown,
+} from "components/MultichainBalanceTooltip/MultichainBalanceTooltip";
+import { AmountHumanValue } from "components/NumericValue/AmountHumanValue";
+import { UsdValue } from "components/NumericValue/UsdValue";
+import { ShimmerText } from "components/ShimmerText/ShimmerText";
+import TokenIcon from "components/TokenIcon/TokenIcon";
+
+import BuyIcon from "img/ic_buy.svg?react";
+import ChevronDownIcon from "img/ic_chevron_down.svg?react";
+import MenuDotsIcon from "img/ic_menu_dots.svg?react";
+import SellIcon from "img/ic_sell.svg?react";
+
+import { PoolsDetailsMarketAmount } from "./PoolsDetailsMarketAmount";
+
+type Props = {
+  glvOrMarketInfo: GlvOrMarketInfo | undefined;
+  marketToken: TokenData | undefined;
+  timeRange: PoolsTimeRange;
+  launchBoost: UsdgLaunchBoost | undefined;
+};
+
+export function PoolsDetailsHeader({ glvOrMarketInfo, marketToken, timeRange, launchBoost }: Props) {
+  const { chainId, srcChainId } = useChainId();
+  const canBridgeInMarket = useSelector(selectPoolsDetailsCanBridgeInMarket);
+  const canBridgeOutMarket = useSelector(selectPoolsDetailsCanBridgeOutMarket);
+  const isGlv = glvOrMarketInfo && isGlvInfo(glvOrMarketInfo);
+  const iconName = glvOrMarketInfo?.isSpotOnly
+    ? getNormalizedTokenSymbol(glvOrMarketInfo.longToken.symbol) +
+      getNormalizedTokenSymbol(glvOrMarketInfo.shortToken.symbol)
+    : isGlv
+      ? glvOrMarketInfo?.glvToken.symbol
+      : glvOrMarketInfo?.indexToken.symbol;
+
+  const [openedTransferModal, setOpenedTransferModal] = useState<"transferIn" | "transferOut" | undefined>(undefined);
+
+  const marketPrice = marketToken?.prices?.maxPrice;
+
+  const marketTotalSupply = marketToken?.totalSupply;
+  const marketTotalSupplyUsd = convertToUsd(marketTotalSupply, marketToken?.decimals, marketPrice);
+
+  const {
+    userEarnings,
+    isLoading: isUserEarningsLoading,
+    isUnavailable: isUserEarningsUnavailable,
+  } = useUserEarnings(chainId, srcChainId);
+  const marketEarnings = getByKey(userEarnings?.byMarketAddress, marketToken?.address);
+
+  const {
+    marketsTokensApyData,
+    glvApyInfoData,
+    marketsTokensIncentiveAprData,
+    glvTokensIncentiveAprData,
+    marketsTokensLidoAprData,
+    isLoading: isApyLoading,
+  } = useGmMarketsApy(chainId, srcChainId, { period: timeRange });
+  const apyData = isGlv ? glvApyInfoData : marketsTokensApyData;
+  const incentiveAprData = isGlv ? glvTokensIncentiveAprData : marketsTokensIncentiveAprData;
+  const apy = getByKey(apyData, marketToken?.address);
+  const incentiveApr = getByKey(incentiveAprData, marketToken?.address);
+  const lidoApr = getByKey(marketsTokensLidoAprData, marketToken?.address);
+  const shouldShowApy = (apy !== undefined && apy !== 0n) || launchBoost !== undefined || isApyLoading;
+
+  const { isMobile } = useBreakpoints();
+
+  const multichainMarketTokensBalances = useSelector(selectMultichainMarketTokenBalances);
+  const multichainMarketTokenBalances = marketToken?.address
+    ? multichainMarketTokensBalances[marketToken.address]
+    : undefined;
+  const isMultichainBalancesLoading = useSelector(selectMultichainMarketTokensBalancesIsLoading);
+  const hasMultichainBreakdown = useHasMultichainBreakdown(multichainMarketTokenBalances);
+  const hasBalanceOutsideWallet = !isGlv && getHasBalanceOutsideWallet(multichainMarketTokenBalances, chainId);
+
+  const totalBalance = multichainMarketTokenBalances?.totalBalance;
+  const marketBalanceUsd = multichainMarketTokenBalances?.totalBalanceUsd;
+  const hasGmBalance = !isGlv && typeof totalBalance === "bigint" && totalBalance > 0n;
+  const shouldShowEarningsFallback =
+    !marketEarnings && hasGmBalance && (isUserEarningsLoading || isUserEarningsUnavailable);
+  const shouldShowEarningsHeader = !isGlv && (marketEarnings || shouldShowEarningsFallback || hasBalanceOutsideWallet);
+
+  const [isOpen, setIsOpen] = useState(true);
+
+  const handleToggle = useCallback(() => {
+    setIsOpen((isOpen) => !isOpen);
+  }, []);
+
+  const glvOrGm = isGlv ? t`GLV` : t`GM`;
+  const marketTitle = isGlv ? glvOrGm : t`GM: ${glvOrMarketInfo ? getMarketIndexName(glvOrMarketInfo) : ""}`;
+  const marketPoolTitle = glvOrMarketInfo ? t`[${getMarketPoolName(glvOrMarketInfo)}]` : "";
+
+  return (
+    <div
+      className={cx(
+        "flex justify-between gap-18 rounded-8 bg-slate-900 px-16 py-20 max-lg:flex-col max-md:px-12 max-md:py-12"
+      )}
+    >
+      <div
+        className={cx("flex", {
+          "flex-col gap-18": isMobile,
+          "items-center gap-28": !isMobile,
+        })}
+      >
+        {!glvOrMarketInfo ? (
+          <div>...</div>
+        ) : (
+          <>
+            <div
+              className={cx("flex items-center justify-between ", {
+                "border-b-1/2 border-slate-600 pb-18": isOpen && isMobile,
+              })}
+            >
+              <div className="flex items-center gap-20">
+                {iconName && (
+                  <TokenIcon symbol={iconName} displaySize={40} badge={getMarketBadge(chainId, glvOrMarketInfo)} />
+                )}
+                <div className={cx("flex flex-col gap-4 pr-20 font-medium")}>
+                  <div className="text-body-large">{marketTitle}</div>
+                  <div className="text-body-small text-typography-secondary">{marketPoolTitle}</div>
+                </div>
+              </div>
+              {isMobile && (
+                <Button
+                  className="flex h-32 w-32 items-center justify-center"
+                  variant="secondary"
+                  onClick={handleToggle}
+                >
+                  <ChevronDownIcon className={cx({ "rotate-180": isOpen })} />
+                </Button>
+              )}
+            </div>
+            {(isOpen || !isMobile) && (
+              <div className="flex gap-14 max-md:flex-col">
+                <PoolsDetailsMarketAmount
+                  label={<Trans>TVL (supply)</Trans>}
+                  value={
+                    <AmountHumanValue
+                      amount={marketTotalSupplyUsd}
+                      decimals={USD_DECIMALS}
+                      showDollar
+                      displayDecimals={2}
+                    />
+                  }
+                  secondaryValue={
+                    typeof marketTotalSupply === "bigint" && typeof marketToken?.decimals === "number" ? (
+                      <>
+                        <AmountHumanValue
+                          amount={marketTotalSupply}
+                          decimals={marketToken.decimals}
+                          displayDecimals={2}
+                        />{" "}
+                        {isGlv ? "GLV" : "GM"}
+                      </>
+                    ) : undefined
+                  }
+                />
+                {marketToken && (
+                  <PoolsDetailsMarketAmount
+                    label={<Trans>APY</Trans>}
+                    value={
+                      shouldShowApy ? (
+                        <AprInfo
+                          apy={apy}
+                          incentiveApr={incentiveApr}
+                          lidoApr={lidoApr}
+                          launchBoost={launchBoost}
+                          isApyLoading={isApyLoading}
+                          marketAddress={marketToken.address}
+                        />
+                      ) : (
+                        t`N/A`
+                      )
+                    }
+                  />
+                )}
+                {typeof totalBalance === "bigint" && typeof marketToken?.decimals === "number" && (
+                  <PoolsDetailsMarketAmount
+                    label={<Trans>Balance</Trans>}
+                    value={
+                      isMultichainBalancesLoading ? (
+                        <ShimmerText>
+                          <UsdValue usd={marketBalanceUsd} />
+                        </ShimmerText>
+                      ) : (
+                        <UsdValue usd={marketBalanceUsd} />
+                      )
+                    }
+                    secondaryValue={`${formatBalanceAmount(totalBalance, marketToken?.decimals, undefined, {
+                      showZero: true,
+                    })} ${isGlv ? "GLV" : "GM"}`}
+                    afterValue={
+                      canBridgeOutMarket || canBridgeInMarket ? (
+                        <div className="relative shrink-0">
+                          <Menu>
+                            <Menu.Button as="div">
+                              <MenuDotsIcon className="size-20 cursor-pointer text-typography-secondary hover:text-typography-primary" />
+                            </Menu.Button>
+                            <Menu.Items
+                              as="div"
+                              className="absolute right-0 top-full z-10 mt-8 min-w-max overflow-hidden rounded-8 border-1/2 border-slate-600 bg-slate-900 outline-none"
+                            >
+                              {canBridgeInMarket && (
+                                <Menu.Item
+                                  as="div"
+                                  className="menu-item flex cursor-pointer items-center gap-8 px-12 py-8 hover:bg-fill-surfaceHover"
+                                  onClick={() => setOpenedTransferModal("transferIn")}
+                                >
+                                  <BuyIcon className="size-16" />
+                                  <div className="text-body-medium">
+                                    <Trans>Deposit {glvOrGm}</Trans>
+                                  </div>
+                                </Menu.Item>
+                              )}
+                              {canBridgeOutMarket && (
+                                <Menu.Item
+                                  as="div"
+                                  className="menu-item flex cursor-pointer items-center gap-8 px-12 py-8 hover:bg-fill-surfaceHover"
+                                  onClick={() => setOpenedTransferModal("transferOut")}
+                                >
+                                  <SellIcon className="size-16" />
+                                  <div className="text-body-medium">
+                                    <Trans>Withdraw {glvOrGm}</Trans>
+                                  </div>
+                                </Menu.Item>
+                              )}
+                            </Menu.Items>
+                          </Menu>
+                        </div>
+                      ) : undefined
+                    }
+                    tooltipContent={
+                      !hasMultichainBreakdown || totalBalance === undefined || totalBalance === 0n ? undefined : (
+                        <MultichainBalanceTooltip
+                          multichainBalances={multichainMarketTokenBalances}
+                          symbol={glvOrGm}
+                          decimals={PLATFORM_TOKEN_DECIMALS}
+                        />
+                      )
+                    }
+                  />
+                )}
+                {shouldShowEarningsHeader && (
+                  <PoolsDetailsMarketAmount
+                    label={<Trans>Total earned fees</Trans>}
+                    value={
+                      <EarningValue
+                        value={marketEarnings?.total}
+                        isLoading={!hasBalanceOutsideWallet && !marketEarnings && isUserEarningsLoading}
+                        isAvailable={
+                          !hasBalanceOutsideWallet && (Boolean(marketEarnings) || !isUserEarningsUnavailable)
+                        }
+                        unavailableTooltip={hasBalanceOutsideWallet ? <EarningAttributionNote scope="gm" /> : undefined}
+                      >
+                        {(value) => <UsdValue usd={value} />}
+                      </EarningValue>
+                    }
+                  />
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {canBridgeOutMarket && (
+        <BridgeOutModal
+          isVisible={openedTransferModal === "transferOut"}
+          setIsVisible={(newIsVisible) => setOpenedTransferModal(newIsVisible ? "transferOut" : undefined)}
+          glvOrMarketInfo={glvOrMarketInfo}
+        />
+      )}
+      {canBridgeInMarket && (
+        <BridgeInModal
+          isVisible={openedTransferModal === "transferIn"}
+          setIsVisible={(newIsVisible) => setOpenedTransferModal(newIsVisible ? "transferIn" : undefined)}
+          glvOrMarketInfo={glvOrMarketInfo}
+        />
+      )}
+    </div>
+  );
+}

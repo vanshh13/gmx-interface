@@ -1,0 +1,53 @@
+.StatusNotification-wrapper {
+  .StatusNotification-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 1.2rem;
+    padding: 1.2rem 0.8rem 0.8rem 0.8rem;
+    border-top: 1px solid var(--color-slate-600);
+
+    .StatusNotification-cancel-all {
+      background: transparent;
+      border: none;
+      padding: 0;
+      color: var(--color-gray-300);
+      text-decoration: underline;
+
+      &:hover {
+        color: var(--color-typography-primary);
+      }
+    }
+  }
+}
+
+.StatusNotification-list {
+  .StatusNotification + .StatusNotification {
+    margin-top: 1.2rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--color-slate-600);
+  }
+}
+
+.StatusNotification-title {
+  font-weight: 500;
+  font-style: medium;
+  letter-spacing: -0.012em;
+  padding-right: 28px;
+}
+
+.Toastify__toast--error {
+  .StatusNotification-title {
+    color: var(--color-red-500);
+  }
+}
+
+.Toastify__toast--success {
+  .StatusNotification-title {
+    color: var(--color-green-500);
+  }
+}
+
+.StatusNotification-list:has(> .StatusNotification + .StatusNotification) .StatusNotification-title {
+  color: var(--color-typography-primary);
+}
