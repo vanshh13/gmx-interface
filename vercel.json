@@ -1,5 +1,5 @@
 {
-  "buildCommand": "NODE_OPTIONS=--max-old-space-size=4096 yarn build",
+  "buildCommand": "NODE_OPTIONS=--max-old-space-size=8192 yarn build",
   "outputDirectory": "build",
   "rewrites": [
     {
