@@ -1,5 +1,6 @@
 {
-  "buildCommand": "NODE_OPTIONS=--max-old-space-size=8192 yarn build",
+  "installCommand": "YARN_ENABLE_SCRIPTS=false yarn install && cd sdk && YARN_ENABLE_SCRIPTS=false yarn install",
+  "buildCommand": "cd sdk && yarn build && cd .. && NODE_OPTIONS=--max-old-space-size=8192 yarn build",
   "outputDirectory": "build",
   "rewrites": [
     {
