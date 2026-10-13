@@ -1,4 +1,5 @@
 import { Trans, t } from "@lingui/macro";
+import { useLingui } from "@lingui/react";
 import { useHeroStats } from "landing/pages/Home/hooks/useHeroStats";
 import { shortFormat, shortFormatUsd } from "landing/pages/Home/utils/formatters";
 import { CSSProperties, MouseEvent, useEffect, useRef, useState } from "react";
@@ -205,6 +206,7 @@ function CountUp({
 }
 
 export default function Homepage() {
+  const { _ } = useLingui();
   const goToTrade = useGoToTrade({
     buttonPosition: "HomepageHero",
     chainId: RedirectChainIds.Arbitum,
@@ -447,14 +449,14 @@ export default function Homepage() {
             {featureCards.map((card, index) => {
               const reverse = index % 2 === 1;
               return (
-                <div className={`NewHomepage-feature${reverse ? " NewHomepage-feature--reverse" : ""}`} key={card.title}>
+                <div className={`NewHomepage-feature${reverse ? " NewHomepage-feature--reverse" : ""}`} key={card.title.id}>
                   <div className="NewHomepage-feature-text" data-reveal="stagger">
-                    <p className="NewHomepage-feature-eyebrow">{card.eyebrow}</p>
-                    <h3>{card.title}</h3>
-                    <p className="NewHomepage-feature-copy">{card.copy}</p>
+                    <p className="NewHomepage-feature-eyebrow">{_(card.eyebrow)}</p>
+                    <h3>{_(card.title)}</h3>
+                    <p className="NewHomepage-feature-copy">{_(card.copy)}</p>
                     <div>
                       <a className="NewHomepage-button NewHomepage-button--large" href={card.href}>
-                        {card.action}
+                        {_(card.action)}
                       </a>
                     </div>
                   </div>
